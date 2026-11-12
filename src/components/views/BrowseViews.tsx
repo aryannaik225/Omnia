@@ -1,9 +1,10 @@
-/** Search, Watch Now (Continue Watching + history), My OTTs and Watchlist views. */
+/** Search, Watching Now (Continue Watching + history), My OTTs and Watchlist views. */
 import { useMemo, useState, type ReactNode } from "react";
 import { episodeLabel, relativeTime } from "../../lib/format";
 import { useAsync, useDebounced } from "../../lib/hooks";
+import { groupByFamily } from "../../lib/providers";
 import { discover, img, isKidsSafe, searchMulti, type MediaSummary } from "../../services/tmdbClient";
-import { history } from "../../services/tauriBridge";
+import { history, type HistoryWithMedia } from "../../services/tauriBridge";
 import { useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { LandscapeCard, PosterCard } from "../common/Cards";
@@ -50,6 +51,30 @@ export function SearchView() {
 
 // ---------------------------------------------------------------------------------------------
 
+/** One card per title: the latest entry plus how many episodes were watched. */
+interface HistoryGroup {
+  latest: HistoryWithMedia;
+  entries: HistoryWithMedia[];
+}
+
+function groupHistory(rows: HistoryWithMedia[]): HistoryGroup[] {
+  const groups = new Map<string, HistoryGroup>();
+  for (const row of rows) {
+    const key = `${row.mediaType}-${row.tmdbId}`;
+    const g = groups.get(key);
+    if (g) g.entries.push(row);
+    else groups.set(key, { latest: row, entries: [row] });
+  }
+  return [...groups.values()];
+}
+
+function historySubtitle(h: HistoryWithMedia, count: number) {
+  const ep = episodeLabel(h.seasonNumber, h.episodeNumber);
+  const parts = h.mediaType === "tv" ? [ep, h.episodeTitle] : [h.isCompleted ? "Finished" : `${Math.round(h.completionRatio * 100)}% watched`];
+  if (h.mediaType === "tv" && count > 1) parts.push(`${count} episodes`);
+  return parts.filter(Boolean).join(" · ");
+}
+
 export function ContinueWatchingView() {
   const profile = useAppStore((s) => s.activeProfile);
   const items = useAppStore((s) => s.continueWatching);
@@ -58,7 +83,8 @@ export function ContinueWatchingView() {
   const toast = useAppStore((s) => s.toast);
   const resume = usePlayerStore((s) => s.resumeItem);
   const [nonce, setNonce] = useState(0);
-  const recent = useAsync(() => history.list(profile!.profileId, 200), [profile?.profileId, nonce, items.length], !!profile);
+  const recent = useAsync(() => history.list(profile!.profileId, 400), [profile?.profileId, nonce, items.length], !!profile);
+  const groups = useMemo(() => groupHistory(recent.data ?? []), [recent.data]);
 
   const exportHistory = async () => {
     if (!profile) return;
@@ -72,10 +98,17 @@ export function ContinueWatchingView() {
     toast({ kind: "success", title: "History exported", body: `${rows.length} entries (stays on this device unless you move the file).` });
   };
 
+  const removeGroup = async (g: HistoryGroup) => {
+    for (const e of g.entries) await history.remove(e.appProfileId, e.id);
+    setNonce((n) => n + 1);
+    void refresh();
+    toast({ kind: "info", title: "Removed from history", body: g.latest.title ?? undefined });
+  };
+
   return (
-    <div>
+    <div className="pb-16">
       <PageHeader
-        title="Watch Now"
+        title="Watching Now"
         subtitle="Everything you're in the middle of, across all your services"
         actions={
           <button className="glass-button" onClick={() => void exportHistory()}>
@@ -102,38 +135,48 @@ export function ContinueWatchingView() {
       )}
 
       <h2 className="section-title mb-4 mt-12">Recently watched</h2>
-      <div className="glass-panel divide-y divide-white/[0.06] overflow-hidden">
-        {(recent.data ?? []).map((h) => (
-          <div key={h.id} className="flex items-center gap-4 px-5 py-3">
-            <button className="min-w-0 flex-1 text-left" onClick={() => openTitle({ id: h.tmdbId, mediaType: h.mediaType })}>
-              <p className="truncate text-[14px] font-medium">
-                {h.episodeTitle ?? `TMDB #${h.tmdbId}`}
-                {episodeLabel(h.seasonNumber, h.episodeNumber) && <span className="ml-2 text-label-tertiary">{episodeLabel(h.seasonNumber, h.episodeNumber)}</span>}
-              </p>
-              <p className="text-[12px] text-label-tertiary">
-                {[h.providerName, relativeTime(h.lastWatchedAt), h.isCompleted ? "Finished" : `${Math.round(h.completionRatio * 100)}%`, h.watchCount > 1 ? `Watched ${h.watchCount}×` : null, h.abandoned ? "Abandoned" : null]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </p>
-            </button>
-            <div className="progress-track w-28">
-              <div className="progress-fill" style={{ width: `${Math.round(h.completionRatio * 100)}%` }} />
-            </div>
-            <button
-              className="text-label-tertiary transition-colors hover:text-[#ff453a]"
-              aria-label="Remove from history"
-              onClick={async () => {
-                await history.remove(h.appProfileId, h.id);
-                setNonce((n) => n + 1);
-                void refresh();
-              }}
-            >
-              <TrashIcon size={17} />
-            </button>
-          </div>
-        ))}
-        {recent.data && recent.data.length === 0 && <p className="px-5 py-6 text-label-secondary">No history yet.</p>}
-      </div>
+      {groups.length ? (
+        <div className="grid gap-x-5 gap-y-7" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}>
+          {groups.map((g) => {
+            const h = g.latest;
+            return (
+              <PosterCard
+                key={`${h.mediaType}-${h.tmdbId}`}
+                title={h.title ?? h.episodeTitle ?? "Untitled"}
+                posterPath={h.posterPath}
+                subtitle={historySubtitle(h, g.entries.length)}
+                caption={[h.providerName, relativeTime(h.lastWatchedAt), h.watchCount > 1 ? `${h.watchCount}×` : null].filter(Boolean).join(" · ")}
+                progress={h.isCompleted ? 1 : h.completionRatio}
+                badge={h.abandoned ? <span className="badge !bg-black/60">Abandoned</span> : undefined}
+                cornerAction={
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Remove ${h.title ?? "title"} from history`}
+                    className="flex h-7 w-7 items-center justify-center rounded-full bg-black/55 backdrop-blur-md hover:text-[#ff453a]"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void removeGroup(g);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.stopPropagation();
+                        void removeGroup(g);
+                      }
+                    }}
+                  >
+                    <TrashIcon size={14} />
+                  </span>
+                }
+                width="fill"
+                onClick={() => openTitle({ id: h.tmdbId, mediaType: h.mediaType })}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <p className="text-label-secondary">{recent.loading ? "Loading…" : "No history yet."}</p>
+      )}
     </div>
   );
 }
@@ -163,19 +206,19 @@ export function MyOttsView() {
   return (
     <div className="flex flex-col gap-12 pb-16">
       <PageHeader title="My OTTs" subtitle="What's popular on each of your services" />
-      {subs.map((p) => {
-        const pctx = { ...ctx, providers: [p.providerId] };
-        const logo = img(p.logoPath, "w92");
+      {groupByFamily(subs, (p) => p.providerId, (p) => p.providerName).map(({ family, members }) => {
+        const pctx = { ...ctx, providers: members.map((m) => m.providerId) };
+        const logo = img(members.find((m) => m.logoPath)?.logoPath, "w92");
         const title = (
           <span className="flex items-center gap-3">
             {logo && <img src={logo} alt="" className="h-8 w-8 rounded-[9px]" />}
-            {p.providerName}
+            {family.name}
           </span>
         );
         return (
-          <div key={p.providerId} className="flex flex-col gap-8">
-            <LazyTmdbRow title={title} subtitle="Series" load={async () => (await discover("tv", pctx)).results} deps={[catalogKey, p.providerId, "tv"]} />
-            <LazyTmdbRow title={<span className="text-label-secondary">{p.providerName} · Movies</span>} load={async () => (await discover("movie", pctx)).results} deps={[catalogKey, p.providerId, "movie"]} />
+          <div key={family.key} className="flex flex-col gap-8">
+            <LazyTmdbRow title={title} subtitle="Series" load={async () => (await discover("tv", pctx)).results} deps={[catalogKey, family.key, "tv"]} />
+            <LazyTmdbRow title={<span className="text-label-secondary">{family.name} · Movies</span>} load={async () => (await discover("movie", pctx)).results} deps={[catalogKey, family.key, "movie"]} />
           </div>
         );
       })}

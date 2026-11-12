@@ -5,6 +5,7 @@
 import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flag, regionName } from "../../lib/format";
+import { groupByFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
 import { availableRegions, img } from "../../services/tmdbClient";
 import { useAppStore } from "../../store/useAppStore";
@@ -125,19 +126,20 @@ export function TopFilterBar() {
       </div>
 
       <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
-        {subs.map((p) => {
-          const active = providerFilter === p.providerId;
-          const logo = img(p.logoPath, "w92");
+        {groupByFamily(subs, (p) => p.providerId, (p) => p.providerName).map(({ family, members }) => {
+          const p = members[0]!;
+          const active = providerFilter === family.key;
+          const logo = img(members.find((m) => m.logoPath)?.logoPath, "w92");
           return (
             <button
-              key={p.providerId}
-              onClick={() => setProviderFilter(active ? null : p.providerId)}
-              title={active ? `Showing ${p.providerName} only` : `Only ${p.providerName}`}
+              key={family.key}
+              onClick={() => setProviderFilter(active ? null : family.key)}
+              title={active ? `Showing ${family.name} only` : `Only ${family.name}`}
               className={`relative h-9 w-9 shrink-0 overflow-hidden rounded-[10px] transition-all duration-200 ${
                 active ? "ring-2 ring-white" : providerFilter ? "opacity-40 hover:opacity-80" : "opacity-90 hover:opacity-100"
               }`}
             >
-              {logo ? <img src={logo} alt={p.providerName} className="h-full w-full object-cover" /> : <span className="text-xs">{p.providerName[0]}</span>}
+              {logo ? <img src={logo} alt={family.name} className="h-full w-full object-cover" /> : <span className="text-xs">{p.providerName[0]}</span>}
             </button>
           );
         })}

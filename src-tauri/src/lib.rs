@@ -26,7 +26,7 @@ use serde::Serializer;
 use tauri::{Manager, State};
 
 use db::queries::{
-    self, AppProfile, ContinueWatchingItem, CustomHub, HistoryImport, MediaCatalogEntry,
+    self, AppProfile, ContinueWatchingItem, CustomHub, HistoryImport, HistoryWithMedia, MediaCatalogEntry,
     OttProfileMapping, PlaybackEvent, ProgressUpdate, SubscribedProvider, WatchHistoryEntry,
     WatchlistItem,
 };
@@ -361,10 +361,10 @@ async fn get_watch_history(
     app_profile_id: i64,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> AppResult<Vec<WatchHistoryEntry>> {
+) -> AppResult<Vec<HistoryWithMedia>> {
     state
         .db
-        .run(move |c| queries::list_history(c, app_profile_id, limit.unwrap_or(100), offset.unwrap_or(0)))
+        .run(move |c| queries::list_history_with_media(c, app_profile_id, limit.unwrap_or(100), offset.unwrap_or(0)))
         .await
 }
 
@@ -593,9 +593,35 @@ pub fn run() {
 
             let resolver = JustWatchResolver::new(http.clone());
 
-            // Startup maintenance: drop stale deep links and apply the early-abandonment rule.
+            // Startup maintenance: canonicalise OTT links, drop stale deep links and apply the
+            // early-abandonment rule.
             let maintenance_db = db.clone();
             tauri::async_runtime::spawn(async move {
+                let rekey = maintenance_db
+                    .run(|c| {
+                        let mut moved = 0;
+                        for m in queries::list_all_ott_mappings(c)? {
+                            let canonical = window_manager::canonical_provider_id(m.provider_id, "");
+                            // Legacy Netflix links stored a bare guid, which can match every
+                            // profile of an account; they must be re-linked (guid::name).
+                            if canonical == 8 && !m.ott_native_profile_id.contains("::") {
+                                queries::delete_ott_mapping(c, m.app_profile_id, m.provider_id)?;
+                                log::warn!("removed a legacy Netflix link for Omnia profile {}; re-link it in Connect Accounts", m.app_profile_id);
+                                continue;
+                            }
+                            if canonical != m.provider_id {
+                                queries::rekey_ott_mapping(c, m.app_profile_id, m.provider_id, canonical)?;
+                                moved += 1;
+                            }
+                        }
+                        Ok(moved)
+                    })
+                    .await;
+                match rekey {
+                    Ok(n) if n > 0 => log::info!("canonicalised {n} OTT profile links"),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("OTT link canonicalisation failed: {e}"),
+                }
                 match maintenance_db.run(|c| queries::purge_expired_deep_links(c)).await {
                     Ok(n) if n > 0 => log::info!("purged {n} expired deep links"),
                     Ok(_) => {}

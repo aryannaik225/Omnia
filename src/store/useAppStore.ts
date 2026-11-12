@@ -26,6 +26,7 @@ import {
   type WatchlistItem,
 } from "../services/tauriBridge";
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
+import { providerFamily } from "../lib/providers";
 
 export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "settings";
 
@@ -62,7 +63,8 @@ interface AppState {
 
   view: View;
   activeHub: string | null;
-  providerFilter: number | null;
+  /** Provider family key (see lib/providers) shown exclusively, or null. */
+  providerFilter: string | null;
   searchQuery: string;
   sidebarCollapsed: boolean;
   scrollPositions: Partial<Record<View, number>>;
@@ -100,7 +102,7 @@ interface AppState {
   navigate: (view: View, opts?: { hub?: string | null }) => void;
   rememberScroll: (view: View, top: number) => void;
   setSearchQuery: (q: string) => void;
-  setProviderFilter: (id: number | null) => void;
+  setProviderFilter: (familyKey: string | null) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setAmbient: (palette: [Rgb, Rgb, Rgb]) => void;
 
@@ -322,7 +324,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   rememberScroll: (view, top) => set((s) => ({ scrollPositions: { ...s.scrollPositions, [view]: top } })),
   setSearchQuery: (q) => set((s) => ({ searchQuery: q, view: q.trim() ? "search" : s.view === "search" ? "home" : s.view })),
-  setProviderFilter: (id) => set({ providerFilter: id }),
+  setProviderFilter: (familyKey) => set({ providerFilter: familyKey }),
   setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
   setAmbient: (palette) => set({ ambient: palette }),
 
@@ -400,7 +402,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   catalogContext: () => {
     const s = get();
     const providers = s.providerFilter
-      ? [s.providerFilter]
+      ? s.subscriptions.filter((p) => providerFamily(p.providerId, p.providerName).key === s.providerFilter).map((p) => p.providerId)
       : s.subscriptionsOnly
         ? s.subscriptions.filter((p) => p.isActive).map((p) => p.providerId)
         : [];

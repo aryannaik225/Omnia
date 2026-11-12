@@ -5,6 +5,7 @@
 import { AnimatePresence } from "framer-motion";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { flag, regionName } from "../../lib/format";
+import { groupByFamily, providerFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
 import { envTmdbKey, img, regionProviders } from "../../services/tmdbClient";
 import { recommendations, type Affinity, type SubscribedProvider } from "../../services/tauriBridge";
@@ -131,12 +132,15 @@ function SubscriptionsSection() {
   const tmdbReady = useAppStore((s) => s.tmdbReady);
   const toast = useAppStore((s) => s.toast);
   const options = useAsync(() => regionProviders(region), [region], tmdbReady);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  // Selection is per provider family ("Prime Video" covers its ad tier and the Amazon store).
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showAll, setShowAll] = useState(false);
-  useEffect(() => setSelected(new Set(subs.map((s) => s.providerId))), [subs]);
+  const savedFamilies = useMemo(() => new Set(subs.map((s) => providerFamily(s.providerId, s.providerName).key)), [subs]);
+  useEffect(() => setSelected(new Set(savedFamilies)), [savedFamilies]);
 
-  const list = useMemo(() => (options.data ?? []).slice(0, showAll ? 200 : 30), [options.data, showAll]);
-  const dirty = selected.size !== subs.length || subs.some((s) => !selected.has(s.providerId));
+  const groups = useMemo(() => groupByFamily(options.data ?? [], (p) => p.providerId, (p) => p.providerName), [options.data]);
+  const list = useMemo(() => groups.slice(0, showAll ? 200 : 30), [groups, showAll]);
+  const dirty = selected.size !== savedFamilies.size || [...savedFamilies].some((k) => !selected.has(k));
 
   return (
     <Section title="My Subscriptions" description={`Services you pay for in ${regionName(region)}. Omnia highlights them everywhere and can hide everything else.`}>
@@ -148,24 +152,25 @@ function SubscriptionsSection() {
       />
       <div className="mt-4 grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}>
         {options.loading && Array.from({ length: 12 }, (_, i) => <div key={i} className="skeleton h-[58px] rounded-pill" />)}
-        {list.map((p) => {
-          const on = selected.has(p.providerId);
-          const logo = img(p.logoPath, "w92");
+        {list.map(({ family, members }) => {
+          const on = selected.has(family.key);
+          const logo = img(members.find((m) => m.logoPath)?.logoPath, "w92");
           return (
             <button
-              key={p.providerId}
+              key={family.key}
+              title={members.length > 1 ? `Includes ${members.map((m) => m.providerName).join(", ")}` : undefined}
               onClick={() =>
                 setSelected((prev) => {
                   const next = new Set(prev);
-                  if (next.has(p.providerId)) next.delete(p.providerId);
-                  else next.add(p.providerId);
+                  if (next.has(family.key)) next.delete(family.key);
+                  else next.add(family.key);
                   return next;
                 })
               }
               className={`flex items-center gap-3 rounded-pill p-2 text-left transition-colors ${on ? "bg-white/[0.16] shadow-specular" : "bg-white/[0.04] hover:bg-white/[0.08]"}`}
             >
               {logo && <img src={logo} alt="" className="h-10 w-10 rounded-[10px]" />}
-              <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{p.providerName}</span>
+              <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{family.name}</span>
               {on && <CheckIcon size={16} className="shrink-0 text-[#30d158]" />}
             </button>
           );
@@ -176,18 +181,22 @@ function SubscriptionsSection() {
           className="glass-button-primary"
           disabled={!dirty}
           onClick={async () => {
-            const chosen: SubscribedProvider[] = (options.data ?? [])
-              .filter((p) => selected.has(p.providerId))
-              .map((p) => ({ providerId: p.providerId, providerName: p.providerName, logoPath: p.logoPath, regionCode: region, isActive: true }));
+            // Every variant id is stored (so catalog filters match all of them) under one family name.
+            const chosen: SubscribedProvider[] = groups
+              .filter((g) => selected.has(g.family.key))
+              .flatMap((g) => {
+                const logo = g.members.find((m) => m.logoPath)?.logoPath ?? null;
+                return g.members.map((m) => ({ providerId: m.providerId, providerName: g.family.name, logoPath: logo, regionCode: region, isActive: true }));
+              });
             await save(chosen);
-            toast({ kind: "success", title: "Subscriptions saved", body: `${chosen.length} services in ${region}` });
+            toast({ kind: "success", title: "Subscriptions saved", body: `${selected.size} services in ${region}` });
           }}
         >
           Save subscriptions
         </button>
-        {(options.data?.length ?? 0) > 30 && (
+        {groups.length > 30 && (
           <button className="glass-button" onClick={() => setShowAll((s) => !s)}>
-            {showAll ? "Show fewer" : `Show all ${options.data?.length} services`}
+            {showAll ? "Show fewer" : `Show all ${groups.length} services`}
           </button>
         )}
       </div>

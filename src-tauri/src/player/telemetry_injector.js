@@ -5,14 +5,15 @@
  * window (and hidden importer windows) via WebView2's document-created script hook. Rust
  * appends the call `({...config})` to this function expression.
  *
- * Privacy: this script only ever talks to the local Omnia process through Tauri IPC. It sends
- * nothing to any network endpoint except same-origin metadata requests the OTT page itself is
- * authorised for (Netflix's own metadata API), and it never reads or forwards cookies.
+ * Privacy: this script only ever talks to the local Omnia process through Tauri IPC. Network
+ * requests it makes are same-origin calls the OTT page itself is authorised for (Netflix's own
+ * metadata / viewing-activity APIs); it never reads or forwards cookies.
  *
  * Modes:
- *   play    — track progress / pauses / seeks / episode hops, render the "Back to Hub" pill
+ *   play    — switch to the linked profile, track progress / pauses / seeks / episode hops,
+ *             render the "Back to Hub" pill (with one-click profile linking when unlinked)
  *   connect — profile handshake: detect the OTT profile the user picked and link it
- *   import  — hidden window: scrape the watch-history / continue-watching page and submit it
+ *   import  — hidden window: read watch history and submit it
  */
 (function (CONFIG) {
   "use strict";
@@ -25,6 +26,8 @@
   } catch (_) {
     return;
   }
+  var TOKEN_KEY = String(CONFIG.token || "").slice(0, 12);
+  var IS_NETFLIX = CONFIG.provider === "netflix";
 
   // -------------------------------------------------------------------------------------------
   // IPC (capture Tauri's invoke before page scripts run, so later monkey-patching can't wrap it)
@@ -49,19 +52,29 @@
     }
   }
 
+  function session(key, value) {
+    try {
+      if (value === undefined) return window.sessionStorage.getItem(key);
+      if (value === null) window.sessionStorage.removeItem(key);
+      else window.sessionStorage.setItem(key, value);
+    } catch (_) {}
+    return null;
+  }
+
   // -------------------------------------------------------------------------------------------
   // Text helpers
   // -------------------------------------------------------------------------------------------
   function clean(s) {
-    return String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+    return String(s == null ? "" : s).replace(/[\s ]+/g, " ").trim();
   }
 
   var SE_PATTERNS = [
-    // S1:E3 · S01E03 · S1 E3 · Season 1, Ep. 3 · Season 1 Episode 3 · Season 1 · Episode 3
+    // S1:E3 · S01E03 · S1 E3 · S2.E1 · Season 1, Ep. 3 · Season 1 Episode 3
     /\bS(?:eason)?\s*(\d{1,3})\s*[:,.\-|·]?\s*E(?:p(?:isode)?)?\.?\s*(\d{1,4})\b/i,
-    /\bSeason\s*(\d{1,3})\b[^\d]{0,12}\bEpisode\s*(\d{1,4})\b/i,
+    /\bSeason\s*(\d{1,3})\b[^\d]{0,12}\b(?:Episode|Ep\.?)\s*(\d{1,4})\b/i,
   ];
-  var EP_ONLY = /\bEp(?:isode)?\.?\s*(\d{1,4})\b/i;
+  var EP_ONLY = /\b(?:Ep(?:isode)?\.?|E)\s*(\d{1,4})\b/i;
+  var SEASON_ONLY = /^(?:S|Season|Series|Part|Volume)\s*(\d{1,3})$/i;
 
   /** Parses season/episode markers; `rest` is the text left after removing them (episode title). */
   function parseSE(text) {
@@ -77,7 +90,8 @@
         };
       }
     }
-    var e = t.match(EP_ONLY);
+    // A standalone "E1" / "Ep. 1" / "Episode 1" token (season shown elsewhere).
+    var e = t.match(/^(?:Ep(?:isode)?\.?|E)\s*(\d{1,4})\b/i) || t.match(/\b(?:Episode|Ep\.)\s*(\d{1,4})\b/i);
     if (e) {
       return {
         season: null,
@@ -88,10 +102,13 @@
     return null;
   }
 
+  var BRAND_ONLY = /^(netflix|prime video|amazon\.?\w*|jiohotstar|disney\+?\s*hotstar|hotstar|zee5|sony ?liv|apple tv\+?|disney\+|hbo max|max|hulu|peacock|paramount\+|crunchyroll|mubi|youtube)$/i;
+
   function stripProviderSuffix(title) {
     return clean(
       String(title || "")
         .replace(/\s*[|\-–—]\s*(Netflix|Prime Video|Amazon\.?\w*|JioHotstar|Disney\+?\s*Hotstar|Hotstar|ZEE5|Sony ?LIV|Apple TV\+?|Disney\+|HBO Max|Max|Hulu|Peacock|Paramount\+|Crunchyroll|MUBI|YouTube)\b.*$/i, "")
+        .replace(/\s+on\s+(Netflix|Prime Video|JioHotstar|Disney\+?\s*Hotstar|Hotstar|ZEE5|Sony ?LIV|Apple TV\+?|Disney\+|HBO Max|Max|Hulu|Peacock|Paramount\+)\b.*$/i, "")
         .replace(/^(Watch|Stream)\s+/i, "")
         .replace(/\s+(Online|Full (Movie|Episode)s?)(\s+(in\s+)?(HD|4K))?.*$/i, ""),
     );
@@ -102,8 +119,20 @@
     return m ? m[1] : null;
   }
 
+  function waitFor(check, timeoutMs, intervalMs) {
+    return new Promise(function (resolve) {
+      var start = Date.now();
+      (function tick() {
+        var value = null;
+        try { value = check(); } catch (_) {}
+        if (value || Date.now() - start > timeoutMs) return resolve(value || null);
+        setTimeout(tick, intervalMs || 400);
+      })();
+    });
+  }
+
   // -------------------------------------------------------------------------------------------
-  // OTT profile detection (the native profile id used for ott_profile_mappings)
+  // OTT profile detection (the native identity used for ott_profile_mappings)
   // -------------------------------------------------------------------------------------------
   var PROFILE_ID_KEYS = ["currentProfileId", "activeProfileId", "selectedProfileId", "profileId", "profile_id", "pid"];
   var PROFILE_NAME_KEYS = ["currentProfileName", "profileName", "profile_name", "name"];
@@ -133,13 +162,23 @@
     return null;
   }
 
-  function detectNetflixProfile() {
+  function netflixUserInfo() {
     try {
-      var data = window.netflix && window.netflix.reactContext && window.netflix.reactContext.models &&
-        window.netflix.reactContext.models.userInfo && window.netflix.reactContext.models.userInfo.data;
-      if (data && data.guid) return { id: String(data.guid), name: data.name ? clean(data.name) : null };
-    } catch (_) {}
-    return null;
+      return window.netflix.reactContext.models.userInfo.data || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Netflix identity = `guid::profile name`. The name disambiguates profiles even if `guid`
+   * turns out to be account-level; a page reload after any profile gate keeps it fresh.
+   */
+  function detectNetflixProfile() {
+    var data = netflixUserInfo();
+    if (!data || !data.guid || !data.name) return null;
+    var name = clean(data.name).slice(0, 64);
+    return { id: String(data.guid) + "::" + name, name: name };
   }
 
   function detectGenericProfile() {
@@ -154,7 +193,7 @@
       keys.sort();
       for (var k = 0; k < keys.length; k++) {
         var key = keys[k];
-        if (!key || !/profile/i.test(key)) continue;
+        if (!key || !/profile/i.test(key) || /^omnia-/.test(key)) continue;
         var raw = store.getItem(key);
         if (!raw) continue;
         var parsed = null;
@@ -171,78 +210,173 @@
   }
 
   function detectOttProfile() {
-    if (CONFIG.provider === "netflix") return detectNetflixProfile();
+    if (IS_NETFLIX) return onProfileGate() ? null : detectNetflixProfile();
     return detectGenericProfile();
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Media metadata detection (title / season / episode) per provider
-  // -------------------------------------------------------------------------------------------
-  var netflixMeta = { id: null, value: null, pending: false };
+  function onProfileGate() {
+    if (!IS_NETFLIX) return false;
+    if (/\/(ProfilesGate|profiles\/manage|SwitchProfile)/i.test(location.pathname)) return true;
+    return !!document.querySelector(
+      '[data-uia*="profile-gate"], [data-uia="profile-choices-page"], .profile-gate-container, .list-profiles, .profiles-gate-container',
+    );
+  }
 
-  function netflixBuildId() {
+  /**
+   * Netflix can switch profiles inside its single-page app, leaving the page's profile data
+   * stale. After any trip through the "Who's watching?" gate, reload once so detection is fresh.
+   */
+  function watchProfileGate() {
+    if (!IS_NETFLIX) return;
+    var KEY = "omnia-gate-seen";
+    setInterval(function () {
+      if (onProfileGate()) {
+        if (!session(KEY)) session(KEY, "1");
+      } else if (session(KEY) && document.readyState === "complete") {
+        session(KEY, null);
+        location.reload();
+      }
+    }, 800);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Netflix metadata (season / episode) — player state first, then APIs, then the DOM
+  // -------------------------------------------------------------------------------------------
+  function netflixContextValue(path) {
     try {
-      return window.netflix.reactContext.models.serverDefs.data.BUILD_IDENTIFIER;
+      var node = window.netflix.reactContext.models;
+      for (var i = 0; i < path.length; i++) node = node[path[i]];
+      return node || null;
     } catch (_) {
       return null;
     }
   }
 
-  /** Netflix hides the title overlay during playback, so resolve the episode from its own metadata API. */
-  function refreshNetflixMetadata(videoId) {
-    if (!videoId || netflixMeta.pending || netflixMeta.id === videoId) return;
-    var build = netflixBuildId();
-    if (!build) return;
-    netflixMeta.pending = true;
-    fetch("/api/shakti/" + build + "/metadata?movieid=" + encodeURIComponent(videoId), { credentials: "include" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (json) {
-        var v = json && json.video;
-        if (!v) return;
-        var result = { title: clean(v.title), seasonNumber: null, episodeNumber: null, episodeTitle: null, runtime: v.runtime || null };
-        if (v.type === "show" && Array.isArray(v.seasons)) {
-          v.seasons.forEach(function (season) {
-            (season.episodes || []).forEach(function (ep) {
-              if (String(ep.episodeId || ep.id) === String(videoId)) {
-                result.seasonNumber = season.seq;
-                result.episodeNumber = ep.seq;
-                result.episodeTitle = ep.title ? clean(ep.title) : null;
-                result.runtime = ep.runtime || result.runtime;
-              }
-            });
+  function fromNetflixVideo(v, videoId) {
+    if (!v || !v.title) return null;
+    var result = { title: clean(v.title), seasonNumber: null, episodeNumber: null, episodeTitle: null };
+    if (v.type === "show" && Array.isArray(v.seasons)) {
+      var wanted = [String(videoId), v.currentEpisode != null ? String(v.currentEpisode) : null];
+      for (var w = 0; w < wanted.length && result.episodeNumber == null; w++) {
+        if (!wanted[w]) continue;
+        v.seasons.forEach(function (season) {
+          (season.episodes || []).forEach(function (ep) {
+            var id = String(ep.episodeId != null ? ep.episodeId : ep.id);
+            if (id === wanted[w] && result.episodeNumber == null) {
+              result.seasonNumber = season.seq != null ? season.seq : season.num;
+              result.episodeNumber = ep.seq != null ? ep.seq : ep.num;
+              result.episodeTitle = ep.title ? clean(ep.title) : null;
+            }
           });
-        }
-        netflixMeta.id = videoId;
-        netflixMeta.value = result;
-        sendSync("metadata");
-      })
-      .catch(function () {})
-      .then(function () { netflixMeta.pending = false; });
+        });
+      }
+    }
+    return result;
   }
 
+  /** Netflix's in-memory player store (no network). */
+  function netflixFromPlayerState(videoId) {
+    try {
+      var app = window.netflix && window.netflix.appContext && window.netflix.appContext.state && window.netflix.appContext.state.playerApp;
+      var st = app && typeof app.getState === "function" ? app.getState() : null;
+      var vm = st && st.videoPlayer && st.videoPlayer.videoMetadata;
+      if (!vm) return null;
+      var keys = Object.keys(vm);
+      for (var i = 0; i < keys.length; i++) {
+        var entry = vm[keys[i]];
+        var video = (entry && entry._metadata && entry._metadata.video) || (entry && entry.video) || null;
+        if (!video) continue;
+        var r = fromNetflixVideo(video, videoId);
+        if (r && (keys[i] === String(videoId) || r.episodeNumber != null || String(video.id) === String(videoId))) return r;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  var netflixMeta = { id: null, value: null, pending: false, failedAt: 0 };
+
+  function refreshNetflixMetadata(videoId) {
+    if (!videoId || netflixMeta.pending || netflixMeta.id === videoId) return;
+    if (Date.now() - netflixMeta.failedAt < 20000) return;
+    var build = netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]);
+    var bases = (build ? ["/api/shakti/" + build + "/metadata"] : []).concat(["/api/shakti/mre/metadata"]);
+    netflixMeta.pending = true;
+    (function attempt(i) {
+      if (i >= bases.length) {
+        netflixMeta.pending = false;
+        netflixMeta.failedAt = Date.now();
+        return;
+      }
+      fetch(bases[i] + "?movieid=" + encodeURIComponent(videoId), { credentials: "include" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (json) {
+          var r = json && json.video ? fromNetflixVideo(json.video, videoId) : null;
+          if (!r) return attempt(i + 1);
+          netflixMeta.id = videoId;
+          netflixMeta.value = r;
+          netflixMeta.pending = false;
+          sendSync("metadata");
+        })
+        .catch(function () { attempt(i + 1); });
+    })(0);
+  }
+
+  /** Netflix's title overlay: <h4>Series</h4><span>S2:E1</span><span>Episode</span> and variants. */
+  function netflixFromDom() {
+    var root = document.querySelector('[data-uia="video-title"]');
+    if (!root) return null;
+    var h4 = root.querySelector("h4");
+    var series = clean(h4 ? h4.textContent : "");
+    var leaves = Array.prototype.filter
+      .call(root.querySelectorAll("*"), function (el) { return el.childElementCount === 0; })
+      .map(function (el) { return clean(el.textContent); })
+      .filter(Boolean);
+    if (!series) series = leaves[0] || "";
+    var season = null, episode = null, epTitle = null;
+    var joined = leaves.filter(function (t) { return t !== series; }).join(" | ");
+    var combined = parseSE(joined.replace(/\s*\|\s*/g, " "));
+    leaves.forEach(function (t) {
+      if (t === series) return;
+      var p = parseSE(t);
+      if (p && p.episode != null) {
+        if (p.season != null) season = p.season;
+        episode = p.episode;
+        if (p.rest && !epTitle) epTitle = p.rest;
+        return;
+      }
+      var s = t.match(SEASON_ONLY);
+      if (s) {
+        season = parseInt(s[1], 10);
+        return;
+      }
+      if (!epTitle && t.length > 1) epTitle = t;
+    });
+    if (episode == null && combined) {
+      episode = combined.episode;
+      if (season == null) season = combined.season;
+    }
+    return { title: series, seasonNumber: season, episodeNumber: episode, episodeTitle: epTitle };
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Media metadata detection (title / season / episode) per provider
+  // -------------------------------------------------------------------------------------------
   var adapters = {
     netflix: function () {
       var id = matchUrl(/\/watch\/(\d+)/);
       if (!id) return null;
-      if (netflixMeta.id === id && netflixMeta.value) {
-        var m = netflixMeta.value;
-        return { title: m.title, seasonNumber: m.seasonNumber, episodeNumber: m.episodeNumber, episodeTitle: m.episodeTitle, ottTitleId: id, confidence: "high" };
+      var r = netflixFromPlayerState(id);
+      if (!r || r.episodeNumber == null) {
+        if (netflixMeta.id === id && netflixMeta.value) r = netflixMeta.value;
+        else refreshNetflixMetadata(id);
       }
-      refreshNetflixMetadata(id);
-      var root = document.querySelector('[data-uia="video-title"]');
-      if (!root) return null;
-      var h4 = root.querySelector("h4");
-      var se = null, epTitle = null;
-      root.querySelectorAll("span").forEach(function (span) {
-        var p = parseSE(span.textContent);
-        if (p && !se) se = p;
-        else if (clean(span.textContent)) epTitle = clean(span.textContent);
-      });
+      if (!r || (r.episodeNumber == null && !r.title)) r = netflixFromDom() || r;
+      if (!r || !r.title) return null;
       return {
-        title: clean(h4 ? h4.textContent : root.textContent),
-        seasonNumber: se ? se.season : null,
-        episodeNumber: se ? se.episode : null,
-        episodeTitle: epTitle,
+        title: r.title,
+        seasonNumber: r.seasonNumber,
+        episodeNumber: r.episodeNumber,
+        episodeTitle: r.episodeTitle,
         ottTitleId: id,
         confidence: "high",
       };
@@ -277,8 +411,6 @@
     }
   }
 
-  var BRAND_ONLY = /^(netflix|prime video|amazon\.?\w*|jiohotstar|disney\+?\s*hotstar|hotstar|zee5|sony ?liv|apple tv\+?|disney\+|hbo max|max|hulu|peacock|paramount\+|crunchyroll|mubi|youtube)$/i;
-
   function fromDocumentTitle() {
     var t = stripProviderSuffix(document.title);
     if (!t || t.length < 2 || BRAND_ONLY.test(t)) return null;
@@ -293,7 +425,6 @@
   var urlKey = location.pathname + location.search;
   var lastDetected = null;
   var urlChangedSinceDetection = false;
-
   var urlChangedAt = 0;
   var hasHighAdapter = !!adapters[CONFIG.provider];
 
@@ -323,7 +454,7 @@
   var activeAccum = 0; // seconds of real watching since the last sync (excludes pause/seek/buffering)
   var lastKnownTime = 0;
   var seekFrom = null;
-  var resumeApplied = !(CONFIG.resumeAtSeconds > 30) || CONFIG.provider === "netflix";
+  var resumeApplied = !(CONFIG.resumeAtSeconds > 30) || IS_NETFLIX;
   var VIDEO_EVENTS = ["play", "playing", "pause", "seeking", "seeked", "ended", "timeupdate", "waiting", "durationchange", "loadedmetadata"];
 
   function isPlaying(v) {
@@ -469,10 +600,43 @@
   window.addEventListener("pagehide", function () { sendSync("final"); });
 
   // -------------------------------------------------------------------------------------------
+  // Play mode: open the title only once the linked profile is active
+  // -------------------------------------------------------------------------------------------
+  /** Returns true while the window is still on the provider's profile-switch pages. */
+  function handleProfileSwitchThenTarget() {
+    if (CONFIG.mode !== "play" || !CONFIG.targetUrl) return false;
+    var KEY = "omnia-target-" + TOKEN_KEY;
+    if (session(KEY) === "done") return false;
+    var started = Date.now();
+    var hinted = false;
+    (function check() {
+      if (onProfileGate()) {
+        // Waiting for the user (e.g. a profile PIN); never time out while on the gate.
+        if (!hinted && ui.panel) {
+          hinted = true;
+          showPanel("Choose " + (CONFIG.expectedOttProfileName || "your linked profile") + " to continue.", null);
+        }
+        started = Date.now();
+        return setTimeout(check, 800);
+      }
+      var p = detectOttProfile();
+      var matches = p && p.id === CONFIG.expectedOttProfileId;
+      if (matches || Date.now() - started > 12000) {
+        session(KEY, "done");
+        location.replace(CONFIG.targetUrl);
+        return;
+      }
+      setTimeout(check, 500);
+    })();
+    return true;
+  }
+
+  // -------------------------------------------------------------------------------------------
   // Liquid Glass overlay pill (closed shadow DOM so page CSS can't touch it)
   // -------------------------------------------------------------------------------------------
   var host = null, shadow = null, ui = {};
   var hideTimer = null;
+  var panelSticky = false;
 
   var STYLE = [
     ":host{all:initial}",
@@ -481,13 +645,13 @@
     ".wrap.show{opacity:1;transform:none;pointer-events:auto}",
     ".glass{background:rgba(18,18,22,.65);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);",
     "box-shadow:inset 0 1px 0 rgba(255,255,255,.22),inset 0 0 0 1px rgba(255,255,255,.06),0 12px 40px rgba(0,0,0,.45);border-radius:12px}",
-    ".pill{display:flex;align-items:center;gap:10px;padding:6px 12px 6px 6px;max-width:min(520px,70vw)}",
+    ".pill{display:flex;align-items:center;gap:10px;padding:6px 12px 6px 6px;max-width:min(560px,70vw)}",
     "button{all:unset;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:9px;background:rgba(255,255,255,.12);font-weight:600;transition:background .2s,transform .2s}",
     "button:hover{background:rgba(255,255,255,.2)}button:active{transform:scale(.96)}button:focus-visible{outline:2px solid #fff;outline-offset:2px}",
     "button.primary{background:rgba(255,255,255,.92);color:#0b0b0f}button.primary:hover{background:#fff}",
     ".title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:rgba(235,235,245,.72)}",
     ".dot{width:7px;height:7px;border-radius:50%;background:#30d158;flex:none}.dot.warn{background:#ff9f0a}.dot.off{background:rgba(235,235,245,.4)}",
-    ".panel{margin-top:10px;padding:14px 16px;max-width:360px}.panel p{margin:0 0 10px;color:rgba(235,235,245,.72)}.panel strong{color:#fff}",
+    ".panel{margin-top:10px;padding:14px 16px;max-width:380px}.panel p{margin:0 0 10px;color:rgba(235,235,245,.78)}.panel strong{color:#fff}",
     ".hidden{display:none}",
   ].join("");
 
@@ -500,7 +664,7 @@
       '<div class="wrap" part="wrap">' +
       '<div class="glass pill"><button class="back" aria-label="Back to Omnia">&#8592; Omnia</button>' +
       '<span class="dot off"></span><span class="title"></span></div>' +
-      '<div class="glass panel hidden"><p class="msg"></p><button class="primary link">Link this profile</button></div>' +
+      '<div class="glass panel hidden"><p class="msg"></p><button class="primary link hidden">Link this profile</button></div>' +
       "</div>";
     ui.wrap = shadow.querySelector(".wrap");
     ui.back = shadow.querySelector(".back");
@@ -535,8 +699,29 @@
     mountOverlay();
     ui.wrap.classList.add("show");
     clearTimeout(hideTimer);
-    if (CONFIG.mode === "connect" && !linked) return;
+    if (panelSticky || (CONFIG.mode === "connect" && !linked)) return;
     if (!sticky) hideTimer = setTimeout(function () { ui.wrap.classList.remove("show"); }, 2500);
+  }
+
+  /** Shows the info panel; `linkLabel` adds the "Link …" button. */
+  function showPanel(message, linkLabel) {
+    if (!ui.panel) return;
+    ui.panel.classList.remove("hidden");
+    ui.msg.textContent = message;
+    if (linkLabel) {
+      ui.link.textContent = linkLabel;
+      ui.link.classList.remove("hidden");
+    } else {
+      ui.link.classList.add("hidden");
+    }
+    panelSticky = true;
+    showOverlay(true);
+  }
+
+  function hidePanel() {
+    if (!ui.panel) return;
+    ui.panel.classList.add("hidden");
+    panelSticky = false;
   }
 
   function renderStatus() {
@@ -549,20 +734,35 @@
     var label = CONFIG.title || (d && d.title) || CONFIG.providerName;
     if (d && d.seasonNumber && d.episodeNumber) label += " · S" + d.seasonNumber + " E" + d.episodeNumber;
     ui.title.textContent = label;
-    ui.dot.className = "dot";
-    if (lastAck && lastAck.attribution === "rejected") {
+    var a = lastAck && lastAck.attribution;
+    var observed = (lastAck && lastAck.observedProfileName) || "This profile";
+    if (a === "recording") {
+      ui.dot.className = "dot";
+      hidePanel();
+    } else if (a === "unlinked") {
       ui.dot.className = "dot warn";
-      ui.title.textContent = lastAck.message || "Not tracking: this " + CONFIG.providerName + " profile isn't linked to " + CONFIG.appProfileName;
-    } else if (lastAck && lastAck.attribution === "rerouted") {
+      ui.title.textContent = "Not tracking yet";
+      showPanel(
+        observed + " on " + CONFIG.providerName + " isn't linked to " + CONFIG.appProfileName + ". Link it so this viewing is saved to " + CONFIG.appProfileName + " only.",
+        "Link to " + CONFIG.appProfileName,
+      );
+    } else if (a === "mismatch") {
       ui.dot.className = "dot warn";
-      ui.title.textContent = label + " — saving to " + (lastAck.profileName || "another profile");
-    } else if (lastAck && lastAck.attribution === "suspended") {
+      ui.title.textContent = "Not tracking: wrong profile";
+      showPanel(
+        observed + (lastAck.ownerProfileName ? " belongs to " + lastAck.ownerProfileName + " in Omnia" : " isn't " + CONFIG.appProfileName + "'s profile") +
+          ". Switch to " + (CONFIG.expectedOttProfileName || "your linked profile") + " in " + CONFIG.providerName + " to track this.",
+        null,
+      );
+    } else {
       ui.dot.className = "dot off";
+      if (lastAck && lastAck.message) ui.title.textContent = lastAck.message;
+      if (a !== "unverified") hidePanel();
     }
   }
 
   // -------------------------------------------------------------------------------------------
-  // Connect mode: the profile handshake
+  // Profile linking (connect mode, or "Link to …" from the pill in play mode)
   // -------------------------------------------------------------------------------------------
   var linked = false;
   var currentProfile = null;
@@ -572,34 +772,39 @@
     var p = detectOttProfile();
     currentProfile = p;
     if (ui.panel) {
-      ui.panel.classList.remove("hidden");
       if (p) {
-        ui.msg.innerHTML = "";
+        showPanel("", "Link this profile");
+        ui.msg.textContent = "";
         ui.msg.append(
           "Signed in to " + CONFIG.providerName + " as ",
           Object.assign(document.createElement("strong"), { textContent: p.name || "profile " + p.id.slice(0, 6) }),
           ". Link it to " + CONFIG.appProfileName + "?",
         );
-        ui.link.classList.remove("hidden");
       } else {
-        ui.msg.textContent = "Sign in to " + CONFIG.providerName + " and choose who's watching.";
-        ui.link.classList.add("hidden");
+        showPanel("Sign in to " + CONFIG.providerName + " and choose who's watching.", null);
       }
     }
-    showOverlay(true);
   }
 
   function linkProfile() {
-    if (!currentProfile || linked) return;
+    var p = CONFIG.mode === "connect" ? currentProfile : detectOttProfile();
+    if (!p || linked) return;
+    var original = ui.link.textContent;
     ui.link.textContent = "Linking…";
-    invoke("report_ott_profile", { token: CONFIG.token, profile: currentProfile }).then(function (res) {
+    invoke("report_ott_profile", { token: CONFIG.token, profile: p }).then(function (res) {
       if (res && res.linked) {
         linked = true;
-        ui.msg.textContent = "Linked ✓ Importing your " + CONFIG.providerName + " history…";
-        ui.link.classList.add("hidden");
+        if (CONFIG.mode === "connect") {
+          showPanel("Linked ✓ Importing your " + CONFIG.providerName + " history…", null);
+        } else {
+          showPanel("Linked ✓ Tracking " + CONFIG.appProfileName + "'s viewing.", null);
+          setTimeout(function () {
+            hidePanel();
+            sendSync("metadata");
+          }, 1800);
+        }
       } else {
-        ui.msg.textContent = (res && res.message) || "Couldn't link this profile. Try again.";
-        ui.link.textContent = "Link this profile";
+        showPanel((res && res.message) || "Couldn't link this profile. Try again.", original);
       }
     });
   }
@@ -693,7 +898,6 @@
       var key = a.href + "|" + clean(a.textContent);
       if (seen[key]) return;
       seen[key] = true;
-      // Nearest date heading above this entry.
       var watchedAt = null;
       for (var el = a; el && !watchedAt && el !== document.body; el = el.parentElement) {
         for (var sib = el.previousElementSibling; sib && !watchedAt; sib = sib.previousElementSibling) {
@@ -715,7 +919,17 @@
     return items;
   }
 
-  function runImport() {
+  function submitHistory(items, error) {
+    return invoke("submit_scraped_history", {
+      token: CONFIG.token,
+      items: items.slice(0, 6000),
+      ottProfile: detectOttProfile(),
+      pageUrl: location.origin + location.pathname,
+      error: items.length ? null : error,
+    });
+  }
+
+  function runGenericImport() {
     var scraper = CONFIG.scraper === "primevideo_history" ? scrapePrimeHistory : scrapeContinueWatching;
     var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 30000);
     var lastCount = -1, stableRounds = 0, scrolls = 0;
@@ -734,18 +948,139 @@
       }
 
       if ((items.length > 0 && stableRounds >= 2) || Date.now() > deadline) {
-        invoke("submit_scraped_history", {
-          token: CONFIG.token,
-          items: items.slice(0, 2000),
-          ottProfile: detectOttProfile(),
-          pageUrl: location.origin + location.pathname,
-          error: items.length ? null : "No history entries were found on " + location.hostname,
-        });
+        submitHistory(items, "No history entries were found on " + location.hostname);
         return;
       }
       setTimeout(tick, 1500);
     }
     setTimeout(tick, 2500);
+  }
+
+  /** Netflix viewing activity through Netflix's own in-page APIs (build id + authURL). */
+  function netflixApiHistory(deadline) {
+    var build = netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]);
+    var info = netflixUserInfo() || {};
+    var auth = info.authURL || netflixContextValue(["memberContext", "data", "userInfo", "authURL"]) || "";
+    var bases = (build ? ["/api/shakti/" + build + "/viewingactivity"] : []).concat(["/api/shakti/mre/viewingactivity"]);
+    var items = [];
+
+    function toItem(v) {
+      var series = v.seriesTitle && clean(v.seriesTitle);
+      var isTv = !!series || v.series != null;
+      var seasonMatch = String(v.seasonDescriptor || "").match(/\d+/);
+      return {
+        title: clean(isTv ? series || v.title : v.title),
+        isTv: isTv,
+        seasonNumber: isTv ? (seasonMatch ? parseInt(seasonMatch[0], 10) : 1) : null,
+        episodeNumber: null,
+        episodeTitle: v.episodeTitle ? clean(v.episodeTitle) : null,
+        progressRatio: null,
+        progressSeconds: typeof v.bookmark === "number" ? v.bookmark : null,
+        durationSeconds: typeof v.duration === "number" ? v.duration : null,
+        watchedAt: typeof v.date === "number" ? new Date(v.date).toISOString() : null,
+      };
+    }
+
+    function page(base, pg) {
+      var url = base + "?pg=" + pg + "&pgSize=100" + (auth ? "&authURL=" + encodeURIComponent(auth) : "");
+      return fetch(url, { credentials: "include", headers: { Accept: "application/json" } }).then(function (r) {
+        return r.ok ? r.json() : null;
+      });
+    }
+
+    function fromBase(i) {
+      if (i >= bases.length) return Promise.resolve(null);
+      return page(bases[i], 0)
+        .then(function (first) {
+          if (!first || !Array.isArray(first.viewedItems)) return fromBase(i + 1);
+          var total = first.vhSize || 0;
+          first.viewedItems.forEach(function (v) { items.push(toItem(v)); });
+          var pg = 1;
+          function next() {
+            if (Date.now() > deadline || (total && items.length >= total) || pg >= 60) return items;
+            return page(bases[i], pg++).then(function (body) {
+              var list = body && body.viewedItems;
+              if (!list || !list.length) return items;
+              list.forEach(function (v) { items.push(toItem(v)); });
+              return next();
+            });
+          }
+          return first.viewedItems.length ? next() : items;
+        })
+        .catch(function () { return fromBase(i + 1); });
+    }
+    return fromBase(0);
+  }
+
+  /** Last resort: the viewing-activity page itself ("Show more" until everything is listed). */
+  function scrapeNetflixActivityPage(deadline) {
+    return new Promise(function (resolve) {
+      var clicks = 0;
+      (function expand() {
+        var more = Array.prototype.find.call(document.querySelectorAll("button"), function (b) {
+          return /show more|load more|see more/i.test(clean(b.textContent)) && !b.disabled;
+        });
+        if (more && clicks < 60 && Date.now() < deadline) {
+          clicks++;
+          more.click();
+          return setTimeout(expand, 1200);
+        }
+        var items = [];
+        var rows = document.querySelectorAll("li.retableRow, li[class*='retableRow'], [data-uia*='viewing-activity'] li, ul li");
+        rows.forEach(function (row) {
+          var link = row.querySelector('a[href*="/title/"]');
+          if (!link) return;
+          var dateEl = row.querySelector(".date, [class*='date']");
+          var watchedAt = parseDateText(dateEl ? dateEl.textContent : "");
+          if (!watchedAt) {
+            Array.prototype.some.call(row.querySelectorAll("*"), function (el) {
+              if (el.childElementCount === 0) watchedAt = parseDateText(el.textContent);
+              return !!watchedAt;
+            });
+          }
+          items.push({
+            title: clean(link.textContent),
+            isTv: false,
+            seasonNumber: null,
+            episodeNumber: null,
+            episodeTitle: null,
+            progressRatio: null,
+            watchedAt: watchedAt,
+          });
+        });
+        resolve(items);
+      })();
+    });
+  }
+
+  function runNetflixImport() {
+    var STEP = "omnia-import-" + TOKEN_KEY;
+    var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 120000);
+    waitFor(function () { return !onProfileGate() && detectOttProfile(); }, 25000).then(function (profile) {
+      if (CONFIG.expectedOttProfileId && (!profile || profile.id !== CONFIG.expectedOttProfileId)) {
+        submitHistory([], profile ? "Netflix is on " + (profile.name || "another profile") + ", not the linked profile." : "Couldn't detect the Netflix profile.");
+        return;
+      }
+      var onActivityPage = /viewingactivity|settings\/viewed/i.test(location.pathname);
+      if (session(STEP) === "dom") {
+        if (!onActivityPage) {
+          location.href = "/viewingactivity";
+          return;
+        }
+        scrapeNetflixActivityPage(deadline).then(function (items) {
+          submitHistory(items, "The Netflix viewing-activity page had no readable entries.");
+        });
+        return;
+      }
+      netflixApiHistory(deadline).then(function (items) {
+        if (items && items.length) {
+          submitHistory(items, null);
+          return;
+        }
+        session(STEP, "dom");
+        location.href = "/viewingactivity";
+      });
+    });
   }
 
   // -------------------------------------------------------------------------------------------
@@ -757,14 +1092,17 @@
     document.addEventListener("mousemove", function () { showOverlay(false); }, { passive: true });
 
     if (CONFIG.mode === "import") {
-      runImport();
+      if (CONFIG.scraper === "netflix_history") runNetflixImport();
+      else runGenericImport();
       return;
     }
+    watchProfileGate();
     if (CONFIG.mode === "connect") {
       pollProfile();
       setInterval(pollProfile, 1500);
       return;
     }
+    if (handleProfileSwitchThenTarget()) return;
 
     // Video discovery: cheap, throttled scan on DOM mutations plus a 1s safety poll.
     var scanQueued = false;
@@ -790,11 +1128,15 @@
     }, 1000);
 
     setInterval(function () {
-      // Periodic sync every CONFIG.syncIntervalMs while playing; idle heartbeats are skipped.
+      // Periodic sync while playing; while paused, a slow heartbeat keeps the profile status fresh.
       if (video && (isPlaying(video) || activeAccum > 0)) sendSync("progress");
     }, CONFIG.syncIntervalMs || 3000);
+    setInterval(function () {
+      if (!video || !isPlaying(video)) sendSync("metadata");
+    }, 10000);
 
     scan();
+    setTimeout(function () { sendSync("metadata"); }, 2500);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot, { once: true });

@@ -7,6 +7,7 @@ import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { extractPalette } from "../../lib/color";
 import { formatRuntime, ratingLabel } from "../../lib/format";
+import { providerFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
 import { details as tmdbDetails, img, type MediaDetails, type MediaSummary } from "../../services/tmdbClient";
 import type { SubscribedProvider } from "../../services/tauriBridge";
@@ -20,15 +21,16 @@ const TRAILER_DELAY_MS = 2_000;
 export function providerBadge(d: MediaDetails | undefined, region: string, subs: SubscribedProvider[]): string | null {
   const r = d?.providersByRegion[region];
   if (!r) return null;
-  const subIds = new Set(subs.filter((s) => s.isActive).map((s) => s.providerId));
+  const fam = (p: { providerId: number; providerName: string }) => providerFamily(p.providerId, p.providerName);
+  const subFamilies = new Set(subs.filter((s) => s.isActive).map((s) => fam(s).key));
   const streaming = [...r.flatrate, ...r.free, ...r.ads];
-  const included = streaming.find((p) => subIds.has(p.providerId));
-  if (included) return `Included with your ${included.providerName} subscription`;
-  if (r.flatrate[0]) return `Streaming on ${r.flatrate[0].providerName}`;
+  const included = streaming.find((p) => subFamilies.has(fam(p).key));
+  if (included) return `Included with your ${fam(included).name} subscription`;
+  if (r.flatrate[0]) return `Streaming on ${fam(r.flatrate[0]).name}`;
   const free = r.free[0] ?? r.ads[0];
-  if (free) return `Free on ${free.providerName}`;
+  if (free) return `Free on ${fam(free).name}`;
   const store = r.rent[0] ?? r.buy[0];
-  return store ? `Rent or buy on ${store.providerName}` : null;
+  return store ? `Rent or buy on ${fam(store).name}` : null;
 }
 
 export function HeroBillboard({ items }: { items: MediaSummary[] }) {

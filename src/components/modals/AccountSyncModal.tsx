@@ -6,6 +6,7 @@
 import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
 import { useAsync } from "../../lib/hooks";
+import { groupByFamily, providerFamily } from "../../lib/providers";
 import { img, regionProviders, type WatchProviderOption } from "../../services/tmdbClient";
 import { ottMappings } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
@@ -60,13 +61,24 @@ export function AccountSyncModal() {
     if (open) void refreshMappings();
   }, [open, refreshMappings]);
 
+  // One row per provider family, keyed by the canonical id Rust stores links under.
   const providers = useMemo(() => {
-    const map = new Map<number, WatchProviderOption>();
-    for (const s of subs) map.set(s.providerId, { providerId: s.providerId, providerName: s.providerName, logoPath: s.logoPath, priority: -1 });
-    for (const p of regional.data ?? []) if (SUPPORTED.test(p.providerName) && !map.has(p.providerId) && p.priority < 60) map.set(p.providerId, p);
-    for (const mp of mappings)
-      if (!map.has(mp.providerId)) map.set(mp.providerId, { providerId: mp.providerId, providerName: `Provider ${mp.providerId}`, logoPath: null, priority: 999 });
-    return [...map.values()].filter((p) => SUPPORTED.test(p.providerName) || mappings.some((m) => m.providerId === p.providerId)).slice(0, 16);
+    const options: WatchProviderOption[] = [
+      ...subs.map((s) => ({ providerId: s.providerId, providerName: s.providerName, logoPath: s.logoPath, priority: -1 })),
+      ...(regional.data ?? []).filter((p) => p.priority < 60),
+    ].filter((p) => SUPPORTED.test(p.providerName));
+    const rows = groupByFamily(options, (p) => p.providerId, (p) => p.providerName).map(({ family, members }) => ({
+      providerId: family.canonicalId,
+      providerName: family.name,
+      logoPath: members.find((m) => m.logoPath)?.logoPath ?? null,
+      priority: members[0]!.priority,
+    }));
+    for (const mp of mappings) {
+      if (!rows.some((r) => r.providerId === mp.providerId)) {
+        rows.push({ providerId: mp.providerId, providerName: providerFamily(mp.providerId, "").name || `Provider ${mp.providerId}`, logoPath: null, priority: 999 });
+      }
+    }
+    return rows.slice(0, 16);
   }, [subs, regional.data, mappings]);
 
   const onFiles = (files: FileList | null) => {

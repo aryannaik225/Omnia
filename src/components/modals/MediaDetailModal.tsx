@@ -7,7 +7,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { extractPalette } from "../../lib/color";
 import { formatRuntime, MONETIZATION_LABEL, ratingLabel } from "../../lib/format";
 import { useAsync } from "../../lib/hooks";
-import { isSubscribedLink } from "../../services/catalog";
+import { groupLinks, isSubscribedLink } from "../../services/catalog";
+import { providerFamily } from "../../lib/providers";
 import {
   details as tmdbDetails,
   img,
@@ -41,7 +42,11 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   const logoFor = (l: ResolvedLink) => {
     const r = d.providersByRegion[region];
     const all = r ? [...r.flatrate, ...r.free, ...r.ads, ...r.rent, ...r.buy] : [];
-    return img(all.find((p) => p.providerId === l.providerId || p.providerName === l.providerName)?.logoPath, "w92");
+    const fam = providerFamily(l.providerId, l.providerName).key;
+    const hit =
+      all.find((p) => p.providerId === l.providerId) ??
+      all.find((p) => providerFamily(p.providerId, p.providerName).key === fam);
+    return img(hit?.logoPath, "w92");
   };
 
   if (links.loading) {
@@ -60,15 +65,18 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   const primary = all.filter((l) => !subscriptionsOnly || isSubscribedLink(l, subs) || ["free", "ads"].includes(l.monetizationType));
   const shown = showAll || !subscriptionsOnly ? all : primary.length ? primary : all;
 
+  const groups = groupLinks(shown);
   return (
     <div>
       <div className="flex flex-wrap gap-3">
-        {shown.map((l) => {
+        {groups.map((g) => {
+          const l = g.primary;
           const logo = logoFor(l);
           const included = isSubscribedLink(l, subs) && ["flatrate", "free", "ads"].includes(l.monetizationType);
+          const extras = [...new Set(g.alternatives.map((a) => MONETIZATION_LABEL[a.monetizationType]).filter((x) => x && x !== MONETIZATION_LABEL[l.monetizationType]))];
           return (
             <m.button
-              key={`${l.providerId}-${l.monetizationType}`}
+              key={g.key}
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.97 }}
               onClick={() => onPlay(l)}
@@ -77,9 +85,11 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
             >
               {logo ? <img src={logo} alt="" className="h-10 w-10 rounded-[10px]" /> : <span className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-white/10 font-bold">{l.providerName[0]}</span>}
               <span>
-                <span className="block text-[14px] font-semibold">{l.providerName}</span>
+                <span className="block text-[14px] font-semibold">{g.name}</span>
                 <span className="block text-[12px] text-label-tertiary">
-                  {[included ? "Included" : MONETIZATION_LABEL[l.monetizationType], l.quality, l.isFallback ? "Search" : null].filter(Boolean).join(" · ")}
+                  {[included ? "Included" : MONETIZATION_LABEL[l.monetizationType], l.quality, l.isFallback ? "Search" : null, extras.length ? `also ${extras.join(", ")}` : null]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </span>
               </span>
             </m.button>
@@ -89,7 +99,7 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
       <div className="mt-3 flex gap-2">
         {subscriptionsOnly && shown.length < all.length && (
           <button className="chip" onClick={() => setShowAll(true)}>
-            Show rent, buy & other services ({all.length - shown.length})
+            Show rent, buy & other services ({groupLinks(all).length - groups.length})
           </button>
         )}
         <button className="chip" onClick={() => setForce((n) => n + 1)} title="Re-resolve deep links">

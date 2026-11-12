@@ -11,6 +11,7 @@ import {
   type MediaSummary,
   type Paged,
 } from "./tmdbClient";
+import { providerFamily } from "../lib/providers";
 import type { CustomHub, MediaType, ResolvedLink, SubscribedProvider, WatchHistoryEntry } from "./tauriBridge";
 
 // ---------------------------------------------------------------------------------------------
@@ -147,10 +148,12 @@ export async function loadHubPage(h: CustomHub, ctx: CatalogContext, facets: Hub
 const MONETIZATION_RANK: Record<string, number> = { flatrate: 0, free: 1, ads: 2, rent: 3, buy: 4, search: 5 };
 
 /** Orders resolved links: subscribed streaming first, direct links before search fallbacks. */
+const subscribedFamilies = (subs: SubscribedProvider[]) =>
+  new Set(subs.filter((s) => s.isActive).map((s) => providerFamily(s.providerId, s.providerName).key));
+
 export function rankLinks(links: ResolvedLink[], subs: SubscribedProvider[]): ResolvedLink[] {
-  const subIds = new Set(subs.filter((s) => s.isActive).map((s) => s.providerId));
-  const subNames = new Set(subs.filter((s) => s.isActive).map((s) => s.providerName.toLowerCase()));
-  const subscribed = (l: ResolvedLink) => subIds.has(l.providerId) || subNames.has(l.providerName.toLowerCase());
+  const families = subscribedFamilies(subs);
+  const subscribed = (l: ResolvedLink) => families.has(providerFamily(l.providerId, l.providerName).key);
   return [...links].sort(
     (a, b) =>
       Number(subscribed(b)) - Number(subscribed(a)) ||
@@ -160,8 +163,30 @@ export function rankLinks(links: ResolvedLink[], subs: SubscribedProvider[]): Re
   );
 }
 
+/** Subscription checks are per family: a "Prime Video" subscription covers "Prime Video with Ads". */
 export const isSubscribedLink = (l: ResolvedLink, subs: SubscribedProvider[]) =>
-  subs.some((s) => s.isActive && (s.providerId === l.providerId || s.providerName.toLowerCase() === l.providerName.toLowerCase()));
+  subscribedFamilies(subs).has(providerFamily(l.providerId, l.providerName).key);
+
+export interface LinkGroup {
+  key: string;
+  name: string;
+  /** Best link for the family (links arrive ranked). */
+  primary: ResolvedLink;
+  /** Other monetisation options of the same family (e.g. Rent / Buy). */
+  alternatives: ResolvedLink[];
+}
+
+/** Collapses "Amazon Prime Video", "... with Ads", "Amazon Video" into one "Prime Video" option. */
+export function groupLinks(ranked: ResolvedLink[]): LinkGroup[] {
+  const groups = new Map<string, LinkGroup>();
+  for (const l of ranked) {
+    const fam = providerFamily(l.providerId, l.providerName);
+    const g = groups.get(fam.key);
+    if (g) g.alternatives.push(l);
+    else groups.set(fam.key, { key: fam.key, name: fam.name, primary: l, alternatives: [] });
+  }
+  return [...groups.values()];
+}
 
 /**
  * The episode to start for a series: resume an unfinished episode, otherwise the one after the

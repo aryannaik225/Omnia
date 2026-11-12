@@ -300,6 +300,31 @@ pub fn count_mappings_for_provider(c: &Connection, provider_id: i64) -> rusqlite
     )
 }
 
+pub fn list_all_ott_mappings(c: &Connection) -> rusqlite::Result<Vec<OttProfileMapping>> {
+    collect_rows(
+        c,
+        "SELECT app_profile_id, provider_id, ott_native_profile_id, ott_native_profile_name
+         FROM ott_profile_mappings ORDER BY app_profile_id, provider_id",
+        [],
+        map_ott_mapping,
+    )
+}
+
+/// Moves a link to another provider id (canonicalisation of monetisation variants). If the
+/// profile already has a link under the target id, that one wins and the old row is dropped.
+pub fn rekey_ott_mapping(c: &Connection, app_profile_id: i64, from_provider: i64, to_provider: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE OR IGNORE ott_profile_mappings SET provider_id = ?3
+         WHERE app_profile_id = ?1 AND provider_id = ?2",
+        params![app_profile_id, from_provider, to_provider],
+    )?;
+    c.execute(
+        "DELETE FROM ott_profile_mappings WHERE app_profile_id = ?1 AND provider_id = ?2",
+        params![app_profile_id, from_provider],
+    )?;
+    Ok(())
+}
+
 pub fn delete_ott_mapping(
     c: &Connection,
     app_profile_id: i64,
@@ -933,6 +958,53 @@ pub fn list_history(
         ),
         params![app_profile_id, limit.clamp(1, 1_000_000), offset.max(0)],
         map_watch,
+    )
+}
+
+/// A history row joined with its parent title's catalog metadata (show/movie name + artwork).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryWithMedia {
+    #[serde(flatten)]
+    pub entry: WatchHistoryEntry,
+    pub title: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    pub release_year: Option<i64>,
+}
+
+/// Recent history with the parent title's name, poster and backdrop (Watching Now view).
+pub fn list_history_with_media(
+    c: &Connection,
+    app_profile_id: i64,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<HistoryWithMedia>> {
+    let cols = WATCH_COLS
+        .split(", ")
+        .map(|col| format!("wh.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    collect_rows(
+        c,
+        &format!(
+            "SELECT {cols}, mc.title, mc.poster_path, mc.backdrop_path, mc.release_year
+             FROM watch_history wh
+             LEFT JOIN media_catalog mc ON mc.tmdb_id = wh.tmdb_id AND mc.media_type = wh.media_type
+             WHERE wh.app_profile_id = ?1
+             ORDER BY wh.last_watched_at DESC, wh.id DESC
+             LIMIT ?2 OFFSET ?3"
+        ),
+        params![app_profile_id, limit.clamp(1, 1_000_000), offset.max(0)],
+        |r| {
+            Ok(HistoryWithMedia {
+                entry: map_watch(r)?,
+                title: r.get(17)?,
+                poster_path: r.get(18)?,
+                backdrop_path: r.get(19)?,
+                release_year: r.get(20)?,
+            })
+        },
     )
 }
 
@@ -1607,6 +1679,61 @@ mod tests {
         c.execute("UPDATE deep_links SET expires_at = datetime('now', '-1 hours')", []).unwrap();
         assert!(get_valid_deep_links(&c, 603, "movie", "IN").unwrap().is_empty());
         assert_eq!(purge_expired_deep_links(&c).unwrap(), 1);
+    }
+
+    #[test]
+    fn history_with_media_joins_parent_title() {
+        let c = test_db();
+        upsert_media(
+            &c,
+            &MediaCatalogEntry {
+                tmdb_id: 1668,
+                media_type: "tv".into(),
+                title: "Friends".into(),
+                original_title: None,
+                overview: None,
+                poster_path: Some("/friends.jpg".into()),
+                backdrop_path: Some("/friends-bg.jpg".into()),
+                release_year: Some(1994),
+                runtime_mins: None,
+                genres: None,
+                keywords: None,
+                credits: None,
+                vote_average: None,
+                certification: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+        let mut u = sample_update(300.0, 1320.0);
+        u.tmdb_id = 1668;
+        u.media_type = "tv".into();
+        u.season_number = 2;
+        u.episode_number = 1;
+        u.episode_title = Some("The One with Ross's New Girlfriend".into());
+        record_progress(&c, &u).unwrap();
+        let rows = list_history_with_media(&c, 1, 10, 0).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Friends"));
+        assert_eq!(rows[0].poster_path.as_deref(), Some("/friends.jpg"));
+        assert_eq!((rows[0].entry.season_number, rows[0].entry.episode_number), (2, 1));
+    }
+
+    #[test]
+    fn mapping_rekey_merges_variants() {
+        let c = test_db();
+        let m = |provider_id: i64, id: &str| OttProfileMapping {
+            app_profile_id: 1,
+            provider_id,
+            ott_native_profile_id: id.into(),
+            ott_native_profile_name: None,
+        };
+        upsert_ott_mapping(&c, &m(119, "P1")).unwrap();
+        rekey_ott_mapping(&c, 1, 119, 9).unwrap();
+        assert_eq!(get_ott_mapping(&c, 1, 9).unwrap().unwrap().ott_native_profile_id, "P1");
+        upsert_ott_mapping(&c, &m(2100, "P2")).unwrap();
+        rekey_ott_mapping(&c, 1, 2100, 9).unwrap();
+        assert_eq!(get_ott_mapping(&c, 1, 9).unwrap().unwrap().ott_native_profile_id, "P1");
+        assert!(get_ott_mapping(&c, 1, 2100).unwrap().is_none());
     }
 
     #[test]

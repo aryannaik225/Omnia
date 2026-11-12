@@ -128,23 +128,29 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
           app().toast({ kind: "error", title: "Title tracking paused", body: String(err) });
         }
       }),
-      events.onOttProfileMismatch((e) =>
-        app().toast({
-          kind: "warning",
-          title: `Not tracking this ${e.providerName} profile`,
-          body: `${e.observedOttProfileName ?? "This profile"} isn't linked to ${app().activeProfile?.profileName ?? "you"}. Switch profiles in ${e.providerName} or link it in Settings.`,
-        }),
-      ),
-      events.onOttProfileRerouted((e) => {
-        const to = app().profiles.find((p) => p.profileId === e.toAppProfileId);
-        app().toast({ kind: "info", title: "Saving to another profile", body: `This ${e.providerName} profile belongs to ${to?.profileName ?? "another profile"}.` });
+      events.onOttProfileMismatch((e) => {
+        const me = app().activeProfile?.profileName ?? "you";
+        const who = e.observedOttProfileName ?? "This profile";
+        app().toast(
+          e.reason === "unlinked"
+            ? { kind: "info", title: `Link your ${e.providerName} profile`, body: `${who} isn't linked to ${me} yet, so nothing is being saved. Use “Link” in the player's top-left pill.` }
+            : { kind: "warning", title: `Not tracking: wrong ${e.providerName} profile`, body: `${who} isn't ${me}'s linked profile. Nothing is saved until you switch profiles in ${e.providerName}.` },
+        );
       }),
       events.onOttProfileConnected((e) => {
         void get().refreshMappings();
-        set((s) => ({
-          imports: { ...s.imports, [importKey(e.appProfileId, e.providerName)]: { providerName: e.providerName, stage: "starting", done: 0, total: 0 } },
-        }));
-        app().toast({ kind: "success", title: `${e.providerName} linked`, body: `${e.ottProfileName ?? "Profile"} → importing your history…` });
+        if (e.importing) {
+          set((s) => ({
+            imports: { ...s.imports, [importKey(e.appProfileId, e.providerName)]: { providerName: e.providerName, stage: "starting", done: 0, total: 0 } },
+          }));
+        }
+        app().toast({
+          kind: "success",
+          title: `${e.providerName} linked`,
+          body: e.importing
+            ? `${e.ottProfileName ?? "Profile"} → importing your history…`
+            : `${e.ottProfileName ?? "Profile"} is now tracked for ${app().activeProfile?.profileName ?? "this profile"}.`,
+        });
       }),
       events.onHistoryImportProgress((e) =>
         set((s) => ({

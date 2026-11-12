@@ -16,7 +16,7 @@ export const SIDEBAR_COLLAPSED = 76;
 const NAV: { view: View; label: string; icon: ComponentType<{ size?: number }> }[] = [
   { view: "search", label: "Search", icon: SearchIcon },
   { view: "home", label: "Home", icon: HomeIcon },
-  { view: "continue", label: "Watch Now", icon: PlayCircleIcon },
+  { view: "continue", label: "Watching Now", icon: PlayCircleIcon },
   { view: "myotts", label: "My OTTs", icon: TvIcon },
   { view: "hubs", label: "Franchises & Hubs", icon: GridIcon },
   { view: "watchlist", label: "Watchlist", icon: BookmarkIcon },

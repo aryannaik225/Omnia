@@ -30,7 +30,7 @@ use tokio::task::JoinSet;
 
 use crate::db::queries::{self, HistoryImport, MediaCatalogEntry, OttProfileMapping};
 use crate::db::Database;
-use crate::player::window_manager::{self as wm, DetectedOttProfile, OttProvider};
+use crate::player::window_manager::{self as wm, canonical_provider_id, DetectedOttProfile, OttProvider};
 use crate::resolver::justwatch::normalize_title;
 use crate::{AppError, AppResult, AppState};
 
@@ -39,6 +39,8 @@ pub const EVT_IMPORT_FINISHED: &str = "omnia://history-import-finished";
 
 const IMPORTER_LABEL_PREFIX: &str = "importer-";
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(50);
+/// The Netflix fallback may page through years of activity inside the page.
+const NETFLIX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(150);
 const TMDB_CONCURRENCY: usize = 4;
 const MAX_UNIQUE_TITLES: usize = 1500;
 const MAX_SEASON_LOOKUPS: usize = 400;
@@ -114,6 +116,10 @@ pub struct ScrapedItem {
     pub is_tv: bool,
     #[serde(default)]
     pub progress_ratio: Option<f64>,
+    #[serde(default)]
+    pub progress_seconds: Option<f64>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     #[serde(default)]
     pub watched_at: Option<String>,
 }
@@ -200,6 +206,8 @@ async fn import_ott_history_inner(
     provider_name: &str,
 ) -> AppResult<ImportReport> {
     let state = app.state::<AppState>();
+    // Links are stored per provider family ("Prime Video with Ads" == "Prime Video").
+    let provider_id = canonical_provider_id(provider_id, provider_name);
     let _guard = RunGuard::acquire(&state.importer, (app_profile_id, provider_id))?;
 
     let mapping = state
@@ -217,7 +225,13 @@ async fn import_ott_history_inner(
     emit_progress(app, app_profile_id, provider_name, "fetching", 0, 0);
     let provider = OttProvider::detect(provider_id, provider_name);
     let raw = match provider {
-        OttProvider::Netflix => fetch_netflix_history(app, &mapping, provider_name).await?,
+        OttProvider::Netflix => match fetch_netflix_history(app, &mapping, provider_name).await? {
+            Ok(items) => items,
+            Err(api_unavailable) => {
+                log::warn!("{api_unavailable}; falling back to the in-page Netflix importer");
+                scrape_netflix_in_page(app, &mapping, provider_name).await?
+            }
+        },
         OttProvider::Generic => {
             return Err(msg(format!(
                 "Automatic import isn't available for {provider_name}. Use a CSV/JSON file import instead."
@@ -368,6 +382,7 @@ fn cookie_client(origin: &str, cookies: &[CookieParts]) -> AppResult<reqwest::Cl
 #[derive(Debug, Default, PartialEq)]
 struct NetflixContext {
     build_identifier: Option<String>,
+    auth_url: Option<String>,
     profile_guid: Option<String>,
     profile_name: Option<String>,
 }
@@ -459,8 +474,11 @@ fn find_js_string(hay: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Reads the Shakti build id, the `authURL` token and the active profile from Netflix's inline
+/// `reactContext` (present on the homepage and most account pages).
 fn parse_netflix_context(html: &str) -> Option<NetflixContext> {
     let build_identifier = find_js_string(html, "BUILD_IDENTIFIER");
+    let auth_url = find_js_string(html, "authURL");
     let (profile_guid, profile_name) = match html.find("\"userInfo\"") {
         Some(i) => {
             let window = &html[i..char_floor(html, i + 6000)];
@@ -468,10 +486,21 @@ fn parse_netflix_context(html: &str) -> Option<NetflixContext> {
         }
         None => (None, None),
     };
-    if build_identifier.is_none() && profile_guid.is_none() {
+    if build_identifier.is_none() && profile_guid.is_none() && auth_url.is_none() {
         return None;
     }
-    Some(NetflixContext { build_identifier, profile_guid, profile_name })
+    Some(NetflixContext { build_identifier, auth_url, profile_guid, profile_name })
+}
+
+/// Netflix identities are `guid::profile name` (links created before this format store the bare
+/// guid). Both the guid and, when present, the name must match.
+fn netflix_identity_matches(mapped: &str, guid: &str, name: Option<&str>) -> bool {
+    match mapped.split_once("::") {
+        Some((mapped_guid, mapped_name)) => {
+            mapped_guid.trim() == guid.trim() && name.is_some_and(|n| n.trim() == mapped_name.trim())
+        }
+        None => mapped.trim() == guid.trim(),
+    }
 }
 
 fn first_number(s: &str) -> Option<i64> {
@@ -509,7 +538,14 @@ fn netflix_item(v: &Value) -> Option<RawItem> {
     })
 }
 
-async fn fetch_netflix_history(app: &AppHandle, mapping: &OttProfileMapping, provider_name: &str) -> AppResult<Vec<RawItem>> {
+/// Netflix via the private cookie jar. The outer error is fatal (not signed in, profile can't be
+/// verified); the inner `Err` means the viewing-activity API itself is unavailable, in which
+/// case the caller falls back to the in-page importer.
+async fn fetch_netflix_history(
+    app: &AppHandle,
+    mapping: &OttProfileMapping,
+    provider_name: &str,
+) -> AppResult<Result<Vec<RawItem>, String>> {
     let cookies = read_cookies(app, "https://www.netflix.com/").await?;
     if !cookies.iter().any(|c| c.name == "NetflixId" || c.name == "SecureNetflixId") {
         return Err(msg("You're not signed in to Netflix inside Omnia. Use Connect Accounts to sign in first."));
@@ -518,17 +554,34 @@ async fn fetch_netflix_history(app: &AppHandle, mapping: &OttProfileMapping, pro
     drop(cookies);
 
     // Point this private session at the mapped profile. The WebView2 session is untouched.
-    let switch_url = format!(
-        "https://www.netflix.com/SwitchProfile?tkn={}",
-        url::form_urlencoded::byte_serialize(mapping.ott_native_profile_id.as_bytes()).collect::<String>()
-    );
-    let _ = client.get(switch_url).send().await;
+    if let Some(switch_url) = OttProvider::Netflix.profile_switch_url(&mapping.ott_native_profile_id) {
+        let _ = client.get(switch_url).send().await;
+    }
 
-    let html = client.get("https://www.netflix.com/viewingactivity").send().await?.text().await?;
-    let ctx = parse_netflix_context(&html)
-        .ok_or_else(|| msg("Couldn't read your Netflix session. Sign in again via Connect Accounts."))?;
+    // Scrape the homepage (then the activity page) for BUILD_IDENTIFIER, authURL and the profile.
+    let mut ctx: Option<NetflixContext> = None;
+    for page_url in ["https://www.netflix.com/browse", "https://www.netflix.com/viewingactivity"] {
+        let html = client.get(page_url).send().await?.text().await?;
+        if let Some(found) = parse_netflix_context(&html) {
+            let merged = match ctx.take() {
+                Some(prev) => NetflixContext {
+                    build_identifier: prev.build_identifier.or(found.build_identifier),
+                    auth_url: prev.auth_url.or(found.auth_url),
+                    profile_guid: prev.profile_guid.or(found.profile_guid),
+                    profile_name: prev.profile_name.or(found.profile_name),
+                },
+                None => found,
+            };
+            let complete = merged.profile_guid.is_some() && merged.auth_url.is_some() && merged.build_identifier.is_some();
+            ctx = Some(merged);
+            if complete {
+                break;
+            }
+        }
+    }
+    let ctx = ctx.ok_or_else(|| msg("Couldn't read your Netflix session. Sign in again via Connect Accounts."))?;
     match ctx.profile_guid.as_deref() {
-        Some(guid) if guid == mapping.ott_native_profile_id => {}
+        Some(guid) if netflix_identity_matches(&mapping.ott_native_profile_id, guid, ctx.profile_name.as_deref()) => {}
         Some(_) => {
             return Err(msg(format!(
                 "Netflix didn't switch to the linked profile{}; import aborted to keep profiles separate.",
@@ -537,21 +590,53 @@ async fn fetch_netflix_history(app: &AppHandle, mapping: &OttProfileMapping, pro
         }
         None => return Err(msg("Couldn't verify the active Netflix profile; import aborted to keep profiles separate.")),
     }
-    let build = ctx
-        .build_identifier
-        .ok_or_else(|| msg("Netflix page format changed (no build identifier)."))?;
 
+    let mut bases: Vec<String> = Vec::new();
+    if let Some(build) = &ctx.build_identifier {
+        bases.push(format!("https://www.netflix.com/api/shakti/{build}/viewingactivity"));
+    }
+    bases.push("https://www.netflix.com/api/shakti/mre/viewingactivity".to_string());
+
+    let mut working: Option<String> = None;
+    let mut failures: Vec<String> = Vec::new();
     let mut items = Vec::new();
     for page in 0..NETFLIX_MAX_PAGES {
-        let url = format!("https://www.netflix.com/api/shakti/{build}/viewingactivity?pg={page}&pgSize=100");
-        let resp = client.get(&url).header(reqwest::header::ACCEPT, "application/json").send().await?;
-        if !resp.status().is_success() {
+        let candidates = match &working {
+            Some(base) => vec![base.clone()],
+            None => bases.clone(),
+        };
+        let mut body: Option<Value> = None;
+        for base in candidates {
+            let mut query = vec![("pg", page.to_string()), ("pgSize", "100".to_string())];
+            if let Some(auth) = ctx.auth_url.as_ref().filter(|a| !a.is_empty()) {
+                query.push(("authURL", auth.clone()));
+            }
+            let resp = client
+                .get(&base)
+                .query(&query)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    if v.get("viewedItems").is_some() {
+                        working = Some(base);
+                        body = Some(v);
+                        break;
+                    }
+                }
+                failures.push(format!("{} returned an unexpected body", base.rsplit("/api/").next().unwrap_or(&base)));
+            } else {
+                failures.push(format!("HTTP {} from {}", status.as_u16(), base.rsplit("/api/").next().unwrap_or(&base)));
+            }
+        }
+        let Some(body) = body else {
             if page == 0 {
-                return Err(msg(format!("Netflix viewing activity request failed (HTTP {}).", resp.status())));
+                return Ok(Err(format!("Netflix viewing-activity API unavailable ({})", failures.join("; "))));
             }
             break;
-        }
-        let body: Value = resp.json().await?;
+        };
         let viewed = body["viewedItems"].as_array().cloned().unwrap_or_default();
         if viewed.is_empty() {
             break;
@@ -563,7 +648,38 @@ async fn fetch_netflix_history(app: &AppHandle, mapping: &OttProfileMapping, pro
             break;
         }
     }
-    Ok(items)
+    if let Some(base) = &working {
+        log::info!("Netflix history read via {}", base.rsplit("/api/").next().unwrap_or(base));
+    }
+    Ok(Ok(items))
+}
+
+/// Fallback: a hidden WebView2 switches to the linked profile, then the injected script calls
+/// Netflix's own APIs from inside the page (or scrapes the viewing-activity page).
+async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, provider_name: &str) -> AppResult<Vec<RawItem>> {
+    let start = OttProvider::Netflix
+        .profile_switch_url(&mapping.ott_native_profile_id)
+        .unwrap_or_else(|| "https://www.netflix.com/browse".to_string());
+    let payload = scrape_with_hidden_window(
+        app,
+        OttProvider::Netflix,
+        provider_name,
+        &start,
+        "netflix_history",
+        Some(&mapping.ott_native_profile_id),
+        NETFLIX_SCRAPE_TIMEOUT,
+    )
+    .await?;
+    // Netflix exposes the active profile reliably, so verification is mandatory here.
+    match payload.ott_profile.as_ref().map(|p| p.id.as_str()) {
+        Some(id) if id == mapping.ott_native_profile_id || netflix_identity_matches(&mapping.ott_native_profile_id, wm::netflix_guid(id), id.split_once("::").map(|(_, n)| n)) => {}
+        Some(_) => return Err(msg("Netflix is on a different profile than the linked one; import aborted to keep profiles separate.")),
+        None => return Err(msg("Couldn't verify the active Netflix profile; import aborted to keep profiles separate.")),
+    }
+    if payload.items.is_empty() {
+        return Err(msg(payload.error.unwrap_or_else(|| "No Netflix history was found.".into())));
+    }
+    Ok(scraped_to_raw(payload.items, true, true))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -586,6 +702,8 @@ async fn scrape_with_hidden_window(
     provider_name: &str,
     url: &str,
     scraper: &str,
+    expected_profile: Option<&str>,
+    timeout: Duration,
 ) -> AppResult<ScrapePayload> {
     let state = app.state::<AppState>();
     let parsed = tauri::Url::parse(url).map_err(|e| msg(e.to_string()))?;
@@ -604,7 +722,9 @@ async fn scrape_with_hidden_window(
         "resumeAtSeconds": 0,
         "syncIntervalMs": 3000,
         "scraper": scraper,
-        "scrapeTimeoutMs": 30000,
+        "expectedOttProfileId": expected_profile,
+        // Leave headroom so the script reports what it has before Rust gives up.
+        "scrapeTimeoutMs": timeout.saturating_sub(Duration::from_secs(10)).as_millis() as u64,
     });
     let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false) {
         Ok(w) => w,
@@ -613,7 +733,7 @@ async fn scrape_with_hidden_window(
             return Err(e);
         }
     };
-    let outcome = tokio::time::timeout(SCRAPE_TIMEOUT, rx).await;
+    let outcome = tokio::time::timeout(timeout, rx).await;
     state.importer.pending().remove(&label);
     let _ = window.destroy();
     match outcome {
@@ -621,6 +741,47 @@ async fn scrape_with_hidden_window(
         Ok(Err(_)) => Err(msg("The history window closed before finishing.")),
         Err(_) => Err(msg(format!("Timed out reading {provider_name} history. Are you signed in?"))),
     }
+}
+
+/// Converts scraped rows into raw history. Netflix activity titles ("Series: Season 2: Episode")
+/// are split into series / season / episode title.
+fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) -> Vec<RawItem> {
+    items
+        .into_iter()
+        .filter(|i| !i.title.trim().is_empty())
+        .map(|i| {
+            let ratio = i.progress_ratio.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0));
+            let has_seconds = i.progress_seconds.is_some_and(|p| p.is_finite()) && i.duration_seconds.is_some_and(|d| d > 1.0);
+            let (title, mut is_tv, mut season, mut episode_title) = (
+                i.title.trim().to_string(),
+                if i.is_tv || i.episode_number.is_some() { Some(true) } else { None },
+                i.season_number,
+                i.episode_title.clone(),
+            );
+            let title = if netflix && season.is_none() && episode_title.is_none() {
+                let (series, tv, s, ep) = parse_netflix_title(&title);
+                is_tv = is_tv.or(tv);
+                season = s;
+                episode_title = ep;
+                series
+            } else {
+                title
+            };
+            RawItem {
+                title,
+                is_tv,
+                season,
+                episode: i.episode_number,
+                episode_title,
+                watched_at: i.watched_at.as_deref().and_then(parse_loose_date),
+                has_time_of_day: false,
+                progress_seconds: if has_seconds { i.progress_seconds } else { None },
+                duration_seconds: if has_seconds { i.duration_seconds } else { None },
+                progress_ratio: ratio,
+                assume_completed: history_page && ratio.is_none() && !has_seconds,
+            }
+        })
+        .collect()
 }
 
 async fn scrape_provider_history(
@@ -638,7 +799,7 @@ async fn scrape_provider_history(
             false,
         ),
     };
-    let payload = scrape_with_hidden_window(app, provider, provider_name, &url, scraper).await?;
+    let payload = scrape_with_hidden_window(app, provider, provider_name, &url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
 
     let state = app.state::<AppState>();
     let provider_id = mapping.provider_id;
@@ -656,27 +817,7 @@ async fn scrape_provider_history(
     if payload.items.is_empty() {
         return Err(msg(payload.error.unwrap_or_else(|| format!("No {provider_name} history was found."))));
     }
-    Ok(payload
-        .items
-        .into_iter()
-        .filter(|i| !i.title.trim().is_empty())
-        .map(|i| {
-            let ratio = i.progress_ratio.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0));
-            RawItem {
-                title: i.title.trim().to_string(),
-                is_tv: if i.is_tv || i.episode_number.is_some() { Some(true) } else { None },
-                season: i.season_number,
-                episode: i.episode_number,
-                episode_title: i.episode_title,
-                watched_at: i.watched_at.as_deref().and_then(parse_loose_date),
-                has_time_of_day: false,
-                progress_seconds: None,
-                duration_seconds: None,
-                progress_ratio: ratio,
-                assume_completed: history_page && ratio.is_none(),
-            }
-        })
-        .collect())
+    Ok(scraped_to_raw(payload.items, history_page, false))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1372,6 +1513,42 @@ mod tests {
         assert_eq!(items[0].title, "Dark");
         assert_eq!(items[0].watched_at.unwrap().format("%Y-%m-%d").to_string(), "2025-01-10");
         assert!(items[0].assume_completed);
+    }
+
+    #[test]
+    fn netflix_identity_and_auth_url() {
+        assert!(netflix_identity_matches("G1::Clara", "G1", Some("Clara")));
+        assert!(!netflix_identity_matches("G1::Clara", "G1", Some("Aryan")), "same account guid, other profile");
+        assert!(!netflix_identity_matches("G1::Clara", "G2", Some("Clara")));
+        assert!(netflix_identity_matches("G1", "G1", Some("Anyone")), "legacy bare-guid links");
+        let html = r#"{"models":{"userInfo":{"data":{"name":"Clara","guid":"G1","authURL":"abc.123"}},"serverDefs":{"data":{"BUILD_IDENTIFIER":"v1"}}}}"#;
+        let ctx = parse_netflix_context(html).unwrap();
+        assert_eq!(ctx.auth_url.as_deref(), Some("abc.123"));
+        assert_eq!(ctx.build_identifier.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn netflix_scraped_rows_are_split_into_series_and_season() {
+        let rows = scraped_to_raw(
+            vec![ScrapedItem {
+                title: "Friends: Season 2: The One with Ross's New Girlfriend".into(),
+                season_number: None,
+                episode_number: None,
+                episode_title: None,
+                is_tv: false,
+                progress_ratio: None,
+                progress_seconds: Some(600.0),
+                duration_seconds: Some(1320.0),
+                watched_at: Some("2026-11-11T21:00:00Z".into()),
+            }],
+            true,
+            true,
+        );
+        assert_eq!(rows[0].title, "Friends");
+        assert_eq!(rows[0].season, Some(2));
+        assert_eq!(rows[0].episode_title.as_deref(), Some("The One with Ross's New Girlfriend"));
+        assert_eq!(rows[0].progress_seconds, Some(600.0));
+        assert!(!rows[0].assume_completed);
     }
 
     #[test]

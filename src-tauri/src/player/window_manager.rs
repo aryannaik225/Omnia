@@ -2,15 +2,20 @@
 //!
 //! Spawns a dedicated player `WebviewWindow` pointed at the resolved OTT deep link, injects the
 //! `<video>` telemetry observer, and turns its 3-second samples into `watch_history` /
-//! `playback_events` rows **for the correct Omnia profile**.
+//! `playback_events` rows **only for a verified Omnia profile**.
 //!
-//! Profile isolation: each sample carries the OTT's native profile id (Netflix `guid`, Prime
-//! `profileId`, ...). It is resolved through `ott_profile_mappings`:
-//!   * mapped to the session's profile         -> recorded to the session profile
-//!   * mapped to a *different* Omnia profile    -> rerouted to that profile (it's their viewing)
-//!   * unmapped while the session profile has a different mapping for this provider
-//!                                              -> rejected (never guess; nothing is written)
-//!   * not detectable / no mappings exist       -> recorded to the session profile
+//! Profile isolation (strict): every sample carries the OTT's native profile identity (Netflix
+//! `guid::name`, Prime `profileId`, ...). A sample is written to the session's Omnia profile only
+//! when that identity equals the OTT profile linked to it in `ott_profile_mappings`:
+//!   * linked profile is active                       -> recorded
+//!   * another OTT profile is active                  -> dropped ("mismatch")
+//!   * no link yet, but an OTT profile is detected    -> dropped; the pill offers one-click linking
+//!   * profile can't be determined while links exist  -> dropped ("unverified")
+//!   * provider never linked by anyone & undetectable -> recorded (no isolation configured)
+//! Nothing is ever rerouted to another family member's history.
+//!
+//! On launch, providers that support it are switched to the linked profile first (Netflix
+//! `SwitchProfile`), then the deep link is opened.
 //!
 //! Security: player windows load third-party pages. Their IPC is restricted by the `player`
 //! capability (remote OTT origins only, four telemetry commands only), and every call must carry
@@ -48,7 +53,6 @@ pub const EVT_PLAYER_CLOSED: &str = "omnia://player-closed";
 pub const EVT_PLAYBACK_PROGRESS: &str = "omnia://playback-progress";
 pub const EVT_TITLE_CHANGED: &str = "omnia://player-title-changed";
 pub const EVT_PROFILE_MISMATCH: &str = "omnia://ott-profile-mismatch";
-pub const EVT_PROFILE_REROUTED: &str = "omnia://ott-profile-rerouted";
 pub const EVT_PROFILE_CONNECTED: &str = "omnia://ott-profile-connected";
 
 static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -77,16 +81,26 @@ pub enum OttProvider {
 }
 
 impl OttProvider {
-    /// Matches by TMDB/JustWatch provider id first, then by name.
+    /// Matches by TMDB/JustWatch provider id first, then by name. Monetisation variants
+    /// ("with Ads", "Kids", the Amazon store…) all map to their parent family.
     pub fn detect(provider_id: i64, provider_name: &str) -> Self {
         use OttProvider::*;
-        let n = provider_name.to_lowercase();
+        let lower = provider_name.trim().to_lowercase();
+        // Channels resold through a store ("MUBI Amazon Channel") belong to their own brand.
+        let channel_suffix = [" amazon channel", " apple tv channel", " roku premium channel"]
+            .iter()
+            .find(|sfx| lower.ends_with(**sfx));
+        let n = match channel_suffix {
+            Some(sfx) => lower[..lower.len() - sfx.len()].to_string(),
+            None => lower,
+        };
+        let provider_id = if channel_suffix.is_some() { -1 } else { provider_id };
         let has = |s: &str| n.contains(s);
         if matches!(provider_id, 8 | 175 | 1796) || has("netflix") {
             Netflix
         } else if matches!(provider_id, 122 | 220 | 2336) || has("hotstar") || has("jiocinema") {
             Hotstar
-        } else if matches!(provider_id, 9 | 10 | 119 | 2100) || has("prime video") || has("amazon") {
+        } else if matches!(provider_id, 9 | 10 | 119 | 2100 | 613) || has("prime video") || has("amazon") {
             PrimeVideo
         } else if provider_id == 337 || has("disney") {
             DisneyPlus
@@ -102,9 +116,9 @@ impl OttProvider {
             Hulu
         } else if matches!(provider_id, 386 | 387) || has("peacock") {
             Peacock
-        } else if provider_id == 531 || has("paramount") {
+        } else if matches!(provider_id, 531 | 582 | 1853) || has("paramount") {
             ParamountPlus
-        } else if provider_id == 283 || has("crunchyroll") {
+        } else if matches!(provider_id, 283 | 1968) || has("crunchyroll") {
             Crunchyroll
         } else {
             Generic
@@ -130,6 +144,27 @@ impl OttProvider {
         }
     }
 
+    /// One stable id per family, so a link made on "Prime Video with Ads" (2100) also applies to
+    /// "Amazon Prime Video" (9/119). Generic providers keep their own id.
+    pub fn canonical_id(self) -> Option<i64> {
+        use OttProvider::*;
+        Some(match self {
+            Netflix => 8,
+            PrimeVideo => 9,
+            Hotstar => 122,
+            Zee5 => 232,
+            SonyLiv => 237,
+            AppleTv => 350,
+            DisneyPlus => 337,
+            HboMax => 1899,
+            Hulu => 15,
+            Peacock => 386,
+            ParamountPlus => 531,
+            Crunchyroll => 283,
+            Generic => return None,
+        })
+    }
+
     /// Landing page for the "Connect account" handshake (login + "Who's watching?").
     pub fn home_url(self, region: &str) -> Option<String> {
         use OttProvider::*;
@@ -150,6 +185,38 @@ impl OttProvider {
             Generic => return None,
         })
     }
+
+    /// URL that makes the provider switch the browser session to a given native profile.
+    pub fn profile_switch_url(self, native_profile_id: &str) -> Option<String> {
+        match self {
+            OttProvider::Netflix => {
+                let guid = netflix_guid(native_profile_id);
+                (!guid.is_empty()).then(|| {
+                    format!(
+                        "https://www.netflix.com/SwitchProfile?tkn={}",
+                        url::form_urlencoded::byte_serialize(guid.as_bytes()).collect::<String>()
+                    )
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Providers whose player exposes reliable season/episode metadata: for these, series
+    /// progress is only recorded once the episode is confirmed (never the launch-time guess).
+    pub fn confirms_episodes(self) -> bool {
+        matches!(self, OttProvider::Netflix | OttProvider::PrimeVideo)
+    }
+}
+
+/// Netflix identities are stored as `guid::profile name`; the guid part drives `SwitchProfile`.
+pub fn netflix_guid(native_profile_id: &str) -> &str {
+    native_profile_id.split("::").next().unwrap_or_default().trim()
+}
+
+/// Canonical provider id used for every `ott_profile_mappings` read and write.
+pub fn canonical_provider_id(provider_id: i64, provider_name: &str) -> i64 {
+    OttProvider::detect(provider_id, provider_name).canonical_id().unwrap_or(provider_id)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -202,6 +269,8 @@ pub struct PlayerOpened {
     pub mode: PlayerMode,
     pub resume_at_seconds: Option<f64>,
     pub mapped_ott_profile_id: Option<String>,
+    /// True when the window first switches the provider to the linked profile.
+    pub switching_profile: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -278,22 +347,23 @@ pub struct TelemetryPayload {
 #[serde(rename_all = "camelCase")]
 pub struct TelemetryAck {
     pub accepted: bool,
-    /// `session` | `rerouted` | `rejected` | `suspended`
+    /// `recording` | `mismatch` | `unlinked` | `unverified` | `suspended`
     pub attribution: &'static str,
-    pub profile_id: Option<i64>,
-    pub profile_name: Option<String>,
+    /// Omnia profile that owns the observed OTT profile (mismatch only).
+    pub owner_profile_name: Option<String>,
+    pub observed_profile_name: Option<String>,
     pub message: Option<String>,
 }
 
 impl TelemetryAck {
-    fn suspended(message: Option<String>) -> Self {
-        Self { accepted: false, attribution: "suspended", profile_id: None, profile_name: None, message }
+    fn status(attribution: &'static str, message: Option<String>) -> Self {
+        Self { accepted: false, attribution, owner_profile_name: None, observed_profile_name: None, message }
     }
 }
 
 impl Default for TelemetryAck {
     fn default() -> Self {
-        Self::suspended(None)
+        Self::status("suspended", None)
     }
 }
 
@@ -351,6 +421,8 @@ pub struct PlayerStatus {
     pub duration_seconds: f64,
     pub active_watch_seconds: f64,
     pub awaiting_rebind: bool,
+    /// `recording` | `mismatch` | `unlinked` | `unverified` | `pending`
+    pub tracking: &'static str,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -359,28 +431,55 @@ pub struct PlayerStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attribution {
-    Session(i64),
-    Rerouted(i64),
-    Rejected,
+    /// The linked OTT profile is active: record to this Omnia profile.
+    Recording(i64),
+    /// A different OTT profile than the linked one is active.
+    Mismatch,
+    /// No link for this Omnia profile; the active OTT profile belongs to another Omnia profile.
+    OwnedByOther,
+    /// No link yet and the active OTT profile is unclaimed: offer linking, record nothing.
+    Unlinked,
+    /// The active OTT profile can't be determined while links exist.
+    Unverified,
 }
 
-/// Decides which Omnia profile a telemetry sample belongs to. See the module docs for the rules.
+impl Attribution {
+    fn key(self) -> &'static str {
+        match self {
+            Attribution::Recording(_) => "recording",
+            Attribution::Mismatch | Attribution::OwnedByOther => "mismatch",
+            Attribution::Unlinked => "unlinked",
+            Attribution::Unverified => "unverified",
+        }
+    }
+}
+
+/// Strict attribution. See the module docs; nothing is ever attributed to another profile.
 pub fn attribute(
     session_profile: i64,
     session_mapping: Option<&str>,
     observed: Option<&str>,
     owner_of_observed: Option<i64>,
+    provider_has_mappings: bool,
 ) -> Attribution {
-    let Some(observed) = observed else {
-        return Attribution::Session(session_profile);
-    };
-    match owner_of_observed {
-        Some(owner) if owner == session_profile => Attribution::Session(session_profile),
-        Some(owner) => Attribution::Rerouted(owner),
-        None => match session_mapping {
-            Some(mapped) if mapped != observed => Attribution::Rejected,
-            _ => Attribution::Session(session_profile),
-        },
+    match (session_mapping, observed) {
+        (Some(mapped), Some(seen)) if mapped == seen => Attribution::Recording(session_profile),
+        (Some(_), Some(_)) => Attribution::Mismatch,
+        (Some(_), None) => Attribution::Unverified,
+        (None, Some(_)) => {
+            if owner_of_observed.is_some() {
+                Attribution::OwnedByOther
+            } else {
+                Attribution::Unlinked
+            }
+        }
+        (None, None) => {
+            if provider_has_mappings {
+                Attribution::Unverified
+            } else {
+                Attribution::Recording(session_profile)
+            }
+        }
     }
 }
 
@@ -415,6 +514,8 @@ struct SessionItem {
     direct_url: String,
     last_progress: f64,
     last_duration: f64,
+    /// Series only: season/episode confirmed by the provider (not the launch-time guess).
+    episode_confirmed: bool,
 }
 
 impl SessionItem {
@@ -447,26 +548,31 @@ struct PlayerSession {
     mode: PlayerMode,
     app_profile_id: i64,
     app_profile_name: String,
+    /// Canonical provider id (see `canonical_provider_id`).
     provider_id: i64,
     provider_name: String,
+    provider: OttProvider,
     mapped_ott_profile_id: Option<String>,
+    /// Whether any Omnia profile has linked this provider (strict mode when true).
+    provider_has_mappings: bool,
     item: Option<SessionItem>,
     awaiting_metadata: bool,
     pending_title_change: Option<DetectedMedia>,
     active_watch_seconds: f64,
     episodes_finished: HashSet<(i64, i64)>,
     last_attribution: Option<Attribution>,
-    notified_mismatch: bool,
+    last_notified: Option<&'static str>,
+    /// `play_start` is logged on the first verified sample of each title (never before).
+    play_start_logged: bool,
     last_progress_emit: Option<Instant>,
     final_flush: Arc<Notify>,
 }
 
 impl PlayerSession {
-    fn target_profile(&self) -> Option<i64> {
+    fn recording_profile(&self) -> Option<i64> {
         match self.last_attribution {
-            Some(Attribution::Rejected) => None,
-            Some(Attribution::Session(p)) | Some(Attribution::Rerouted(p)) => Some(p),
-            None => Some(self.app_profile_id),
+            Some(Attribution::Recording(p)) => Some(p),
+            _ => None,
         }
     }
 
@@ -486,54 +592,22 @@ impl PlayerSession {
             duration_seconds: self.item.as_ref().map_or(0.0, |i| i.last_duration),
             active_watch_seconds: self.active_watch_seconds,
             awaiting_rebind: self.pending_title_change.is_some(),
+            tracking: self.last_attribution.map_or("pending", Attribution::key),
         }
     }
 
     /// Applies one telemetry sample and returns the DB writes / UI events it implies.
+    /// Metadata (episode/title hops) is always tracked so state stays correct, but writes are
+    /// only produced while the linked OTT profile is verified.
     fn apply(&mut self, p: &TelemetryPayload, attribution: Attribution) -> Plan {
         let mut plan = Plan::default();
         if self.mode != PlayerMode::Play {
             return plan;
         }
-
-        let target = match attribution {
-            Attribution::Rejected => {
-                if !self.notified_mismatch {
-                    self.notified_mismatch = true;
-                    plan.emits.push((
-                        EVT_PROFILE_MISMATCH,
-                        json!({
-                            "appProfileId": self.app_profile_id,
-                            "providerId": self.provider_id,
-                            "providerName": self.provider_name,
-                            "expectedOttProfileId": self.mapped_ott_profile_id,
-                            "observedOttProfileName": p.ott_profile.as_ref().and_then(|o| o.name.clone()),
-                        }),
-                    ));
-                }
-                self.last_attribution = Some(attribution);
-                plan.ack = TelemetryAck {
-                    accepted: false,
-                    attribution: "rejected",
-                    profile_id: None,
-                    profile_name: None,
-                    message: Some(format!(
-                        "Not tracking: this {} profile isn't linked to {}",
-                        self.provider_name, self.app_profile_name
-                    )),
-                };
-                return plan;
-            }
-            Attribution::Session(id) | Attribution::Rerouted(id) => id,
-        };
-        if matches!(attribution, Attribution::Rerouted(_)) && self.last_attribution != Some(attribution) {
-            plan.emits.push((
-                EVT_PROFILE_REROUTED,
-                json!({ "fromAppProfileId": self.app_profile_id, "toAppProfileId": target, "providerName": self.provider_name }),
-            ));
-        }
+        let verified = matches!(attribution, Attribution::Recording(_));
+        let target = self.app_profile_id;
         self.last_attribution = Some(attribution);
-        if p.active_delta_seconds.is_finite() {
+        if verified && p.active_delta_seconds.is_finite() {
             self.active_watch_seconds += p.active_delta_seconds.clamp(0.0, 30.0);
         }
 
@@ -543,21 +617,76 @@ impl PlayerSession {
             // rather than risk attributing the next episode's progress to the previous one.
             self.awaiting_metadata = true;
         }
+        let mut title_changed = false;
         if let Some(d) = &p.detected {
             self.awaiting_metadata = false;
-            if self.apply_detection(d, target, &mut plan) {
-                plan.ack = TelemetryAck::suspended(Some("Identifying the new title…".to_string()));
-                return plan;
+            title_changed = self.apply_detection(d, target, &mut plan);
+        }
+
+        if !verified {
+            plan.ops.clear();
+            plan.emits.retain(|(event, _)| *event == EVT_TITLE_CHANGED);
+            let observed_name = p.ott_profile.as_ref().and_then(|o| o.name.clone());
+            let key = attribution.key();
+            if self.last_notified != Some(key) {
+                self.last_notified = Some(key);
+                if key != "unverified" {
+                    plan.emits.push((
+                        EVT_PROFILE_MISMATCH,
+                        json!({
+                            "appProfileId": self.app_profile_id,
+                            "providerId": self.provider_id,
+                            "providerName": self.provider_name,
+                            "reason": key,
+                            "observedOttProfileName": observed_name,
+                        }),
+                    ));
+                }
             }
+            let message = match attribution {
+                Attribution::Mismatch | Attribution::OwnedByOther => format!(
+                    "Not tracking: {} isn't {}'s {} profile",
+                    observed_name.as_deref().unwrap_or("this"),
+                    self.app_profile_name,
+                    self.provider_name
+                ),
+                Attribution::Unlinked => format!("Not tracking yet: link this {} profile to {}", self.provider_name, self.app_profile_name),
+                _ => format!("Verifying your {} profile…", self.provider_name),
+            };
+            plan.ack = TelemetryAck { observed_profile_name: observed_name, ..TelemetryAck::status(key, Some(message)) };
+            return plan;
+        }
+        self.last_notified = None;
+
+        if title_changed {
+            plan.ack = TelemetryAck::status("suspended", Some("Identifying the new title…".to_string()));
+            return plan;
         }
         if self.awaiting_metadata || self.item.is_none() {
-            plan.ack = TelemetryAck::suspended(None);
+            plan.ack = TelemetryAck::status("suspended", None);
             return plan;
+        }
+
+        if !self.play_start_logged {
+            if let Some(item) = &self.item {
+                self.play_start_logged = true;
+                plan.ops.push(DbOp::Event {
+                    profile: target,
+                    tmdb_id: item.tmdb_id,
+                    media_type: item.media_type.clone(),
+                    event_type: "play_start",
+                    seconds: 0.0,
+                });
+            }
         }
 
         // --- progress ------------------------------------------------------------------------
         let provider_name = self.provider_name.clone();
         let item = self.item.as_mut().expect("checked above");
+        if item.media_type == "tv" && !item.episode_confirmed {
+            plan.ack = TelemetryAck::status("suspended", Some("Identifying the episode…".to_string()));
+            return plan;
+        }
         let trackable = p.duration.is_finite() && p.duration >= MIN_TRACKABLE_DURATION_SECS;
         if trackable && p.current_time.is_finite() && p.current_time >= 1.0 {
             item.last_progress = p.current_time;
@@ -575,7 +704,7 @@ impl PlayerSession {
                 episode_number: item.episode_number,
                 episode_title: item.episode_title.clone(),
                 provider_name: Some(provider_name),
-                direct_url: page_url.or_else(|| Some(item.direct_url.clone())),
+                direct_url: page_url.or_else(|| Some(item.direct_url.clone()).filter(|u| !u.is_empty())),
                 progress_seconds: p.current_time,
                 duration_seconds: p.duration,
             }));
@@ -647,13 +776,7 @@ impl PlayerSession {
             ));
         }
 
-        plan.ack = TelemetryAck {
-            accepted: true,
-            attribution: if matches!(attribution, Attribution::Rerouted(_)) { "rerouted" } else { "session" },
-            profile_id: Some(target),
-            profile_name: None,
-            message: None,
-        };
+        plan.ack = TelemetryAck { accepted: true, ..TelemetryAck::status("recording", None) };
         plan
     }
 
@@ -686,7 +809,7 @@ impl PlayerSession {
             plan.emits.push((
                 EVT_TITLE_CHANGED,
                 json!({
-                    "appProfileId": target,
+                    "appProfileId": self.app_profile_id,
                     "providerId": self.provider_id,
                     "providerName": self.provider_name,
                     "previousTmdbId": item.tmdb_id,
@@ -700,45 +823,49 @@ impl PlayerSession {
 
         if item.media_type == "tv" {
             if let Some(ep) = d.episode_number.filter(|e| *e > 0) {
-                let season = d.season_number.filter(|s| *s > 0).unwrap_or(item.season_number.max(1));
-                if (season, ep) != (item.season_number, item.episode_number) {
-                    if item.episode_number > 0 {
-                        if item.ratio() >= HOP_COMPLETION_RATIO {
-                            plan.ops.push(DbOp::Complete {
+                let detected_season = d.season_number.filter(|s| *s > 0);
+                // A season is only known if detected now or previously confirmed.
+                let season = detected_season.or(item.episode_confirmed.then_some(item.season_number).filter(|s| *s > 0));
+                if let Some(season) = season {
+                    if (season, ep) != (item.season_number, item.episode_number) {
+                        if item.episode_confirmed && item.episode_number > 0 {
+                            if item.ratio() >= HOP_COMPLETION_RATIO {
+                                plan.ops.push(DbOp::Complete {
+                                    profile: target,
+                                    tmdb_id: item.tmdb_id,
+                                    media_type: item.media_type.clone(),
+                                    season: item.season_number,
+                                    episode: item.episode_number,
+                                });
+                                self.episodes_finished.insert((item.season_number, item.episode_number));
+                            }
+                            plan.ops.push(DbOp::Event {
                                 profile: target,
                                 tmdb_id: item.tmdb_id,
                                 media_type: item.media_type.clone(),
-                                season: item.season_number,
-                                episode: item.episode_number,
+                                event_type: "episode_hop",
+                                seconds: self.active_watch_seconds,
                             });
-                            self.episodes_finished.insert((item.season_number, item.episode_number));
                         }
-                        plan.ops.push(DbOp::Event {
-                            profile: target,
-                            tmdb_id: item.tmdb_id,
-                            media_type: item.media_type.clone(),
-                            event_type: "episode_hop",
-                            seconds: self.active_watch_seconds,
-                        });
+                        item.season_number = season;
+                        item.episode_number = ep;
+                        item.episode_title = d.episode_title.clone();
+                        item.last_progress = 0.0;
+                        item.last_duration = 0.0;
                     }
-                    item.season_number = season;
-                    item.episode_number = ep;
-                    item.episode_title = d.episode_title.clone();
-                    item.last_progress = 0.0;
-                    item.last_duration = 0.0;
-                    return false;
+                    item.episode_confirmed = true;
                 }
             }
         }
-        if item.episode_title.is_none() {
-            item.episode_title = d.episode_title.clone();
+        if d.episode_title.is_some() && (item.episode_title.is_none() || item.media_type == "tv") {
+            item.episode_title = d.episode_title.clone().or(item.episode_title.take());
         }
         false
     }
 
     /// Writes performed when the session ends (window closed / Back to Hub / replaced).
     fn finalize_ops(&self) -> Vec<DbOp> {
-        let (Some(profile), Some(item)) = (self.target_profile(), self.item.as_ref()) else {
+        let (Some(profile), Some(item)) = (self.recording_profile(), self.item.as_ref()) else {
             return Vec::new();
         };
         if self.mode != PlayerMode::Play {
@@ -878,11 +1005,8 @@ async fn finalize_session(app: &AppHandle, label: &str, reason: &str) {
     if let Err(e) = execute_ops(&state.db, session.finalize_ops()).await {
         log::warn!("failed to finalize player session: {e}");
     }
-    // New telemetry: let this profile's (and any rerouted profile's) recommendations refresh.
+    // New telemetry: let this profile's recommendations refresh.
     state.recommender.invalidate(session.app_profile_id);
-    if let Some(target) = session.target_profile() {
-        state.recommender.invalidate(target);
-    }
     let status = session.status();
     let _ = app.emit_to(MAIN_LABEL, EVT_PLAYER_CLOSED, json!({ "reason": reason, "status": status }));
 }
@@ -935,6 +1059,7 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         .await?
         .ok_or_else(|| AppError::Message(format!("profile {profile_id} not found")))?;
     let provider = OttProvider::detect(request.provider_id, &request.provider_name);
+    let provider_key = canonical_provider_id(request.provider_id, &request.provider_name);
     let region = match request.region.clone() {
         Some(r) => r,
         None => state
@@ -945,21 +1070,27 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
     };
 
     // Validate the request and work out the item being played.
-    let (url, item, window_title) = match request.mode {
+    let (target_url, item, window_title) = match request.mode {
         PlayerMode::Play => {
             let tmdb_id = request.tmdb_id.ok_or_else(|| AppError::Message("tmdbId is required to play".into()))?;
             let media_type = request.media_type.clone().unwrap_or_default();
             if media_type != "movie" && media_type != "tv" {
                 return Err(AppError::Message("mediaType must be 'movie' or 'tv'".into()));
             }
-            let title = request.title.clone().filter(|t| !t.trim().is_empty())
+            let title = request
+                .title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| AppError::Message("title is required to play".into()))?;
-            let direct_url = request.direct_url.clone()
+            let direct_url = request
+                .direct_url
+                .clone()
                 .ok_or_else(|| AppError::Message("directUrl is required to play".into()))?;
             let url = parse_https_url(&direct_url)?;
             let mut titles = vec![title.clone()];
             titles.extend(request.original_title.clone().filter(|t| !t.trim().is_empty()));
-            let (season, episode) = if media_type == "tv" {
+            let is_tv = media_type == "tv";
+            let (season, episode) = if is_tv {
                 (request.season_number.max(0), request.episode_number.max(0))
             } else {
                 (0, 0)
@@ -974,6 +1105,9 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
                 direct_url: url.to_string(),
                 last_progress: 0.0,
                 last_duration: 0.0,
+                // The launch-time episode is a guess (deep links open the series page); providers
+                // that report the real episode must confirm it before anything is written.
+                episode_confirmed: !is_tv || !provider.confirms_episodes(),
             };
             (url, Some(item), format!("{title} — {}", request.provider_name))
         }
@@ -1002,11 +1136,25 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         (None, None) => None,
     };
 
-    let provider_id = request.provider_id;
-    let mapping = state
+    let (mapping, provider_has_mappings) = state
         .db
-        .run(move |c| queries::get_ott_mapping(c, profile_id, provider_id))
+        .run(move |c| {
+            Ok((
+                queries::get_ott_mapping(c, profile_id, provider_key)?,
+                queries::count_mappings_for_provider(c, provider_key)? > 0,
+            ))
+        })
         .await?;
+
+    // Switch the provider to the linked profile before opening the title, where supported.
+    let switch_url = match (request.mode, &mapping) {
+        (PlayerMode::Play, Some(m)) => provider.profile_switch_url(&m.ott_native_profile_id),
+        _ => None,
+    };
+    let initial_url = match &switch_url {
+        Some(u) => parse_https_url(u)?,
+        None => target_url.clone(),
+    };
 
     // Only one player at a time: flush & destroy the previous one first.
     close_active_player(&app, "replaced").await;
@@ -1017,12 +1165,16 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         "token": token,
         "mode": request.mode,
         "provider": provider.key(),
-        "providerId": request.provider_id,
+        "providerId": provider_key,
         "providerName": request.provider_name,
         "appProfileName": profile.profile_name,
         "title": item.as_ref().and_then(|i| i.titles.first().cloned()),
         "resumeAtSeconds": resume_at.unwrap_or(0.0),
         "syncIntervalMs": SYNC_INTERVAL_MS,
+        "expectedOttProfileId": mapping.as_ref().map(|m| m.ott_native_profile_id.clone()),
+        "expectedOttProfileName": mapping.as_ref().and_then(|m| m.ott_native_profile_name.clone()),
+        "targetUrl": switch_url.as_ref().map(|_| target_url.to_string()),
+        "canLink": mapping.is_none(),
     });
 
     let session = PlayerSession {
@@ -1031,22 +1183,25 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         mode: request.mode,
         app_profile_id: profile_id,
         app_profile_name: profile.profile_name.clone(),
-        provider_id: request.provider_id,
+        provider_id: provider_key,
         provider_name: request.provider_name.clone(),
+        provider,
         mapped_ott_profile_id: mapping.as_ref().map(|m| m.ott_native_profile_id.clone()),
+        provider_has_mappings,
         item: item.clone(),
         awaiting_metadata: false,
         pending_title_change: None,
         active_watch_seconds: 0.0,
         episodes_finished: HashSet::new(),
         last_attribution: None,
-        notified_mismatch: false,
+        last_notified: None,
+        play_start_logged: false,
         last_progress_emit: None,
         final_flush: Arc::new(Notify::new()),
     };
     *state.player.lock() = Some(session);
 
-    let window = match build_ott_window(&app, &label, url, &window_title, build_injection(&config), true) {
+    let window = match build_ott_window(&app, &label, initial_url, &window_title, build_injection(&config), true) {
         Ok(w) => w,
         Err(e) => {
             state.player.lock().take();
@@ -1067,18 +1222,12 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         }
     });
 
-    if let Some(it) = &item {
-        let (tmdb_id, mt) = (it.tmdb_id, it.media_type.clone());
-        state
-            .db
-            .run(move |c| queries::insert_playback_event(c, profile_id, tmdb_id, &mt, "play_start", 0.0))
-            .await?;
-    }
     let opened = PlayerOpened {
         label,
         mode: request.mode,
         resume_at_seconds: resume_at,
         mapped_ott_profile_id: mapping.map(|m| m.ott_native_profile_id),
+        switching_profile: switch_url.is_some(),
     };
     let _ = app.emit_to(MAIN_LABEL, EVT_PLAYER_OPENED, &opened);
     Ok(opened)
@@ -1101,7 +1250,7 @@ pub async fn player_rebind_title(app: AppHandle, state: State<'_, AppState>, req
     if request.media_type != "movie" && request.media_type != "tv" {
         return Err(AppError::Message("mediaType must be 'movie' or 'tv'".into()));
     }
-    let (status, profile) = {
+    let status = {
         let mut guard = state.player.lock();
         let session = guard
             .as_mut()
@@ -1112,28 +1261,25 @@ pub async fn player_rebind_title(app: AppHandle, state: State<'_, AppState>, req
         titles.extend(request.original_title.clone());
         titles.extend(pending.title.clone());
         let is_tv = request.media_type == "tv";
+        let season = request.season_number.or(pending.season_number).filter(|s| *s > 0);
+        let episode = request.episode_number.or(pending.episode_number).filter(|e| *e > 0);
         session.item = Some(SessionItem {
             tmdb_id: request.tmdb_id,
             media_type: request.media_type.clone(),
             titles,
-            season_number: if is_tv { request.season_number.or(pending.season_number).unwrap_or(1) } else { 0 },
-            episode_number: if is_tv { request.episode_number.or(pending.episode_number).unwrap_or(0) } else { 0 },
+            season_number: if is_tv { season.unwrap_or(1) } else { 0 },
+            episode_number: if is_tv { episode.unwrap_or(0) } else { 0 },
             episode_title: request.episode_title.clone().or(pending.episode_title),
             direct_url: String::new(),
             last_progress: 0.0,
             last_duration: 0.0,
+            episode_confirmed: !is_tv || !session.provider.confirms_episodes() || (season.is_some() && episode.is_some()),
         });
         session.awaiting_metadata = false;
+        session.play_start_logged = false;
         session.episodes_finished.clear();
-        (session.status(), session.target_profile())
+        session.status()
     };
-    if let Some(profile) = profile {
-        let (tmdb_id, mt) = (request.tmdb_id, request.media_type.clone());
-        state
-            .db
-            .run(move |c| queries::insert_playback_event(c, profile, tmdb_id, &mt, "play_start", 0.0))
-            .await?;
-    }
     let _ = app.emit_to(MAIN_LABEL, EVT_PLAYER_OPENED, json!({ "label": status.label, "rebound": true }));
     Ok(status)
 }
@@ -1172,16 +1318,22 @@ pub async fn sync_playback_telemetry(
         None => None,
     };
 
-    let (plan, flush) = {
+    let (plan, flush, attribution) = {
         let mut guard = state.player.lock();
         let s = guard
             .as_mut()
             .filter(|s| s.label == window.label() && tokens_equal(&s.token, &payload.token))
             .ok_or_else(unauthorized)?;
-        let attribution = attribute(s.app_profile_id, s.mapped_ott_profile_id.as_deref(), observed.as_deref(), owner);
+        let attribution = attribute(
+            s.app_profile_id,
+            s.mapped_ott_profile_id.as_deref(),
+            observed.as_deref(),
+            owner,
+            s.provider_has_mappings,
+        );
         let plan = s.apply(&payload, attribution);
         let flush = (payload.kind == TelemetryKind::Final).then(|| s.final_flush.clone());
-        (plan, flush)
+        (plan, flush, attribution)
     };
 
     execute_ops(&state.db, plan.ops).await?;
@@ -1193,11 +1345,11 @@ pub async fn sync_playback_telemetry(
     }
 
     let mut ack = plan.ack;
-    if ack.attribution == "rerouted" {
-        if let Some(pid) = ack.profile_id {
-            ack.profile_name = state
+    if matches!(attribution, Attribution::Mismatch | Attribution::OwnedByOther) {
+        if let Some(owner_id) = owner {
+            ack.owner_profile_name = state
                 .db
-                .run(move |c| queries::get_profile(c, pid))
+                .run(move |c| queries::get_profile(c, owner_id))
                 .await?
                 .map(|p| p.profile_name);
         }
@@ -1218,7 +1370,8 @@ pub async fn player_back_to_hub(app: AppHandle, window: WebviewWindow, state: St
     Ok(())
 }
 
-/// Profile handshake: the user confirmed which OTT profile belongs to the active Omnia profile.
+/// Profile handshake. In connect mode the window closes and history import starts; in play mode
+/// (pill "Link this profile") the link applies immediately and tracking begins.
 #[tauri::command]
 pub async fn report_ott_profile(
     app: AppHandle,
@@ -1226,16 +1379,17 @@ pub async fn report_ott_profile(
     state: State<'_, AppState>,
     payload: ReportProfilePayload,
 ) -> AppResult<ReportProfileResult> {
-    let (app_profile_id, provider_id, provider_name) = {
+    let (app_profile_id, provider_id, provider_name, mode) = {
         let guard = state.player.lock();
         let s = guard
             .as_ref()
-            .filter(|s| s.mode == PlayerMode::Connect && s.label == window.label() && tokens_equal(&s.token, &payload.token))
+            .filter(|s| s.label == window.label() && tokens_equal(&s.token, &payload.token))
+            .filter(|s| s.mode == PlayerMode::Connect || s.mapped_ott_profile_id.is_none())
             .ok_or_else(unauthorized)?;
-        (s.app_profile_id, s.provider_id, s.provider_name.clone())
+        (s.app_profile_id, s.provider_id, s.provider_name.clone(), s.mode)
     };
     let ott_id = payload.profile.id.trim().to_string();
-    if ott_id.is_empty() || ott_id.len() > 128 {
+    if ott_id.is_empty() || ott_id.len() > 256 {
         return Ok(ReportProfileResult { linked: false, message: Some("No profile detected yet.".into()) });
     }
     let ott_name = payload.profile.name.map(|n| n.chars().take(64).collect::<String>());
@@ -1271,8 +1425,11 @@ pub async fn report_ott_profile(
         let mut guard = state.player.lock();
         if let Some(s) = guard.as_mut().filter(|s| s.label == window.label()) {
             s.mapped_ott_profile_id = Some(ott_id.clone());
+            s.provider_has_mappings = true;
+            s.last_notified = None;
         }
     }
+    let importing = mode == PlayerMode::Connect;
     let _ = app.emit_to(
         MAIN_LABEL,
         EVT_PROFILE_CONNECTED,
@@ -1282,16 +1439,19 @@ pub async fn report_ott_profile(
             "providerName": provider_name,
             "ottProfileId": ott_id,
             "ottProfileName": ott_name,
+            "importing": importing,
         }),
     );
 
-    // Close the handshake window shortly after showing the confirmation, then import history.
-    let app_bg = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        back_to_hub(app_bg.clone()).await;
-        crate::sync::history_importer::spawn_import(app_bg, app_profile_id, provider_id, provider_name);
-    });
+    if importing {
+        // Close the handshake window shortly after showing the confirmation, then import history.
+        let app_bg = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            back_to_hub(app_bg.clone()).await;
+            crate::sync::history_importer::spawn_import(app_bg, app_profile_id, provider_id, provider_name);
+        });
+    }
     Ok(ReportProfileResult { linked: true, message: None })
 }
 
@@ -1312,7 +1472,9 @@ mod tests {
             app_profile_name: "Aryan".into(),
             provider_id: 8,
             provider_name: "Netflix".into(),
-            mapped_ott_profile_id: Some("GUID-A".into()),
+            provider: OttProvider::Netflix,
+            mapped_ott_profile_id: Some("GUID-A::Aryan".into()),
+            provider_has_mappings: true,
             item: Some(SessionItem {
                 tmdb_id: 66732,
                 media_type: media_type.into(),
@@ -1323,13 +1485,15 @@ mod tests {
                 direct_url: "https://www.netflix.com/title/80057281".into(),
                 last_progress: 0.0,
                 last_duration: 0.0,
+                episode_confirmed: true,
             }),
             awaiting_metadata: false,
             pending_title_change: None,
             active_watch_seconds: 0.0,
             episodes_finished: HashSet::new(),
             last_attribution: None,
-            notified_mismatch: false,
+            last_notified: None,
+            play_start_logged: false,
             last_progress_emit: None,
             final_flush: Arc::new(Notify::new()),
         }
@@ -1354,26 +1518,54 @@ mod tests {
     fn det(title: &str, s: i64, e: i64) -> DetectedMedia {
         DetectedMedia {
             title: Some(title.into()),
-            season_number: Some(s),
+            season_number: (s > 0).then_some(s),
             episode_number: Some(e),
-            episode_title: None,
+            episode_title: Some(format!("Episode {e}")),
             ott_title_id: None,
             confidence: Confidence::High,
         }
     }
 
+    const REC: Attribution = Attribution::Recording(1);
+
     #[test]
-    fn attribution_rules() {
-        // Not detectable -> session profile.
-        assert_eq!(attribute(1, Some("A"), None, None), Attribution::Session(1));
-        // Mapped to this profile.
-        assert_eq!(attribute(1, Some("A"), Some("A"), Some(1)), Attribution::Session(1));
-        // Mapped to another family member -> their history, not ours.
-        assert_eq!(attribute(1, Some("A"), Some("B"), Some(2)), Attribution::Rerouted(2));
-        // Unmapped profile while we're mapped elsewhere -> never guess.
-        assert_eq!(attribute(1, Some("A"), Some("C"), None), Attribution::Rejected);
-        // No mapping at all yet -> session profile.
-        assert_eq!(attribute(1, None, Some("C"), None), Attribution::Session(1));
+    fn attribution_is_strict() {
+        // Linked profile active -> record.
+        assert_eq!(attribute(1, Some("A"), Some("A"), Some(1), true), REC);
+        // Another OTT profile (owned or not) while linked -> never recorded, never rerouted.
+        assert_eq!(attribute(1, Some("A"), Some("B"), Some(2), true), Attribution::Mismatch);
+        assert_eq!(attribute(1, Some("A"), Some("C"), None, true), Attribution::Mismatch);
+        // Linked but undetectable -> unverified.
+        assert_eq!(attribute(1, Some("A"), None, None, true), Attribution::Unverified);
+        // Not linked: someone else's OTT profile -> blocked; unclaimed -> offer link, no writes.
+        assert_eq!(attribute(1, None, Some("A"), Some(2), true), Attribution::OwnedByOther);
+        assert_eq!(attribute(1, None, Some("C"), None, false), Attribution::Unlinked);
+        // Undetectable and nobody linked this provider -> record (no isolation configured).
+        assert_eq!(attribute(1, None, None, None, false), REC);
+        assert_eq!(attribute(1, None, None, None, true), Attribution::Unverified);
+    }
+
+    #[test]
+    fn netflix_identity_helpers() {
+        assert_eq!(netflix_guid("ABC123::Clara"), "ABC123");
+        assert_eq!(netflix_guid("ABC123"), "ABC123");
+        assert_eq!(
+            OttProvider::Netflix.profile_switch_url("ABC123::Clara").as_deref(),
+            Some("https://www.netflix.com/SwitchProfile?tkn=ABC123")
+        );
+        assert_eq!(OttProvider::PrimeVideo.profile_switch_url("x"), None);
+    }
+
+    #[test]
+    fn provider_variants_share_one_canonical_id() {
+        assert_eq!(canonical_provider_id(2100, "Amazon Prime Video with Ads"), 9);
+        assert_eq!(canonical_provider_id(10, "Amazon Video"), 9);
+        assert_eq!(canonical_provider_id(119, "Amazon Prime Video"), 9);
+        assert_eq!(canonical_provider_id(1796, "Netflix basic with Ads"), 8);
+        assert_eq!(canonical_provider_id(0, "Disney+ Hotstar"), 122);
+        assert_eq!(canonical_provider_id(4242, "Obscure Flix"), 4242);
+        assert_eq!(canonical_provider_id(201, "MUBI Amazon Channel"), 201, "channels aren't Prime Video");
+        assert_eq!(canonical_provider_id(1853, "Paramount Plus Apple TV Channel"), 531);
     }
 
     #[test]
@@ -1385,36 +1577,53 @@ mod tests {
     }
 
     #[test]
-    fn progress_is_recorded_for_target_profile_and_ads_ignored() {
+    fn progress_is_recorded_and_ads_ignored() {
         let mut s = session("tv", 1, 1);
-        let plan = s.apply(&sample(TelemetryKind::Progress, 12.0, 30.0, None), Attribution::Session(1));
-        assert!(plan.ops.is_empty(), "30s media is an ad/bumper");
-        let plan = s.apply(&sample(TelemetryKind::Progress, 600.0, 3000.0, None), Attribution::Rerouted(2));
+        let plan = s.apply(&sample(TelemetryKind::Progress, 12.0, 30.0, None), REC);
+        assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Progress(_))), "30s media is an ad/bumper");
+        let plan = s.apply(&sample(TelemetryKind::Progress, 600.0, 3000.0, None), REC);
         match &plan.ops[0] {
             DbOp::Progress(u) => {
-                assert_eq!(u.app_profile_id, 2);
+                assert_eq!(u.app_profile_id, 1);
                 assert_eq!((u.season_number, u.episode_number), (1, 1));
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert_eq!(plan.ack.attribution, "rerouted");
+        assert_eq!(plan.ack.attribution, "recording");
     }
 
     #[test]
-    fn rejected_samples_write_nothing() {
-        let mut s = session("movie", 0, 0);
-        let plan = s.apply(&sample(TelemetryKind::Progress, 600.0, 6000.0, None), Attribution::Rejected);
-        assert!(plan.ops.is_empty());
-        assert_eq!(plan.ack.attribution, "rejected");
-        assert_eq!(plan.emits.len(), 1);
-        assert!(s.finalize_ops().is_empty());
+    fn unverified_states_write_nothing_anywhere() {
+        for attribution in [Attribution::Mismatch, Attribution::OwnedByOther, Attribution::Unlinked, Attribution::Unverified] {
+            let mut s = session("movie", 0, 0);
+            let plan = s.apply(&sample(TelemetryKind::Ended, 5900.0, 6000.0, None), attribution);
+            assert!(plan.ops.is_empty(), "{attribution:?} must not write");
+            assert!(!plan.ack.accepted);
+            assert!(s.finalize_ops().is_empty());
+        }
+    }
+
+    #[test]
+    fn guessed_episode_is_never_recorded_until_confirmed() {
+        // Friends S2E1: launched with a guessed S1E1; provider reports the real episode later.
+        let mut s = session("tv", 1, 1);
+        s.item.as_mut().unwrap().titles = vec!["Friends".into()];
+        s.item.as_mut().unwrap().episode_confirmed = false;
+        let plan = s.apply(&sample(TelemetryKind::Progress, 120.0, 1320.0, None), REC);
+        assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Progress(_))), "unconfirmed episode must not be written");
+        // Episode number without a season is still not enough.
+        let plan = s.apply(&sample(TelemetryKind::Progress, 123.0, 1320.0, Some(det("Friends", 0, 1))), REC);
+        assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Progress(_))));
+        let plan = s.apply(&sample(TelemetryKind::Progress, 126.0, 1320.0, Some(det("Friends", 2, 1))), REC);
+        assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Progress(u) if (u.season_number, u.episode_number) == (2, 1))));
+        assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Event { event_type: "episode_hop", .. })), "a guess isn't a hop");
     }
 
     #[test]
     fn episode_hop_completes_previous_and_tracks_new() {
         let mut s = session("tv", 1, 3);
-        s.apply(&sample(TelemetryKind::Progress, 2900.0, 3000.0, Some(det("Stranger Things", 1, 3))), Attribution::Session(1));
-        let plan = s.apply(&sample(TelemetryKind::Metadata, 5.0, 3100.0, Some(det("Stranger Things", 1, 4))), Attribution::Session(1));
+        s.apply(&sample(TelemetryKind::Progress, 2900.0, 3000.0, Some(det("Stranger Things", 1, 3))), REC);
+        let plan = s.apply(&sample(TelemetryKind::Metadata, 5.0, 3100.0, Some(det("Stranger Things", 1, 4))), REC);
         assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Complete { episode: 3, .. })));
         assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Event { event_type: "episode_hop", .. })));
         assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Progress(u) if u.episode_number == 4)));
@@ -1424,7 +1633,7 @@ mod tests {
     fn binge_session_after_three_episodes() {
         let mut s = session("tv", 1, 1);
         for ep in 1..=3 {
-            s.apply(&sample(TelemetryKind::Progress, 2900.0, 3000.0, Some(det("Stranger Things", 1, ep))), Attribution::Session(1));
+            s.apply(&sample(TelemetryKind::Progress, 2900.0, 3000.0, Some(det("Stranger Things", 1, ep))), REC);
         }
         let ops = s.finalize_ops();
         assert!(ops.iter().any(|o| matches!(o, DbOp::Event { event_type: "binge_session", .. })));
@@ -1433,10 +1642,10 @@ mod tests {
     #[test]
     fn title_hop_suspends_until_rebind() {
         let mut s = session("tv", 1, 1);
-        let plan = s.apply(&sample(TelemetryKind::Metadata, 5.0, 6000.0, Some(det("The Crown", 1, 1))), Attribution::Session(1));
+        let plan = s.apply(&sample(TelemetryKind::Metadata, 5.0, 6000.0, Some(det("The Crown", 1, 1))), REC);
         assert!(plan.emits.iter().any(|(e, _)| *e == EVT_TITLE_CHANGED));
         assert!(s.item.is_none());
-        let plan = s.apply(&sample(TelemetryKind::Progress, 60.0, 6000.0, None), Attribution::Session(1));
+        let plan = s.apply(&sample(TelemetryKind::Progress, 60.0, 6000.0, None), REC);
         assert!(plan.ops.is_empty());
         assert_eq!(plan.ack.attribution, "suspended");
     }
@@ -1446,9 +1655,9 @@ mod tests {
         let mut s = session("tv", 1, 1);
         let mut p = sample(TelemetryKind::Progress, 60.0, 3000.0, None);
         p.url_changed = true;
-        let plan = s.apply(&p, Attribution::Session(1));
+        let plan = s.apply(&p, REC);
         assert!(plan.ops.is_empty());
-        let plan = s.apply(&sample(TelemetryKind::Progress, 63.0, 3000.0, Some(det("Stranger Things", 1, 2))), Attribution::Session(1));
+        let plan = s.apply(&sample(TelemetryKind::Progress, 63.0, 3000.0, Some(det("Stranger Things", 1, 2))), REC);
         assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Progress(u) if u.episode_number == 2)));
     }
 

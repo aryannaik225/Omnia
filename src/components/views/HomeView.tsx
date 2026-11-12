@@ -1,6 +1,7 @@
 /** Home dashboard: hero, Continue Watching, hubs, ML recommendation rows and regional TMDB rows. */
 import { useEffect, useMemo } from "react";
 import { useAsync } from "../../lib/hooks";
+import { groupByFamily } from "../../lib/providers";
 import { discover, isKidsSafe, trending, type MediaSummary } from "../../services/tmdbClient";
 import { recommendations, type RecommendationRow } from "../../services/tauriBridge";
 import { useAppStore, useCatalogKey } from "../../store/useAppStore";
@@ -139,7 +140,7 @@ export function HomeView() {
     );
   }
 
-  const providerRows = subs.filter((p) => p.isActive).slice(0, 4);
+  const providerRows = groupByFamily(subs.filter((p) => p.isActive), (p) => p.providerId, (p) => p.providerName).slice(0, 4);
   const availability = filtered ? "on your services" : "right now";
 
   return (
@@ -163,16 +164,16 @@ export function HomeView() {
         />
         <LazyTmdbRow title={`Popular series ${availability}`} load={async () => (await discover("tv", ctx)).results} deps={[catalogKey, "tv"]} />
         <LazyTmdbRow title={`Popular movies ${availability}`} load={async () => (await discover("movie", ctx)).results} deps={[catalogKey, "movie"]} />
-        {providerRows.map((p) => (
+        {providerRows.map(({ family, members }) => (
           <LazyTmdbRow
-            key={p.providerId}
-            title={`Top on ${p.providerName}`}
+            key={family.key}
+            title={`Top on ${family.name}`}
             load={async () => {
-              const pctx = { ...ctx, providers: [p.providerId] };
+              const pctx = { ...ctx, providers: members.map((m) => m.providerId) };
               const [mv, tv] = await Promise.all([discover("movie", pctx), discover("tv", pctx)]);
               return interleave(tv.results, mv.results);
             }}
-            deps={[catalogKey, p.providerId]}
+            deps={[catalogKey, family.key]}
           />
         ))}
         <LazyTmdbRow

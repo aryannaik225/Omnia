@@ -46,10 +46,28 @@ interface PosterCardProps {
   caption?: string | null;
   /** Pixel width, or "fill" to take the grid cell's width. */
   width?: number | "fill";
+  /** 0..1 progress bar over the bottom of the artwork. */
+  progress?: number | null;
+  /** Secondary line under the title (e.g. "S2 E1 · Episode title"). */
+  subtitle?: string | null;
+  /** Element shown in the artwork's top-right corner on hover (e.g. remove). */
+  cornerAction?: ReactNode;
   onClick: () => void;
 }
 
-export const PosterCard = memo(function PosterCard({ title, posterPath, year, rating, badge, caption, width = 168, onClick }: PosterCardProps) {
+export const PosterCard = memo(function PosterCard({
+  title,
+  posterPath,
+  year,
+  rating,
+  badge,
+  caption,
+  width = 168,
+  progress,
+  subtitle,
+  cornerAction,
+  onClick,
+}: PosterCardProps) {
   const { ref, rx, ry, onMove, reset } = useSpecular();
   const src = img(posterPath, "w342");
   return (
@@ -75,9 +93,18 @@ export const PosterCard = memo(function PosterCard({ title, posterPath, year, ra
         )}
         <span className="specular-sheen" />
         {badge && <span className="absolute left-2 top-2">{badge}</span>}
+        {progress != null && (
+          <span className="absolute inset-x-2.5 bottom-2.5 block">
+            <span className="progress-track block !bg-black/40">
+              <span className="progress-fill block" style={{ width: `${Math.max(3, Math.min(100, progress * 100))}%` }} />
+            </span>
+          </span>
+        )}
+        {cornerAction && <span className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100">{cornerAction}</span>}
       </m.button>
       <div className="mt-2.5 px-0.5">
         <p className="truncate text-[13px] font-medium text-label-primary">{title}</p>
+        {subtitle && <p className="truncate text-[12px] text-label-secondary">{subtitle}</p>}
         <p className="flex items-center gap-1.5 truncate text-[12px] text-label-tertiary">
           {year && <span>{year}</span>}
           {rating ? (
@@ -86,7 +113,7 @@ export const PosterCard = memo(function PosterCard({ title, posterPath, year, ra
               {rating.toFixed(1)}
             </span>
           ) : null}
-          {caption && <span className="truncate">· {caption}</span>}
+          {caption && <span className="truncate">{year || rating ? "· " : ""}{caption}</span>}
         </p>
       </div>
     </div>

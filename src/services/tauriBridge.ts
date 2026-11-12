@@ -75,6 +75,14 @@ export interface WatchHistoryEntry {
   timeOfDayBucket: TimeOfDayBucket | null;
 }
 
+/** A history row with its parent title's name and artwork (joined from media_catalog). */
+export interface HistoryWithMedia extends WatchHistoryEntry {
+  title: string | null;
+  posterPath: string | null;
+  backdropPath: string | null;
+  releaseYear: number | null;
+}
+
 export interface ContinueWatchingItem extends WatchHistoryEntry {
   title: string | null;
   posterPath: string | null;
@@ -201,7 +209,6 @@ export const OmniaEvents = {
   playbackProgress: "omnia://playback-progress",
   playerTitleChanged: "omnia://player-title-changed",
   ottProfileMismatch: "omnia://ott-profile-mismatch",
-  ottProfileRerouted: "omnia://ott-profile-rerouted",
   ottProfileConnected: "omnia://ott-profile-connected",
   historyImportProgress: "omnia://history-import-progress",
   historyImportFinished: "omnia://history-import-finished",
@@ -239,6 +246,7 @@ export interface PlayerOpened {
   mode: PlayerMode;
   resumeAtSeconds: number | null;
   mappedOttProfileId: string | null;
+  switchingProfile: boolean;
 }
 
 export interface PlayerStatus {
@@ -256,6 +264,7 @@ export interface PlayerStatus {
   durationSeconds: number;
   activeWatchSeconds: number;
   awaitingRebind: boolean;
+  tracking: "recording" | "mismatch" | "unlinked" | "unverified" | "pending";
 }
 
 export interface DetectedMedia {
@@ -312,6 +321,8 @@ export interface OttProfileConnectedEvent {
   providerName: string;
   ottProfileId: string;
   ottProfileName: string | null;
+  /** True for the Connect-accounts handshake (history import follows); false for in-player linking. */
+  importing: boolean;
 }
 
 export interface ImportProgressEvent {
@@ -385,7 +396,7 @@ export const history = {
   continueWatching: (appProfileId: number, limit = 20) =>
     invoke<ContinueWatchingItem[]>("get_continue_watching", { appProfileId, limit }),
   list: (appProfileId: number, limit = 100, offset = 0) =>
-    invoke<WatchHistoryEntry[]>("get_watch_history", { appProfileId, limit, offset }),
+    invoke<HistoryWithMedia[]>("get_watch_history", { appProfileId, limit, offset }),
   titleProgress: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<WatchHistoryEntry[]>("get_title_progress", { appProfileId, tmdbId, mediaType }),
   remove: (appProfileId: number, id: number) => invoke<boolean>("delete_watch_history_entry", { appProfileId, id }),
@@ -453,12 +464,9 @@ export const events = {
     appProfileId: number;
     providerId: number;
     providerName: string;
-    expectedOttProfileId: string | null;
+    reason: "mismatch" | "unlinked";
     observedOttProfileName: string | null;
   }>(OmniaEvents.ottProfileMismatch),
-  onOttProfileRerouted: on<{ fromAppProfileId: number; toAppProfileId: number; providerName: string }>(
-    OmniaEvents.ottProfileRerouted,
-  ),
   onOttProfileConnected: on<OttProfileConnectedEvent>(OmniaEvents.ottProfileConnected),
   onHistoryImportProgress: on<ImportProgressEvent>(OmniaEvents.historyImportProgress),
   onHistoryImportFinished: on<ImportFinishedEvent>(OmniaEvents.historyImportFinished),
