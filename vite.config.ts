@@ -15,7 +15,8 @@ export default defineConfig({
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: { ignored: ["**/src-tauri/**"] },
   },
-  envPrefix: ["VITE_", "TAURI_ENV_"],
+  // `TMDB_` exposes TMDB_API_KEY from .env to the catalog UI (it is copied into local settings for Rust).
+  envPrefix: ["VITE_", "TAURI_ENV_", "TMDB_"],
   build: {
     // WebView2 is evergreen Chromium.
     target: "chrome120",

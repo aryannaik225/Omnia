@@ -143,6 +143,14 @@
     transform: scale(0.97);
   }
 
+  .glass-button:disabled,
+  .icon-button:disabled,
+  .chip:disabled {
+    opacity: 0.42;
+    cursor: default;
+    pointer-events: none;
+  }
+
   /* Primary CTA: bright, opaque "Play Now". */
   .glass-button-primary {
     @apply glass-button;
@@ -199,6 +207,128 @@
     );
     background-size: 200% 100%;
     @apply animate-shimmer;
+  }
+}
+
+@layer components {
+  /* ---- Controls ------------------------------------------------------------------------- */
+  .glass-input {
+    @apply glass-pill w-full px-4 py-2.5 text-sm outline-none placeholder:text-[color:var(--label-tertiary)];
+    color: var(--label-primary);
+  }
+  .glass-input:focus {
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+      0 0 0 4px rgba(10, 132, 255, 0.25);
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap px-3.5 py-1.5 text-[13px] font-medium;
+    border-radius: 999px;
+    background: var(--glass-tint);
+    color: var(--label-secondary);
+    box-shadow: inset 0 0 0 1px var(--glass-hairline);
+    transition: background-color 200ms var(--ease-spring), color 200ms var(--ease-spring);
+  }
+  .chip:hover {
+    background: var(--glass-hover);
+    color: var(--label-primary);
+  }
+  .chip[data-active="true"] {
+    background: rgba(255, 255, 255, 0.92);
+    color: #0b0b0f;
+  }
+
+  .segmented {
+    @apply glass-pill inline-flex p-1 gap-1;
+  }
+  .segmented > button {
+    @apply px-3.5 py-1.5 text-[13px] font-semibold;
+    border-radius: 9px;
+    color: var(--label-secondary);
+    transition: background-color 200ms var(--ease-spring), color 200ms var(--ease-spring);
+  }
+  .segmented > button[data-active="true"] {
+    background: rgba(255, 255, 255, 0.16);
+    color: var(--label-primary);
+    box-shadow: var(--specular-top);
+  }
+
+  .switch {
+    @apply relative inline-flex h-[26px] w-[44px] shrink-0 items-center rounded-full;
+    background: rgba(120, 120, 128, 0.36);
+    transition: background-color 220ms var(--ease-spring);
+  }
+  .switch[data-on="true"] {
+    background: #30d158;
+  }
+  .switch::after {
+    content: "";
+    @apply absolute h-[22px] w-[22px] rounded-full bg-white;
+    left: 2px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    transition: transform 260ms var(--ease-spring);
+  }
+  .switch[data-on="true"]::after {
+    transform: translateX(18px);
+  }
+
+  .icon-button {
+    @apply glass-pill inline-flex h-10 w-10 items-center justify-center;
+    transition: transform 200ms var(--ease-spring), background-color 200ms var(--ease-spring);
+  }
+  .icon-button:hover {
+    background: rgba(40, 40, 48, 0.75);
+    transform: scale(1.05);
+  }
+
+  /* ---- Cards ---------------------------------------------------------------------------- */
+  .media-card {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius-card);
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: inset 0 0 0 1px var(--glass-hairline), 0 8px 24px rgba(0, 0, 0, 0.35);
+    transition: box-shadow 300ms var(--ease-spring);
+    content-visibility: auto;
+    contain-intrinsic-size: 200px 300px;
+  }
+  .media-card:hover,
+  .media-card:focus-visible {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 28px 60px rgba(0, 0, 0, 0.6);
+  }
+
+  .row-scroller {
+    @apply flex gap-4 overflow-x-auto scroll-smooth scrollbar-none;
+    scroll-snap-type: x proximity;
+    padding: 18px 8px 26px;
+    margin: -18px -8px -26px;
+  }
+  .row-scroller > * {
+    scroll-snap-align: start;
+  }
+
+  .section-title {
+    @apply text-[19px] font-semibold tracking-tight;
+    color: var(--label-primary);
+  }
+
+  /* ---- Hero ----------------------------------------------------------------------------- */
+  .hero-mask {
+    mask-image: linear-gradient(to bottom, #000 55%, transparent 100%);
+  }
+  .hero-scrim {
+    background:
+      linear-gradient(90deg, rgba(8, 8, 12, 0.88) 0%, rgba(8, 8, 12, 0.55) 38%, transparent 70%),
+      linear-gradient(0deg, rgba(11, 11, 15, 1) 0%, rgba(11, 11, 15, 0) 45%);
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide;
+    background: rgba(255, 255, 255, 0.14);
+    color: var(--label-primary);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
   }
 }
 

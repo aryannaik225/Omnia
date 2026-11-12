@@ -1,72 +1,164 @@
 /**
- * Boot shell: connects to the Rust backend, loads the active profile and settings, and renders
- * the Liquid Glass frame. The full catalog experience (sidebar, hero, rows, hubs, detail modal)
- * mounts inside this shell in Step 5.
+ * Omnia app shell: boot → "Who's watching?" → Liquid Glass catalog (ambient bleed, collapsible
+ * sidebar, filter bar, views, detail modal, account sync), wired to the Rust backend events.
  */
-import { useEffect, useState } from "react";
-import { motion } from "framer-motion";
-import { isTauri, profiles, settings, SettingKeys, type AppProfile } from "./services/tauriBridge";
+import { AnimatePresence, domMax, LazyMotion, m, MotionConfig } from "framer-motion";
+import { lazy, Suspense, useEffect, useRef, type CSSProperties } from "react";
+import { useRafCallback } from "./lib/hooks";
+import { isTauri } from "./services/tauriBridge";
+import { useAppStore, type View } from "./store/useAppStore";
+import { usePlayerStore } from "./store/usePlayerStore";
+import { Toasts } from "./components/common/Toasts";
+import { AmbientBackground } from "./components/layout/AmbientBackground";
+import { LiquidSidebar, SIDEBAR_COLLAPSED, SIDEBAR_EXPANDED } from "./components/layout/LiquidSidebar";
+import { TopFilterBar } from "./components/layout/TopFilterBar";
+import { MediaDetailModal } from "./components/modals/MediaDetailModal";
+import { ProfileGate } from "./components/profile/ProfileGate";
+import { ContinueWatchingView, MyOttsView, SearchView, WatchlistView } from "./components/views/BrowseViews";
+import { HomeView } from "./components/views/HomeView";
 
-type BootState =
-  | { status: "loading" }
-  | { status: "ready"; profile: AppProfile; region: string | null }
-  | { status: "error"; message: string };
+// Secondary screens load on demand to keep the startup bundle small.
+const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
+const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
+const AccountSyncModal = lazy(() => import("./components/modals/AccountSyncModal").then((mod) => ({ default: mod.AccountSyncModal })));
 
-export default function App() {
-  const [boot, setBoot] = useState<BootState>({ status: "loading" });
+/** Scroll depth after which the sidebar folds into an icon rail. */
+const COLLAPSE_AT = 560;
+
+function CurrentView({ view }: { view: View }) {
+  switch (view) {
+    case "home":
+      return <HomeView />;
+    case "search":
+      return <SearchView />;
+    case "continue":
+      return <ContinueWatchingView />;
+    case "myotts":
+      return <MyOttsView />;
+    case "hubs":
+      return <HubsView />;
+    case "watchlist":
+      return <WatchlistView />;
+    case "settings":
+      return <SettingsView />;
+  }
+}
+
+function Shell() {
+  const view = useAppStore((s) => s.view);
+  const activeHub = useAppStore((s) => s.activeHub);
+  const collapsed = useAppStore((s) => s.sidebarCollapsed);
+  const setCollapsed = useAppStore((s) => s.setSidebarCollapsed);
+  const rememberScroll = useAppStore((s) => s.rememberScroll);
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  const refreshMappings = usePlayerStore((s) => s.refreshMappings);
+  const refreshStatus = usePlayerStore((s) => s.refreshStatus);
+  const main = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    if (!isTauri()) {
-      setBoot({ status: "error", message: "Omnia's backend is only available inside the desktop app." });
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const [all, list] = await Promise.all([settings.getAll(), profiles.list()]);
-        const activeId = Number(all[SettingKeys.activeProfileId]);
-        const profile = list.find((p) => p.profileId === activeId) ?? list[0];
-        if (!profile) throw new Error("No local profile found.");
-        if (!cancelled) {
-          setBoot({ status: "ready", profile, region: all[SettingKeys.regionCode] ?? null });
-        }
-      } catch (err) {
-        if (!cancelled) setBoot({ status: "error", message: String(err) });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void refreshMappings();
+    void refreshStatus();
+  }, [profileId, refreshMappings, refreshStatus]);
+
+  // Restore the exact scroll position per view (e.g. after "Back to Hub").
+  useEffect(() => {
+    const top = useAppStore.getState().scrollPositions[view] ?? 0;
+    main.current?.scrollTo({ top });
+    setCollapsed(top > COLLAPSE_AT);
+  }, [view, activeHub, setCollapsed]);
+
+  const onScroll = useRafCallback(() => {
+    const top = main.current?.scrollTop ?? 0;
+    rememberScroll(view, top);
+    if (top > COLLAPSE_AT !== useAppStore.getState().sidebarCollapsed) setCollapsed(top > COLLAPSE_AT);
+  });
+
+  const contentLeft = (collapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED) + 48;
+  const style = { "--content-left": `${contentLeft}px` } as CSSProperties;
+  const fullBleed = view === "home";
 
   return (
-    <div className="relative flex h-full items-center justify-center overflow-hidden">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-[-20%] animate-ambient-drift opacity-70 blur-3xl"
-        style={{
-          background:
-            "radial-gradient(40% 40% at 25% 30%, rgba(var(--ambient-1), 0.55), transparent 70%)," +
-            "radial-gradient(35% 35% at 75% 65%, rgba(var(--ambient-2), 0.45), transparent 70%)," +
-            "radial-gradient(30% 30% at 50% 90%, rgba(var(--ambient-3), 0.4), transparent 70%)",
-        }}
-      />
-      <motion.section
-        initial={{ opacity: 0, y: 12, scale: 0.98 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        transition={{ type: "spring", stiffness: 260, damping: 26 }}
-        className="glass-panel relative w-[420px] px-8 py-7"
-      >
+    <>
+      <LiquidSidebar />
+      <main ref={main} onScroll={onScroll} className="h-full overflow-y-auto overflow-x-hidden" style={style}>
+        <div className="sticky top-0 z-30 h-0 pr-8 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)" }}>
+          <TopFilterBar />
+        </div>
+        <AnimatePresence mode="wait">
+          <m.div
+            key={view}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
+            className={fullBleed ? "" : "pr-8 pt-20 transition-[padding] duration-500"}
+            style={fullBleed ? undefined : { paddingLeft: "var(--content-left)" }}
+          >
+            <Suspense fallback={<div className="skeleton mt-10 h-[40vh] rounded-panel" />}>
+              <CurrentView view={view} />
+            </Suspense>
+          </m.div>
+        </AnimatePresence>
+      </main>
+      <MediaDetailModal />
+      <Suspense fallback={null}>
+        <AccountSyncModal />
+      </Suspense>
+    </>
+  );
+}
+
+function Splash({ message, error = false }: { message: string; error?: boolean }) {
+  return (
+    <div className="flex h-full items-center justify-center">
+      <m.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="glass-panel w-[420px] px-8 py-7 text-center">
         <h1 className="text-3xl font-semibold tracking-tight">Omnia</h1>
-        {boot.status === "loading" && <p className="mt-2 text-label-secondary">Opening your local library…</p>}
-        {boot.status === "ready" && (
-          <p className="mt-2 text-label-secondary">
-            Signed in locally as <span className="text-label-primary">{boot.profile.profileName}</span>
-            {boot.region ? ` · Region ${boot.region}` : " · Region not set"}
-          </p>
-        )}
-        {boot.status === "error" && <p className="mt-2 text-red-300">{boot.message}</p>}
-      </motion.section>
+        <p className={`mt-2 ${error ? "text-[#ff6961]" : "text-label-secondary"}`}>{message}</p>
+      </m.div>
     </div>
+  );
+}
+
+export default function App() {
+  const booted = useAppStore((s) => s.booted);
+  const bootError = useAppStore((s) => s.bootError);
+  const gateOpen = useAppStore((s) => s.profileGateOpen);
+  const bootstrap = useAppStore((s) => s.bootstrap);
+  const initListeners = usePlayerStore((s) => s.initListeners);
+  const inTauri = isTauri();
+
+  useEffect(() => {
+    if (!inTauri) return;
+    void bootstrap();
+    let off: (() => void) | undefined;
+    let cancelled = false;
+    void initListeners().then((fn) => {
+      if (cancelled) fn();
+      else off = fn;
+    });
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, [inTauri, bootstrap, initListeners]);
+
+  return (
+    <LazyMotion features={domMax} strict>
+      <MotionConfig reducedMotion="user">
+        <AmbientBackground />
+        {!inTauri ? (
+          <Splash message="Omnia's backend is only available inside the desktop app." error />
+        ) : !booted ? (
+          <Splash message="Opening your local library…" />
+        ) : bootError ? (
+          <Splash message={bootError} error />
+        ) : gateOpen ? (
+          <ProfileGate />
+        ) : (
+          <Shell />
+        )}
+        <Toasts />
+      </MotionConfig>
+    </LazyMotion>
   );
 }
