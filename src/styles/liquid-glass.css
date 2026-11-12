@@ -1,0 +1,242 @@
+/*
+ * Omnia — 2026 Apple TV "Liquid Glass" design tokens (tvOS 26 / macOS 26).
+ * Refractive translucent surfaces, specular top edges, concentric radii, ambient bleed.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+
+  /* Material */
+  --glass-blur: 24px;
+  --glass-saturate: 180%;
+  --glass-base: rgba(18, 18, 22, 0.65); /* guarantees WCAG 4.5:1 for white text over any artwork */
+  --glass-strong: rgba(18, 18, 22, 0.82);
+  --glass-tint: rgba(255, 255, 255, 0.06);
+  --glass-hover: rgba(255, 255, 255, 0.12);
+  --glass-edge: rgba(255, 255, 255, 0.22);
+  --glass-hairline: rgba(255, 255, 255, 0.06);
+  --specular-top: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+
+  /* Concentric geometry */
+  --radius-panel: 24px;
+  --radius-card: 16px;
+  --radius-pill: 12px;
+
+  /* Labels */
+  --label-primary: rgba(255, 255, 255, 0.96);
+  --label-secondary: rgba(235, 235, 245, 0.72);
+  --label-tertiary: rgba(235, 235, 245, 0.5);
+  --accent: #0a84ff;
+
+  /* Ambient bleed — updated at runtime from the focused artwork's dominant palette. */
+  --ambient-1: 40, 60, 120;
+  --ambient-2: 120, 40, 90;
+  --ambient-3: 20, 90, 110;
+
+  /* Motion */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --sidebar-expanded: 248px;
+  --sidebar-collapsed: 76px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: #0b0b0f;
+    color: var(--label-primary);
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  ::selection {
+    background: rgba(10, 132, 255, 0.4);
+  }
+
+  /* Thin, glassy scrollbars inside content grids. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  }
+
+  :focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.85);
+    outline-offset: 3px;
+    border-radius: var(--radius-pill);
+  }
+}
+
+@layer components {
+  /* Base refractive surface. */
+  .glass {
+    position: relative;
+    background: var(--glass-base);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px var(--glass-hairline),
+      0 12px 40px rgba(0, 0, 0, 0.45);
+  }
+
+  /* Diagonal specular rim highlight layered over the material. */
+  .glass::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.14) 0%,
+      rgba(255, 255, 255, 0.02) 32%,
+      transparent 60%,
+      rgba(255, 255, 255, 0.05) 100%
+    );
+    mix-blend-mode: screen;
+  }
+
+  .glass-strong {
+    background: var(--glass-strong);
+  }
+
+  .glass-panel {
+    @apply glass;
+    border-radius: var(--radius-panel);
+  }
+
+  .glass-card {
+    @apply glass;
+    border-radius: var(--radius-card);
+  }
+
+  .glass-pill {
+    @apply glass;
+    border-radius: var(--radius-pill);
+  }
+
+  .glass-button {
+    @apply glass-pill inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold;
+    color: var(--label-primary);
+    transition:
+      transform 220ms var(--ease-spring),
+      background-color 220ms var(--ease-spring),
+      box-shadow 220ms var(--ease-spring);
+  }
+
+  .glass-button:hover {
+    background: rgba(40, 40, 48, 0.72);
+    transform: translateY(-1px) scale(1.02);
+  }
+
+  .glass-button:active {
+    transform: scale(0.97);
+  }
+
+  /* Primary CTA: bright, opaque "Play Now". */
+  .glass-button-primary {
+    @apply glass-button;
+    background: rgba(255, 255, 255, 0.92);
+    color: #0b0b0f;
+  }
+
+  .glass-button-primary:hover {
+    background: #ffffff;
+  }
+
+  /* Card specular sheen that follows the cursor (set --mx / --my in px from JS). */
+  .specular-sheen {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 240ms var(--ease-spring);
+    background: radial-gradient(
+      420px circle at var(--mx, 50%) var(--my, 0%),
+      rgba(255, 255, 255, 0.22),
+      rgba(255, 255, 255, 0.06) 30%,
+      transparent 60%
+    );
+    mix-blend-mode: soft-light;
+  }
+
+  .group:hover .specular-sheen,
+  .group:focus-visible .specular-sheen {
+    opacity: 1;
+  }
+
+  /* Progress bar used on Continue Watching cards and episode rows. */
+  .progress-track {
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.22);
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: rgba(255, 255, 255, 0.95);
+  }
+
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.1) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+}
+
+@layer utilities {
+  .text-label-secondary {
+    color: var(--label-secondary);
+  }
+
+  .text-label-tertiary {
+    color: var(--label-tertiary);
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  .mask-fade-x {
+    mask-image: linear-gradient(to right, transparent 0, #000 48px, #000 calc(100% - 48px), transparent 100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Fallback for environments without backdrop-filter: keep contrast with a more opaque base. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass {
+    background: var(--glass-strong);
+  }
+}

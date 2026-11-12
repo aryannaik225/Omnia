@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-watch-history"
+description = "Enables the import_watch_history command without any pre-configured scope."
+commands.allow = ["import_watch_history"]
+
+[[permission]]
+identifier = "deny-import-watch-history"
+description = "Denies the import_watch_history command without any pre-configured scope."
+commands.deny = ["import_watch_history"]

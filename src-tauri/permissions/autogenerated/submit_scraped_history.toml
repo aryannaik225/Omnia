@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-submit-scraped-history"
+description = "Enables the submit_scraped_history command without any pre-configured scope."
+commands.allow = ["submit_scraped_history"]
+
+[[permission]]
+identifier = "deny-submit-scraped-history"
+description = "Denies the submit_scraped_history command without any pre-configured scope."
+commands.deny = ["submit_scraped_history"]

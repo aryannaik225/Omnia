@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-log-playback-event"
+description = "Enables the log_playback_event command without any pre-configured scope."
+commands.allow = ["log_playback_event"]
+
+[[permission]]
+identifier = "deny-log-playback-event"
+description = "Denies the log_playback_event command without any pre-configured scope."
+commands.deny = ["log_playback_event"]

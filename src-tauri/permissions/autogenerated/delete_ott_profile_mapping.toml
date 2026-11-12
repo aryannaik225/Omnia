@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-ott-profile-mapping"
+description = "Enables the delete_ott_profile_mapping command without any pre-configured scope."
+commands.allow = ["delete_ott_profile_mapping"]
+
+[[permission]]
+identifier = "deny-delete-ott-profile-mapping"
+description = "Denies the delete_ott_profile_mapping command without any pre-configured scope."
+commands.deny = ["delete_ott_profile_mapping"]

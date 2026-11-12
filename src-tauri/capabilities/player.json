@@ -1,0 +1,41 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ott-player-remote",
+  "description": "Third-party OTT pages inside player and hidden importer windows: telemetry commands only, and only from known OTT origins.",
+  "windows": ["player-*", "importer-*"],
+  "remote": {
+    "urls": [
+      "https://*.netflix.com",
+      "https://*.primevideo.com",
+      "https://primevideo.com",
+      "https://*.amazon.com",
+      "https://*.amazon.in",
+      "https://*.amazon.co.uk",
+      "https://*.amazon.de",
+      "https://*.amazon.co.jp",
+      "https://*.amazon.ca",
+      "https://*.amazon.com.au",
+      "https://*.amazon.fr",
+      "https://*.amazon.es",
+      "https://*.amazon.it",
+      "https://*.hotstar.com",
+      "https://*.jiocinema.com",
+      "https://*.zee5.com",
+      "https://zee5.com",
+      "https://*.sonyliv.com",
+      "https://tv.apple.com",
+      "https://*.disneyplus.com",
+      "https://*.hbomax.com",
+      "https://*.max.com",
+      "https://*.hulu.com",
+      "https://*.peacocktv.com",
+      "https://*.paramountplus.com",
+      "https://*.crunchyroll.com",
+      "https://mubi.com",
+      "https://*.mubi.com",
+      "https://*.youtube.com",
+      "https://*.mxplayer.in"
+    ]
+  },
+  "permissions": ["ott-player"]
+}

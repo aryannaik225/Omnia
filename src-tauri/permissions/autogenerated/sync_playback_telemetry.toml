@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sync-playback-telemetry"
+description = "Enables the sync_playback_telemetry command without any pre-configured scope."
+commands.allow = ["sync_playback_telemetry"]
+
+[[permission]]
+identifier = "deny-sync-playback-telemetry"
+description = "Denies the sync_playback_telemetry command without any pre-configured scope."
+commands.deny = ["sync_playback_telemetry"]
