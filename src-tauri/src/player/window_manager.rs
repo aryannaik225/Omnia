@@ -878,6 +878,11 @@ async fn finalize_session(app: &AppHandle, label: &str, reason: &str) {
     if let Err(e) = execute_ops(&state.db, session.finalize_ops()).await {
         log::warn!("failed to finalize player session: {e}");
     }
+    // New telemetry: let this profile's (and any rerouted profile's) recommendations refresh.
+    state.recommender.invalidate(session.app_profile_id);
+    if let Some(target) = session.target_profile() {
+        state.recommender.invalidate(target);
+    }
     let status = session.status();
     let _ = app.emit_to(MAIN_LABEL, EVT_PLAYER_CLOSED, json!({ "reason": reason, "status": status }));
 }

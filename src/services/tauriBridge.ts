@@ -463,3 +463,80 @@ export const events = {
   onHistoryImportProgress: on<ImportProgressEvent>(OmniaEvents.historyImportProgress),
   onHistoryImportFinished: on<ImportFinishedEvent>(OmniaEvents.historyImportFinished),
 };
+
+// ---------------------------------------------------------------------------------------------
+// Recommendations (mirror src-tauri/src/ml/recommender.rs)
+// ---------------------------------------------------------------------------------------------
+
+export interface RecommendedItem {
+  tmdbId: number;
+  mediaType: MediaType;
+  title: string;
+  overview: string | null;
+  posterPath: string | null;
+  backdropPath: string | null;
+  releaseYear: number | null;
+  voteAverage: number | null;
+  score: number;
+  matchPercent: number;
+  /** Closest liked title, for "Because you liked …" micro-copy. */
+  becauseOf: string | null;
+}
+
+export interface RecommendationRow {
+  id: string;
+  kind: "taste" | "context" | "binge" | "because" | "comfort" | "popular";
+  title: string;
+  subtitle: string | null;
+  items: RecommendedItem[];
+}
+
+export interface RecommendationsResponse {
+  appProfileId: number;
+  modelId: string;
+  contextBucket: TimeOfDayBucket;
+  coldStart: boolean;
+  generatedAt: string;
+  rows: RecommendationRow[];
+}
+
+export interface Affinity {
+  weight: number;
+  completion: number;
+  partial: number;
+  comfort: number;
+  watchlist: number;
+  engagement: number;
+  bingeMultiplier: number;
+  abandonment: number;
+  skimming: number;
+  recency: number;
+}
+
+export interface TasteSummary {
+  appProfileId: number;
+  titles: {
+    tmdbId: number;
+    mediaType: MediaType;
+    title: string | null;
+    affinity: Affinity;
+    dominantBucket: TimeOfDayBucket | null;
+  }[];
+  bucketWeights: [TimeOfDayBucket, number][];
+}
+
+export interface EmbeddingStatus {
+  ready: boolean;
+  modelId: string | null;
+  backend: "onnx" | "hashed" | null;
+  modelDir: string;
+}
+
+export const recommendations = {
+  /** Cached for 30 min per profile; new telemetry/imports invalidate it automatically. */
+  get: (appProfileId: number, forceRefresh = false) =>
+    invoke<RecommendationsResponse>("get_recommendations", { appProfileId, forceRefresh }),
+  tasteSummary: (appProfileId: number, limit = 50) =>
+    invoke<TasteSummary>("get_taste_summary", { appProfileId, limit }),
+  embeddingStatus: () => invoke<EmbeddingStatus>("get_embedding_status"),
+};

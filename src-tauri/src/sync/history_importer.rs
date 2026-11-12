@@ -845,7 +845,7 @@ fn parse_omnia_json(text: &str, app_profile_id: i64) -> AppResult<Vec<HistoryImp
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct TmdbClient {
+pub(crate) struct TmdbClient {
     http: reqwest::Client,
     credential: Arc<str>,
     bearer: bool,
@@ -881,7 +881,7 @@ struct EpisodeInfo {
 }
 
 impl TmdbClient {
-    async fn from_settings(state: &AppState) -> AppResult<Self> {
+    pub(crate) async fn from_settings(state: &AppState) -> AppResult<Self> {
         let key = state
             .db
             .run(|c| queries::get_setting(c, queries::keys::TMDB_API_KEY))
@@ -892,7 +892,7 @@ impl TmdbClient {
         Ok(Self { http: state.http.clone(), bearer: key.starts_with("eyJ"), credential: key.into() })
     }
 
-    async fn get(&self, path: &str, params: &[(&str, String)]) -> AppResult<Value> {
+    pub(crate) async fn get(&self, path: &str, params: &[(&str, String)]) -> AppResult<Value> {
         let url = format!("https://api.themoviedb.org/3{path}");
         for attempt in 0..3u64 {
             let mut req = self.http.get(&url).query(params);
@@ -1295,6 +1295,7 @@ async fn resolve_and_store(
     })
     .await?;
 
+    app.state::<AppState>().recommender.invalidate(app_profile_id);
     report.imported = imported;
     report.matched_titles = matched_groups.len();
     report.unmatched_titles = unmatched;

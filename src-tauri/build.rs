@@ -47,6 +47,9 @@ const COMMANDS: &[&str] = &[
     "player_rebind_title",
     "import_ott_history",
     "import_history_file",
+    "get_recommendations",
+    "get_taste_summary",
+    "get_embedding_status",
     // Injected OTT script (remote origins)
     "sync_playback_telemetry",
     "player_back_to_hub",

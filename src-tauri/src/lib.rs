@@ -14,6 +14,11 @@ pub mod sync {
     pub mod history_importer;
 }
 
+pub mod ml {
+    pub mod embeddings;
+    pub mod recommender;
+}
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -26,6 +31,8 @@ use db::queries::{
     WatchlistItem,
 };
 use db::Database;
+use ml::embeddings::EmbeddingService;
+use ml::recommender::{self, Recommender};
 use player::window_manager::{self, PlayerManager};
 use resolver::justwatch::{JustWatchResolver, ResolveRequest, ResolveResponse, ResolvedLink};
 use sync::history_importer::{self, HistoryImporter};
@@ -91,6 +98,7 @@ pub struct AppState {
     pub resolver: JustWatchResolver,
     pub player: PlayerManager,
     pub importer: HistoryImporter,
+    pub recommender: Recommender,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -606,6 +614,15 @@ pub fn run() {
                 resolver,
                 player: PlayerManager::default(),
                 importer: HistoryImporter::default(),
+                recommender: Recommender::new(EmbeddingService::new(data_dir.join("models"))),
+            });
+
+            // Warm up the local embedding model in the background (first run: verified download).
+            let warm_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = warm_handle.state::<AppState>();
+                let embedder = state.recommender.embeddings.get().await;
+                log::info!("embedding backend: {}", embedder.model_id());
             });
 
             #[cfg(desktop)]
@@ -671,6 +688,10 @@ pub fn run() {
             history_importer::import_ott_history,
             history_importer::import_history_file,
             history_importer::submit_scraped_history,
+            // Recommendations
+            recommender::get_recommendations,
+            recommender::get_taste_summary,
+            recommender::get_embedding_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Omnia");

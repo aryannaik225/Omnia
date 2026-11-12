@@ -23,6 +23,8 @@ pub mod keys {
     pub const KIDS_SAFE_MODE: &str = "kids_safe_mode";
     /// TMDB v3 key or v4 read token, used locally for history entity resolution.
     pub const TMDB_API_KEY: &str = "tmdb_api_key";
+    /// Model id of the vectors currently stored in media_embeddings.
+    pub const EMBEDDING_MODEL_ID: &str = "embedding_model_id";
 }
 
 /// A title counts as completed when the user reaches the credits: 95% of runtime,
@@ -1293,6 +1295,26 @@ pub fn get_embedding(
         map_embedding,
     )
     .optional()
+}
+
+/// Writes many (tmdb_id, media_type, vector, affinity) rows for one profile atomically.
+pub fn upsert_embeddings_batch(
+    c: &mut Connection,
+    app_profile_id: i64,
+    rows: &[(i64, String, Vec<f32>, f64)],
+) -> rusqlite::Result<usize> {
+    let tx = c.transaction()?;
+    for (tmdb_id, media_type, vector, affinity) in rows {
+        upsert_embedding(&tx, app_profile_id, *tmdb_id, media_type, vector, *affinity)?;
+    }
+    tx.commit()?;
+    Ok(rows.len())
+}
+
+/// Drops every stored vector (all profiles) — used when the embedding model changes, since
+/// vectors from different models live in incompatible spaces.
+pub fn clear_all_embeddings(c: &Connection) -> rusqlite::Result<usize> {
+    c.execute("DELETE FROM media_embeddings", [])
 }
 
 pub fn list_embeddings(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<EmbeddingRecord>> {
