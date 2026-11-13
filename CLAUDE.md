@@ -103,9 +103,9 @@ Instead of opening external bloated Chrome windows or locked UWP Microsoft Store
 
 ### 5.5 Zero-Friction Past Watch History Auto-Importer
 When a user logs into an OTT platform (Netflix, Prime Video, JioHotstar, etc.) inside the app's WebView2 player or via the "Connect Accounts" settings panel:
-1. **Local Session Cookie Read:** Rust accesses the WebView2 cookie manager locally for that specific domain.
+1. **Authenticated Session Stays in WebView2:** The profile's isolated WebView2 session is already signed in; provider cookies are never read into Rust. (Netflix rejects non-browser clients, so a Rust `reqwest` client must not be used for OTT history.)
 2. **Silent Background History Sync:**
-   - Using the authenticated cookies in a local Rust `reqwest` client (and/or a hidden background WebView2 parser for SPA-rendered history pages), the app fetches the user's past viewing activity directly from the OTT platform's internal endpoints (e.g., Netflix's `viewingactivity` / Shakti API, Prime Video's watch history feed, Hotstar's continue-watching state).
+   - A hidden background WebView2 window (in the profile's own data directory) loads the provider, and the injected script fetches the user's past viewing activity from the platform's internal endpoints with genuine in-page `fetch()` calls (e.g., Netflix's `viewingactivity` / Shakti API), falling back to the provider's own history page (captured app requests, embedded React state, hydrated DOM) for Prime Video's watch history, Hotstar's continue-watching state, etc. Results return to Rust over IPC.
 3. **Entity Resolution & Matching:**
    - Matches imported title strings and episode numbers against TMDB's search/find endpoints in parallel batches, populates the local `watch_history` table, and immediately seeds the user's taste profile and "Continue Watching" shelf.
    - Also supports manual drag-and-drop CSV/JSON import/export as an offline backup option.
@@ -276,7 +276,33 @@ CREATE TABLE IF NOT EXISTS watchlist (
     PRIMARY KEY (app_profile_id, tmdb_id, media_type),
     FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
 );
+
+-- 12. Preferred OTT Provider per Title (Isolated by Profile; migration v2)
+-- Remembered answer to "Where do you want to watch this?"; provider_id is canonical.
+CREATE TABLE IF NOT EXISTS preferred_providers (
+    app_profile_id INTEGER NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL CHECK(media_type IN ('movie', 'tv')),
+    provider_id INTEGER NOT NULL,
+    provider_name TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (app_profile_id, tmdb_id, media_type),
+    FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
+);
+
+-- 13. Titles hidden from Continue Watching (Isolated by Profile; migration v3)
+-- "Remove from Continue Watching": hidden until watched again after hidden_at; history is kept.
+CREATE TABLE IF NOT EXISTS continue_watching_hidden (
+    app_profile_id INTEGER NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL CHECK(media_type IN ('movie', 'tv')),
+    hidden_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (app_profile_id, tmdb_id, media_type),
+    FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
+);
 ```
+
+**Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 
 ---
 
@@ -333,7 +359,7 @@ Maintain this exact repository structure:
 │       │   ├── window_manager.rs         # Spawns chromeless WebView2 player & overlay pill
 │       │   └── telemetry_injector.js     # Injected DOM observer for <video> pause/seek/skip tracking
 │       ├── sync/
-│       │   └── history_importer.rs       # Local cookie reader & internal OTT watch history parser
+│       │   └── history_importer.rs       # Hidden-WebView2 OTT watch history importer & TMDB matcher
 │       ├── ml/
 │       │   ├── embeddings.rs             # Text feature extraction & ONNX / TF-IDF vectorization
 │       │   └── recommender.rs            # Behavioral affinity weights, time-of-day centroids, Cosine + MMR

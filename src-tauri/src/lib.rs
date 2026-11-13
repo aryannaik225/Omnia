@@ -27,8 +27,8 @@ use tauri::{Manager, State};
 
 use db::queries::{
     self, AppProfile, ContinueWatchingItem, CustomHub, HistoryImport, HistoryWithMedia, MediaCatalogEntry,
-    OttProfileMapping, PlaybackEvent, ProgressUpdate, SubscribedProvider, WatchHistoryEntry,
-    WatchlistItem,
+    OttProfileMapping, PlaybackEvent, PreferredProvider, ProgressUpdate, SubscribedProvider,
+    WatchHistoryEntry, WatchlistItem,
 };
 use db::Database;
 use ml::embeddings::EmbeddingService;
@@ -146,9 +146,18 @@ async fn update_profile(
         .ok_or_else(|| invalid(format!("profile {profile_id} not found")))
 }
 
+/// Deletes the profile and everything scoped to it: rows cascade in SQLite, and its isolated
+/// browser session (OTT cookies, cache, storage) is wiped from disk.
 #[tauri::command]
-async fn delete_profile(state: State<'_, AppState>, profile_id: i64) -> AppResult<bool> {
-    state.db.run(move |c| queries::delete_profile(c, profile_id)).await
+async fn delete_profile(app: tauri::AppHandle, state: State<'_, AppState>, profile_id: i64) -> AppResult<bool> {
+    let removed = state.db.run(move |c| queries::delete_profile(c, profile_id)).await?;
+    if removed {
+        window_manager::close_player_for_profile(&app, profile_id).await;
+        tauri::async_runtime::spawn(async move {
+            window_manager::purge_profile_data(&app, profile_id).await;
+        });
+    }
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -284,6 +293,95 @@ async fn get_cached_media(
 ) -> AppResult<Option<MediaCatalogEntry>> {
     check_media_type(&media_type)?;
     state.db.run(move |c| queries::get_media(c, tmdb_id, &media_type)).await
+}
+
+/// "Remove from Continue Watching": hides the title from the row; its history is kept.
+#[tauri::command]
+async fn hide_from_continue_watching(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+) -> AppResult<()> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| queries::hide_from_continue_watching(c, app_profile_id, tmdb_id, &media_type))
+        .await
+}
+
+#[tauri::command]
+async fn unhide_from_continue_watching(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+) -> AppResult<bool> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| queries::unhide_from_continue_watching(c, app_profile_id, tmdb_id, &media_type))
+        .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preferred provider per title ("Where do you want to watch this?")
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+async fn get_preferred_provider(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+) -> AppResult<Option<PreferredProvider>> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| queries::get_preferred_provider(c, app_profile_id, tmdb_id, &media_type))
+        .await
+}
+
+/// Remembers the profile's OTT choice for a title. Stored under the canonical provider id so a
+/// "Prime Video" choice also covers its "with Ads" / store variants.
+#[tauri::command]
+async fn set_preferred_provider(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+    provider_id: i64,
+    provider_name: String,
+) -> AppResult<PreferredProvider> {
+    check_media_type(&media_type)?;
+    let name = provider_name.trim().to_string();
+    if name.is_empty() {
+        return Err(invalid("provider name cannot be empty"));
+    }
+    let canonical = window_manager::canonical_provider_id(provider_id, &name);
+    state
+        .db
+        .run(move |c| {
+            if queries::get_profile(c, app_profile_id)?.is_none() {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            queries::set_preferred_provider(c, app_profile_id, tmdb_id, &media_type, canonical, &name)
+        })
+        .await
+}
+
+#[tauri::command]
+async fn clear_preferred_provider(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+) -> AppResult<bool> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| queries::clear_preferred_provider(c, app_profile_id, tmdb_id, &media_type))
+        .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -596,7 +694,16 @@ pub fn run() {
             // Startup maintenance: canonicalise OTT links, drop stale deep links and apply the
             // early-abandonment rule.
             let maintenance_db = db.clone();
+            let maintenance_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Browser data of profiles deleted while it was still locked.
+                match maintenance_db.run(|c| queries::list_profiles(c)).await {
+                    Ok(list) => {
+                        let ids: Vec<i64> = list.iter().map(|p| p.profile_id).collect();
+                        window_manager::sweep_orphan_profile_data(&maintenance_app, &ids);
+                    }
+                    Err(e) => log::warn!("profile data sweep skipped: {e}"),
+                }
                 let rekey = maintenance_db
                     .run(|c| {
                         let mut moved = 0;
@@ -701,6 +808,11 @@ pub fn run() {
             remove_from_watchlist,
             get_watchlist,
             is_in_watchlist,
+            get_preferred_provider,
+            set_preferred_provider,
+            clear_preferred_provider,
+            hide_from_continue_watching,
+            unhide_from_continue_watching,
             // Player (catalog window)
             window_manager::open_player,
             window_manager::close_player,

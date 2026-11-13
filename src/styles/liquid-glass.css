@@ -316,7 +316,8 @@
 
   /* ---- Hero ----------------------------------------------------------------------------- */
   .hero-mask {
-    mask-image: linear-gradient(to bottom, #000 55%, transparent 100%);
+    /* Soft top edge (the hero starts below the floating header) and the long bottom fade. */
+    mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 55%, transparent 100%);
   }
   .hero-scrim {
     background:

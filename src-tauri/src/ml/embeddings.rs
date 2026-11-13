@@ -174,6 +174,44 @@ const KEYWORD_MOODS: &[(&str, &str)] = &[
     ("anime", "anime"),
 ];
 
+/// How light vs dark a title reads. Used to penalise tone clashes in ranking (a serial-killer
+/// thriller in a lighthearted-comedy row) without hard genre filtering.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tone {
+    pub light: f32,
+    pub dark: f32,
+}
+
+impl Tone {
+    /// Weighted average of several tones (e.g. a row's seed titles).
+    pub fn blend(items: impl IntoIterator<Item = (Tone, f64)>) -> Option<Tone> {
+        let (mut light, mut dark, mut total) = (0.0f64, 0.0f64, 0.0f64);
+        for (t, w) in items {
+            if w <= 0.0 {
+                continue;
+            }
+            light += f64::from(t.light) * w;
+            dark += f64::from(t.dark) * w;
+            total += w;
+        }
+        (total > 0.0).then(|| Tone { light: (light / total) as f32, dark: (dark / total) as f32 })
+    }
+}
+
+const LIGHT_GENRES: &[&str] = &["comedy", "family", "kids", "animation", "music", "romance"];
+const DARK_GENRES: &[&str] = &["horror", "crime", "thriller", "war", "war & politics"];
+const LIGHT_MOODS: &[&str] = &[
+    "lighthearted", "funny", "wholesome", "feel-good", "whimsical", "cosy", "warm", "uplifting", "witty", "light", "heartfelt",
+];
+const DARK_MOODS: &[&str] = &["dark", "frightening", "gritty", "bleak", "sobering", "intense", "eerie", "tense", "psychological"];
+/// Keyword substrings that make a title dark whatever its genre tags say.
+const DARK_KEYWORDS: &[&str] = &[
+    "serial killer", "murder", "psychopath", "torture", "gore", "slasher", "rape", "sexual abuse", "child abuse",
+    "suicide", "drug cartel", "drug addiction", "kidnapping", "genocide", "massacre", "cannibal", "home invasion",
+    "violence", "dark comedy",
+];
+const LIGHT_KEYWORDS: &[&str] = &["sitcom", "feel-good", "romantic comedy", "slapstick", "parody", "spoof", "friendship", "christmas"];
+
 fn json_names(v: &Value) -> Vec<String> {
     let arr = match v {
         Value::Array(a) => a.as_slice(),
@@ -265,6 +303,45 @@ impl MediaDocument {
             studios: dedupe(studios).into_iter().take(4).collect(),
             moods: dedupe(moods).into_iter().take(8).collect(),
         }
+    }
+
+    /// Light-vs-dark tone of the title (genres, derived moods and strongly toned keywords).
+    pub fn tone(&self) -> Tone {
+        let mut t = Tone::default();
+        for g in &self.genres {
+            let g = g.to_lowercase();
+            if LIGHT_GENRES.contains(&g.as_str()) {
+                t.light += 1.0;
+            }
+            if DARK_GENRES.contains(&g.as_str()) {
+                t.dark += 1.0;
+            }
+        }
+        // Moods partly restate genres, so they count less.
+        for m in &self.moods {
+            let m = m.to_lowercase();
+            if LIGHT_MOODS.contains(&m.as_str()) {
+                t.light += 0.35;
+            }
+            if DARK_MOODS.contains(&m.as_str()) {
+                t.dark += 0.35;
+            }
+        }
+        let (mut dark_kw, mut light_kw) = (0.0f32, 0.0f32);
+        for k in &self.keywords {
+            let k = k.to_lowercase();
+            // A whodunit is a puzzle, not a dark title ("murder mystery", "cozy mystery").
+            let puzzle = k.contains("mystery") || k.contains("whodunit");
+            if !puzzle && DARK_KEYWORDS.iter().any(|d| k.contains(d)) {
+                dark_kw += 1.0;
+            }
+            if LIGHT_KEYWORDS.iter().any(|l| k.contains(l)) {
+                light_kw += 0.75;
+            }
+        }
+        t.dark += dark_kw.min(3.0);
+        t.light += light_kw.min(2.25);
+        t
     }
 
     /// Natural-language rendering consumed by the transformer.

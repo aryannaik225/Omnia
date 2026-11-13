@@ -13,6 +13,7 @@ import { AmbientBackground } from "./components/layout/AmbientBackground";
 import { LiquidSidebar, SIDEBAR_COLLAPSED, SIDEBAR_EXPANDED } from "./components/layout/LiquidSidebar";
 import { TopFilterBar } from "./components/layout/TopFilterBar";
 import { MediaDetailModal } from "./components/modals/MediaDetailModal";
+import { OttPickerModal } from "./components/modals/OttPickerModal";
 import { ProfileGate } from "./components/profile/ProfileGate";
 import { ContinueWatchingView, MyOttsView, SearchView, WatchlistView } from "./components/views/BrowseViews";
 import { HomeView } from "./components/views/HomeView";
@@ -21,9 +22,6 @@ import { HomeView } from "./components/views/HomeView";
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
 const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
 const AccountSyncModal = lazy(() => import("./components/modals/AccountSyncModal").then((mod) => ({ default: mod.AccountSyncModal })));
-
-/** Scroll depth after which the sidebar folds into an icon rail. */
-const COLLAPSE_AT = 560;
 
 function CurrentView({ view }: { view: View }) {
   switch (view) {
@@ -47,8 +45,7 @@ function CurrentView({ view }: { view: View }) {
 function Shell() {
   const view = useAppStore((s) => s.view);
   const activeHub = useAppStore((s) => s.activeHub);
-  const collapsed = useAppStore((s) => s.sidebarCollapsed);
-  const setCollapsed = useAppStore((s) => s.setSidebarCollapsed);
+  const pinned = useAppStore((s) => s.sidebarPinned);
   const rememberScroll = useAppStore((s) => s.rememberScroll);
   const profileId = useAppStore((s) => s.activeProfile?.profileId);
   const refreshMappings = usePlayerStore((s) => s.refreshMappings);
@@ -64,16 +61,12 @@ function Shell() {
   useEffect(() => {
     const top = useAppStore.getState().scrollPositions[view] ?? 0;
     main.current?.scrollTo({ top });
-    setCollapsed(top > COLLAPSE_AT);
-  }, [view, activeHub, setCollapsed]);
+  }, [view, activeHub]);
 
-  const onScroll = useRafCallback(() => {
-    const top = main.current?.scrollTop ?? 0;
-    rememberScroll(view, top);
-    if (top > COLLAPSE_AT !== useAppStore.getState().sidebarCollapsed) setCollapsed(top > COLLAPSE_AT);
-  });
+  const onScroll = useRafCallback(() => rememberScroll(view, main.current?.scrollTop ?? 0));
 
-  const contentLeft = (collapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED) + 48;
+  // Hover-expansion floats over the content; only a pinned sidebar reserves its full width.
+  const contentLeft = (pinned ? SIDEBAR_EXPANDED : SIDEBAR_COLLAPSED) + 32;
   const style = { "--content-left": `${contentLeft}px` } as CSSProperties;
   const fullBleed = view === "home";
 
@@ -81,9 +74,10 @@ function Shell() {
     <>
       <LiquidSidebar />
       <main ref={main} onScroll={onScroll} className="h-full overflow-y-auto overflow-x-hidden" style={style}>
-        <div className="sticky top-0 z-30 h-0 pr-8 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)" }}>
+        {/* In-flow sticky header: 16px from the top like the sidebar, so it never covers the hero. */}
+        <header className="sticky top-4 z-30 mt-4 pr-8 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)" }}>
           <TopFilterBar />
-        </div>
+        </header>
         <AnimatePresence mode="wait">
           <m.div
             key={view}
@@ -91,7 +85,7 @@ function Shell() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-            className={fullBleed ? "" : "pr-8 pt-20 transition-[padding] duration-500"}
+            className={fullBleed ? "pt-4" : "pr-8 pt-6 transition-[padding] duration-500"}
             style={fullBleed ? undefined : { paddingLeft: "var(--content-left)" }}
           >
             <Suspense fallback={<div className="skeleton mt-10 h-[40vh] rounded-panel" />}>
@@ -101,6 +95,7 @@ function Shell() {
         </AnimatePresence>
       </main>
       <MediaDetailModal />
+      <OttPickerModal />
       <Suspense fallback={null}>
         <AccountSyncModal />
       </Suspense>

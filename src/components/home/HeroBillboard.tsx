@@ -4,7 +4,7 @@
  * a 2-second hover/focus. The artwork's dominant colours drive the ambient background bleed.
  */
 import { AnimatePresence, m } from "framer-motion";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { extractPalette } from "../../lib/color";
 import { formatRuntime, ratingLabel } from "../../lib/format";
 import { providerFamily } from "../../lib/providers";
@@ -47,10 +47,34 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
   const slides = useMemo(() => items.filter((i) => i.backdropPath).slice(0, 6), [items]);
   const [index, setIndex] = useState(0);
+  /** Bumped on manual navigation so the auto-advance timer restarts from zero. */
+  const [cycle, setCycle] = useState(0);
   const [engaged, setEngaged] = useState(false);
   const [showTrailer, setShowTrailer] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const current = slides[index % Math.max(1, slides.length)];
+  const safeIndex = slides.length ? index % slides.length : 0;
+  const current = slides[safeIndex];
+
+  // Keep the selection on the same title when the slide list changes (recs / filter updates).
+  const currentKey = current ? `${current.mediaType}:${current.id}` : null;
+  const lastKey = useRef<string | null>(null);
+  useEffect(() => {
+    const at = lastKey.current ? slides.findIndex((s) => `${s.mediaType}:${s.id}` === lastKey.current) : -1;
+    if (at >= 0 && at !== safeIndex) setIndex(at);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slides]);
+  useEffect(() => {
+    lastKey.current = currentKey;
+  }, [currentKey]);
+
+  const goTo = useCallback(
+    (i: number) => {
+      if (!slides.length) return;
+      setIndex(((i % slides.length) + slides.length) % slides.length);
+      setCycle((c) => c + 1);
+    },
+    [slides.length],
+  );
 
   const { data: d } = useAsync(
     () => (current ? tmdbDetails(current.mediaType, current.id, region) : Promise.resolve(undefined)),
@@ -73,7 +97,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
     if (engaged || slides.length < 2) return;
     const t = setInterval(() => setIndex((i) => (i + 1) % slides.length), ROTATE_MS);
     return () => clearInterval(t);
-  }, [engaged, slides.length]);
+  }, [engaged, slides.length, cycle]);
 
   // Muted trailer preview after a 2s hover/focus.
   const trailerKey = d?.videos[0]?.key;
@@ -85,7 +109,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [engaged, trailerAutoplay, trailerKey, index]);
+  }, [engaged, trailerAutoplay, trailerKey, safeIndex]);
 
   if (!current) {
     return <div className="skeleton h-[68vh] min-h-[520px] w-full" />;
@@ -145,7 +169,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
       <div className="hero-scrim absolute inset-0" />
 
-      <div className="absolute bottom-[19%] left-[calc(var(--sidebar-expanded)+56px)] max-w-[620px] pr-8">
+      <div className="absolute bottom-[19%] left-[calc(var(--content-left)+8px)] z-20 max-w-[620px] pr-8 transition-[left] duration-500">
         <AnimatePresence mode="wait">
           <m.div
             key={current.id}
@@ -180,17 +204,42 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
       </div>
 
       {slides.length > 1 && (
-        <div className="absolute bottom-[19%] right-10 flex gap-2" role="tablist" aria-label="Featured titles">
-          {slides.map((s, i) => (
-            <button
-              key={s.id}
-              role="tab"
-              aria-selected={i === index}
-              aria-label={s.title}
-              onClick={() => setIndex(i)}
-              className={`h-1.5 rounded-full transition-all duration-500 ${i === index ? "w-8 bg-white" : "w-1.5 bg-white/40 hover:bg-white/70"}`}
-            />
-          ))}
+        <div
+          className="absolute bottom-[19%] right-8 z-20 flex items-center rounded-full bg-black/25 px-1.5 backdrop-blur-md"
+          role="tablist"
+          aria-label="Featured titles"
+          onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+            if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+            e.preventDefault();
+            const next = safeIndex + (e.key === "ArrowRight" ? 1 : -1);
+            goTo(next);
+            const buttons = e.currentTarget.querySelectorAll<HTMLButtonElement>("button");
+            buttons[((next % slides.length) + slides.length) % slides.length]?.focus();
+          }}
+        >
+          {slides.map((s, i) => {
+            const active = i === safeIndex;
+            return (
+              // The visible dot is tiny; the button around it is a comfortable 24px hit target.
+              <button
+                key={`${s.mediaType}-${s.id}`}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                aria-label={`Show ${s.title}`}
+                title={s.title}
+                tabIndex={active ? 0 : -1}
+                onClick={() => goTo(i)}
+                className="group/dot flex h-6 cursor-pointer items-center px-1 outline-none"
+              >
+                <span
+                  className={`block h-1.5 rounded-full transition-all duration-500 group-focus-visible/dot:ring-2 group-focus-visible/dot:ring-white/70 ${
+                    active ? "w-8 bg-white" : "w-1.5 bg-white/45 group-hover/dot:w-3 group-hover/dot:bg-white/80"
+                  }`}
+                />
+              </button>
+            );
+          })}
         </div>
       )}
     </section>

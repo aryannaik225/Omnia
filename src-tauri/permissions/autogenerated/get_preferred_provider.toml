@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-preferred-provider"
+description = "Enables the get_preferred_provider command without any pre-configured scope."
+commands.allow = ["get_preferred_provider"]
+
+[[permission]]
+identifier = "deny-get-preferred-provider"
+description = "Denies the get_preferred_provider command without any pre-configured scope."
+commands.deny = ["get_preferred_provider"]

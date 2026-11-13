@@ -44,8 +44,17 @@ const supportsFlags = typeof navigator === "undefined" || !/Windows/i.test(navig
 export const flag = (code: string) =>
   supportsFlags && /^[A-Z]{2}$/.test(code) ? String.fromCodePoint(...[...code].map((c) => 0x1f1a5 + c.charCodeAt(0))) : "";
 
+/** Epoch ms of a SQLite UTC datetime ("YYYY-MM-DD HH:MM:SS"), or NaN. */
+export const parseSqliteUtc = (sqliteUtc: string) => Date.parse(sqliteUtc.replace(" ", "T") + "Z");
+
+/** Watched within the last `days` days (unparseable timestamps count as recent). */
+export const watchedWithinDays = (sqliteUtc: string, days: number) => {
+  const t = parseSqliteUtc(sqliteUtc);
+  return Number.isNaN(t) || Date.now() - t <= days * 86_400_000;
+};
+
 export const relativeTime = (sqliteUtc: string) => {
-  const t = Date.parse(sqliteUtc.replace(" ", "T") + "Z");
+  const t = parseSqliteUtc(sqliteUtc);
   if (Number.isNaN(t)) return "";
   const diff = (Date.now() - t) / 1000;
   if (diff < 60) return "just now";

@@ -1,27 +1,34 @@
 //! Zero-friction past watch-history importer.
 //!
 //! Sources:
-//!   * **Netflix** — reads the WebView2 cookie store locally, copies the session into a private
-//!     in-memory `reqwest` cookie jar, switches *that jar* to the mapped Netflix profile and pulls
-//!     the Shakti `viewingactivity` feed. The active profile is verified before anything is read.
+//!   * **Netflix** — entirely inside a hidden WebView2 window in the profile's own (already
+//!     signed-in) browser session, so Netflix only ever sees its genuine web client; no Rust HTTP
+//!     client and no cookie copying is involved. The injected script switches to the mapped
+//!     profile, calls the Shakti `viewingactivity` API with `fetch()` from the page, and if that
+//!     is refused reads the viewing-activity page: the JSON Netflix's own app fetches (fetch/XHR
+//!     capture), its embedded state, then — after hydration — the rendered rows. The active
+//!     profile is verified before anything is read.
 //!   * **Prime Video / Hotstar / Zee5 / SonyLIV / Disney+ / ...** — a hidden WebView2 window
 //!     renders the provider's watch-history or Continue-Watching page and the injected script
 //!     scrapes it (see `telemetry_injector.js`, import mode).
 //!   * **Manual files** — Netflix "Download viewing activity" CSV, or an Omnia JSON export.
 //!
+//! Session isolation: every webview used here (the hidden import windows) is created in
+//! the browser profile of the Omnia profile being imported (`wm::profile_webview_builder`), so an
+//! import only ever sees the cookies that person signed in with.
+//!
 //! Profile isolation: imports run *for an `ott_profile_mappings` row*. Without a mapping there is
 //! no import; when the provider session's active profile can't be verified as the mapped one,
 //! the import is aborted instead of risking another family member's history.
 //!
-//! Privacy: cookies are only held in memory for the duration of the request, sent only to the
-//! provider's own origin, and never logged. Title matching goes to TMDB (title strings only, no
-//! identifiers), after first trying the local catalog cache.
+//! Privacy: provider cookies never leave WebView2 — Rust never reads them. Title matching goes to
+//! TMDB (title strings only, no identifiers), after first trying the local catalog cache.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -44,11 +51,7 @@ const NETFLIX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(150);
 const TMDB_CONCURRENCY: usize = 4;
 const MAX_UNIQUE_TITLES: usize = 1500;
 const MAX_SEASON_LOOKUPS: usize = 400;
-const NETFLIX_MAX_PAGES: usize = 60;
 const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
-/// Netflix serves its full web app (and the Shakti API) to evergreen Chromium; WebView2 is Edge.
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
-
 fn msg(m: impl Into<String>) -> AppError {
     AppError::Message(m.into())
 }
@@ -74,6 +77,10 @@ impl HistoryImporter {
     }
     fn running(&self) -> std::sync::MutexGuard<'_, HashSet<(i64, i64)>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// Is an import for this Omnia profile in progress (its browser data is in use)?
+    pub fn has_running_for(&self, app_profile_id: i64) -> bool {
+        self.running().iter().any(|(profile, _)| *profile == app_profile_id)
     }
 }
 
@@ -225,13 +232,7 @@ async fn import_ott_history_inner(
     emit_progress(app, app_profile_id, provider_name, "fetching", 0, 0);
     let provider = OttProvider::detect(provider_id, provider_name);
     let raw = match provider {
-        OttProvider::Netflix => match fetch_netflix_history(app, &mapping, provider_name).await? {
-            Ok(items) => items,
-            Err(api_unavailable) => {
-                log::warn!("{api_unavailable}; falling back to the in-page Netflix importer");
-                scrape_netflix_in_page(app, &mapping, provider_name).await?
-            }
-        },
+        OttProvider::Netflix => scrape_netflix_in_page(app, &mapping, provider_name).await?,
         OttProvider::Generic => {
             return Err(msg(format!(
                 "Automatic import isn't available for {provider_name}. Use a CSV/JSON file import instead."
@@ -323,174 +324,8 @@ pub async fn submit_scraped_history(window: WebviewWindow, state: State<'_, AppS
 }
 
 // ---------------------------------------------------------------------------------------------
-// Netflix (cookie-authenticated Shakti API)
+// Netflix (hidden WebView2 only)
 // ---------------------------------------------------------------------------------------------
-
-/// Cookie fields copied out of WebView2. Deliberately no `Debug` impl: values must never be logged.
-struct CookieParts {
-    name: String,
-    value: String,
-    domain: Option<String>,
-    path: Option<String>,
-    secure: bool,
-}
-
-/// Reads cookies for `url` from the shared WebView2 cookie store. Runs on a blocking thread:
-/// WebView2's cookie manager deadlocks if awaited on the main thread.
-async fn read_cookies(app: &AppHandle, url: &str) -> AppResult<Vec<CookieParts>> {
-    let window = app
-        .get_webview_window(wm::MAIN_LABEL)
-        .ok_or_else(|| msg("main window unavailable"))?;
-    let url = tauri::Url::parse(url).map_err(|e| msg(e.to_string()))?;
-    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url)).await??;
-    Ok(cookies
-        .into_iter()
-        .map(|c| CookieParts {
-            name: c.name().to_string(),
-            value: c.value().to_string(),
-            domain: c.domain().map(str::to_string),
-            path: c.path().map(str::to_string),
-            secure: c.secure().unwrap_or(false),
-        })
-        .collect())
-}
-
-/// A one-off HTTPS client whose cookie jar exists only in memory for this import.
-fn cookie_client(origin: &str, cookies: &[CookieParts]) -> AppResult<reqwest::Client> {
-    let base = reqwest::Url::parse(origin).map_err(|e| msg(e.to_string()))?;
-    let host = base.host_str().unwrap_or_default().to_string();
-    let jar = Arc::new(reqwest::cookie::Jar::default());
-    for c in cookies {
-        let domain = c.domain.clone().unwrap_or_else(|| host.clone());
-        let mut line = format!("{}={}; Domain={}; Path={}", c.name, c.value, domain, c.path.as_deref().unwrap_or("/"));
-        if c.secure {
-            line.push_str("; Secure");
-        }
-        jar.add_cookie_str(&line, &base);
-    }
-    Ok(reqwest::Client::builder()
-        .cookie_provider(jar)
-        .user_agent(BROWSER_UA)
-        .https_only(true)
-        .gzip(true)
-        .brotli(true)
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(25))
-        .build()?)
-}
-
-#[derive(Debug, Default, PartialEq)]
-struct NetflixContext {
-    build_identifier: Option<String>,
-    auth_url: Option<String>,
-    profile_guid: Option<String>,
-    profile_name: Option<String>,
-}
-
-fn char_floor(s: &str, mut idx: usize) -> usize {
-    idx = idx.min(s.len());
-    while !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-/// Decodes JS string escapes used in Netflix's inline `reactContext` (`\x20`, `é`, `\"`...).
-fn unescape_js(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    let hex = |slice: &[char]| -> Option<u32> { u32::from_str_radix(&slice.iter().collect::<String>(), 16).ok() };
-    while i < chars.len() {
-        let c = chars[i];
-        if c != '\\' || i + 1 >= chars.len() {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let next = chars[i + 1];
-        match next {
-            'x' if i + 4 <= chars.len() => {
-                match hex(&chars[i + 2..i + 4]).and_then(char::from_u32) {
-                    Some(ch) => out.push(ch),
-                    None => out.extend(&chars[i..i + 4]),
-                }
-                i += 4;
-            }
-            'u' if i + 6 <= chars.len() => {
-                let code = hex(&chars[i + 2..i + 6]).unwrap_or(0xFFFD);
-                if (0xD800..0xDC00).contains(&code)
-                    && i + 12 <= chars.len()
-                    && chars[i + 6] == '\\'
-                    && chars[i + 7] == 'u'
-                {
-                    let low = hex(&chars[i + 8..i + 12]).unwrap_or(0);
-                    let combined = 0x10000 + ((code - 0xD800) << 10) + (low.wrapping_sub(0xDC00) & 0x3FF);
-                    out.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
-                    i += 12;
-                } else {
-                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
-                    i += 6;
-                }
-            }
-            'n' => {
-                out.push('\n');
-                i += 2;
-            }
-            't' => {
-                out.push('\t');
-                i += 2;
-            }
-            'r' => {
-                i += 2;
-            }
-            other => {
-                out.push(other);
-                i += 2;
-            }
-        }
-    }
-    out
-}
-
-/// Finds `"key":"value"` in inline script text and returns the unescaped value.
-fn find_js_string(hay: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = hay.find(&needle)? + needle.len();
-    let bytes = hay.as_bytes();
-    let mut i = start;
-    let mut escaped = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if b == b'"' {
-            return Some(unescape_js(&hay[start..i]));
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Reads the Shakti build id, the `authURL` token and the active profile from Netflix's inline
-/// `reactContext` (present on the homepage and most account pages).
-fn parse_netflix_context(html: &str) -> Option<NetflixContext> {
-    let build_identifier = find_js_string(html, "BUILD_IDENTIFIER");
-    let auth_url = find_js_string(html, "authURL");
-    let (profile_guid, profile_name) = match html.find("\"userInfo\"") {
-        Some(i) => {
-            let window = &html[i..char_floor(html, i + 6000)];
-            (find_js_string(window, "guid"), find_js_string(window, "name"))
-        }
-        None => (None, None),
-    };
-    if build_identifier.is_none() && profile_guid.is_none() && auth_url.is_none() {
-        return None;
-    }
-    Some(NetflixContext { build_identifier, auth_url, profile_guid, profile_name })
-}
 
 /// Netflix identities are `guid::profile name` (links created before this format store the bare
 /// guid). Both the guid and, when present, the name must match.
@@ -512,156 +347,18 @@ fn first_number(s: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-fn netflix_item(v: &Value) -> Option<RawItem> {
-    let series_title = v["seriesTitle"].as_str().filter(|s| !s.trim().is_empty());
-    let is_tv = series_title.is_some() || !v["series"].is_null();
-    let title = if is_tv { series_title.or_else(|| v["title"].as_str()) } else { v["title"].as_str() }?;
-    let watched_at = v["date"]
-        .as_i64()
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
-    Some(RawItem {
-        title: title.trim().to_string(),
-        is_tv: Some(is_tv),
-        season: if is_tv {
-            Some(v["seasonDescriptor"].as_str().and_then(first_number).unwrap_or(1))
-        } else {
-            None
-        },
-        episode: None,
-        episode_title: v["episodeTitle"].as_str().map(str::to_string).filter(|s| !s.is_empty()),
-        watched_at,
-        has_time_of_day: true,
-        progress_seconds: v["bookmark"].as_f64(),
-        duration_seconds: v["duration"].as_f64(),
-        progress_ratio: None,
-        assume_completed: false,
-    })
-}
-
-/// Netflix via the private cookie jar. The outer error is fatal (not signed in, profile can't be
-/// verified); the inner `Err` means the viewing-activity API itself is unavailable, in which
-/// case the caller falls back to the in-page importer.
-async fn fetch_netflix_history(
-    app: &AppHandle,
-    mapping: &OttProfileMapping,
-    provider_name: &str,
-) -> AppResult<Result<Vec<RawItem>, String>> {
-    let cookies = read_cookies(app, "https://www.netflix.com/").await?;
-    if !cookies.iter().any(|c| c.name == "NetflixId" || c.name == "SecureNetflixId") {
-        return Err(msg("You're not signed in to Netflix inside Omnia. Use Connect Accounts to sign in first."));
-    }
-    let client = cookie_client("https://www.netflix.com/", &cookies)?;
-    drop(cookies);
-
-    // Point this private session at the mapped profile. The WebView2 session is untouched.
-    if let Some(switch_url) = OttProvider::Netflix.profile_switch_url(&mapping.ott_native_profile_id) {
-        let _ = client.get(switch_url).send().await;
-    }
-
-    // Scrape the homepage (then the activity page) for BUILD_IDENTIFIER, authURL and the profile.
-    let mut ctx: Option<NetflixContext> = None;
-    for page_url in ["https://www.netflix.com/browse", "https://www.netflix.com/viewingactivity"] {
-        let html = client.get(page_url).send().await?.text().await?;
-        if let Some(found) = parse_netflix_context(&html) {
-            let merged = match ctx.take() {
-                Some(prev) => NetflixContext {
-                    build_identifier: prev.build_identifier.or(found.build_identifier),
-                    auth_url: prev.auth_url.or(found.auth_url),
-                    profile_guid: prev.profile_guid.or(found.profile_guid),
-                    profile_name: prev.profile_name.or(found.profile_name),
-                },
-                None => found,
-            };
-            let complete = merged.profile_guid.is_some() && merged.auth_url.is_some() && merged.build_identifier.is_some();
-            ctx = Some(merged);
-            if complete {
-                break;
-            }
-        }
-    }
-    let ctx = ctx.ok_or_else(|| msg("Couldn't read your Netflix session. Sign in again via Connect Accounts."))?;
-    match ctx.profile_guid.as_deref() {
-        Some(guid) if netflix_identity_matches(&mapping.ott_native_profile_id, guid, ctx.profile_name.as_deref()) => {}
-        Some(_) => {
-            return Err(msg(format!(
-                "Netflix didn't switch to the linked profile{}; import aborted to keep profiles separate.",
-                ctx.profile_name.map(|n| format!(" (active: {n})")).unwrap_or_default()
-            )))
-        }
-        None => return Err(msg("Couldn't verify the active Netflix profile; import aborted to keep profiles separate.")),
-    }
-
-    let mut bases: Vec<String> = Vec::new();
-    if let Some(build) = &ctx.build_identifier {
-        bases.push(format!("https://www.netflix.com/api/shakti/{build}/viewingactivity"));
-    }
-    bases.push("https://www.netflix.com/api/shakti/mre/viewingactivity".to_string());
-
-    let mut working: Option<String> = None;
-    let mut failures: Vec<String> = Vec::new();
-    let mut items = Vec::new();
-    for page in 0..NETFLIX_MAX_PAGES {
-        let candidates = match &working {
-            Some(base) => vec![base.clone()],
-            None => bases.clone(),
-        };
-        let mut body: Option<Value> = None;
-        for base in candidates {
-            let mut query = vec![("pg", page.to_string()), ("pgSize", "100".to_string())];
-            if let Some(auth) = ctx.auth_url.as_ref().filter(|a| !a.is_empty()) {
-                query.push(("authURL", auth.clone()));
-            }
-            let resp = client
-                .get(&base)
-                .query(&query)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .await?;
-            let status = resp.status();
-            if status.is_success() {
-                if let Ok(v) = resp.json::<Value>().await {
-                    if v.get("viewedItems").is_some() {
-                        working = Some(base);
-                        body = Some(v);
-                        break;
-                    }
-                }
-                failures.push(format!("{} returned an unexpected body", base.rsplit("/api/").next().unwrap_or(&base)));
-            } else {
-                failures.push(format!("HTTP {} from {}", status.as_u16(), base.rsplit("/api/").next().unwrap_or(&base)));
-            }
-        }
-        let Some(body) = body else {
-            if page == 0 {
-                return Ok(Err(format!("Netflix viewing-activity API unavailable ({})", failures.join("; "))));
-            }
-            break;
-        };
-        let viewed = body["viewedItems"].as_array().cloned().unwrap_or_default();
-        if viewed.is_empty() {
-            break;
-        }
-        items.extend(viewed.iter().filter_map(netflix_item));
-        let total = body["vhSize"].as_u64().unwrap_or(0) as usize;
-        emit_progress(app, mapping.app_profile_id, provider_name, "fetching", items.len(), total);
-        if total > 0 && (page + 1) * 100 >= total {
-            break;
-        }
-    }
-    if let Some(base) = &working {
-        log::info!("Netflix history read via {}", base.rsplit("/api/").next().unwrap_or(base));
-    }
-    Ok(Ok(items))
-}
-
-/// Fallback: a hidden WebView2 switches to the linked profile, then the injected script calls
-/// Netflix's own APIs from inside the page (or scrapes the viewing-activity page).
+/// Netflix history is read *only* inside a hidden WebView2 window in the Omnia profile's own
+/// browser session: Netflix sees its genuine web client (TLS stack, cookies, headers), never a
+/// Rust HTTP client, and session cookies never leave WebView2. The window starts on the profile
+/// switch URL; the injected script calls the Shakti API in-page and, if that is refused, reads
+/// the viewing-activity page (captured app requests, embedded state, then hydrated rows).
 async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, provider_name: &str) -> AppResult<Vec<RawItem>> {
     let start = OttProvider::Netflix
         .profile_switch_url(&mapping.ott_native_profile_id)
         .unwrap_or_else(|| "https://www.netflix.com/browse".to_string());
     let payload = scrape_with_hidden_window(
         app,
+        mapping.app_profile_id,
         OttProvider::Netflix,
         provider_name,
         &start,
@@ -696,8 +393,10 @@ fn verify_scraped_profile(mapped_id: &str, observed: Option<&str>, mappings_for_
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scrape_with_hidden_window(
     app: &AppHandle,
+    app_profile_id: i64,
     provider: OttProvider,
     provider_name: &str,
     url: &str,
@@ -726,7 +425,7 @@ async fn scrape_with_hidden_window(
         // Leave headroom so the script reports what it has before Rust gives up.
         "scrapeTimeoutMs": timeout.saturating_sub(Duration::from_secs(10)).as_millis() as u64,
     });
-    let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false) {
+    let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false, app_profile_id) {
         Ok(w) => w,
         Err(e) => {
             state.importer.pending().remove(&label);
@@ -799,7 +498,7 @@ async fn scrape_provider_history(
             false,
         ),
     };
-    let payload = scrape_with_hidden_window(app, provider, provider_name, &url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
+    let payload = scrape_with_hidden_window(app, mapping.app_profile_id, provider, provider_name, &url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
 
     let state = app.state::<AppState>();
     let provider_id = mapping.provider_id;
@@ -1139,43 +838,103 @@ fn clean_search_title(title: &str) -> String {
     t.trim().to_string()
 }
 
-fn pick_hit(hits: &[TmdbHit], wanted: &str) -> Option<(i32, TmdbHit)> {
+/// A release year written into the source title ("Dune (2021)", "The Office (US) (2005)").
+fn title_year_hint(title: &str) -> Option<i64> {
+    let mut rest = title.trim();
+    while let Some(open) = rest.rfind(" (") {
+        let inner = rest[open + 2..].trim_end_matches(')').trim();
+        if inner.len() == 4 && inner.chars().all(|c| c.is_ascii_digit()) {
+            return inner.parse().ok().filter(|y| (1900..=2100).contains(y));
+        }
+        rest = &rest[..open];
+    }
+    None
+}
+
+/// The main title before a subtitle ("Glass Onion: A Knives Out Mystery" → "glass onion").
+fn main_title(normalized_source: &str) -> Option<String> {
+    let cut = normalized_source.find([':', '|']).or_else(|| normalized_source.find(" - "))?;
+    let head = normalize_title(&normalized_source[..cut]);
+    // Single short words ("It", "Up") are too ambiguous to match on a prefix alone.
+    ((head.len() >= 4 && head.contains(' ')) || head.len() >= 6).then_some(head)
+}
+
+/// Strict match of a history title against TMDB search hits (ghost-history guard).
+///
+/// * Titles must match exactly (title or original title, normalised), or by main title before a
+///   subtitle — and the latter only among the top three results. No substring matching:
+///   "Friends" must never resolve to "Friends with Benefits".
+/// * `year_hint` (a year in the source title) must agree within ±1 year.
+/// * `released_by` (the earliest year the user watched it) rejects anything released later —
+///   you can't have watched a 2024 remake in 2019.
+fn pick_hit(hits: &[TmdbHit], wanted: &str, year_hint: Option<i64>, released_by: Option<i64>) -> Option<(i32, TmdbHit)> {
     let w = normalize_title(wanted);
     if w.is_empty() {
         return None;
     }
+    let w_main = main_title(wanted);
     hits.iter()
         .enumerate()
         .filter_map(|(idx, h)| {
-            let names = std::iter::once(h.title.as_str()).chain(h.original_title.as_deref());
-            let mut best = 0;
-            for n in names {
-                let n = normalize_title(n);
-                if n == w {
-                    best = best.max(100);
-                } else if idx == 0 && !n.is_empty() && (n.contains(&w) || w.contains(&n)) {
-                    best = best.max(50);
+            if let (Some(by), Some(year)) = (released_by, h.year) {
+                if year > by {
+                    return None;
                 }
             }
-            (best > 0).then(|| (best - idx as i32, h.clone()))
+            let mut score = 0;
+            for raw in std::iter::once(h.title.as_str()).chain(h.original_title.as_deref()) {
+                let n = normalize_title(raw);
+                if n.is_empty() {
+                    continue;
+                }
+                if n == w {
+                    score = score.max(100);
+                } else if idx < 3 && (w_main.as_deref() == Some(n.as_str()) || main_title(raw).as_deref() == Some(w.as_str())) {
+                    score = score.max(60);
+                }
+            }
+            if score == 0 {
+                return None;
+            }
+            match (year_hint, h.year) {
+                (Some(y), Some(hy)) if (y - hy).abs() > 1 => return None,
+                (Some(y), Some(hy)) => score += if y == hy { 20 } else { 10 },
+                (Some(_), None) => score -= 15,
+                _ => {}
+            }
+            Some((score - idx as i32, h.clone()))
         })
         .max_by_key(|(score, _)| *score)
 }
 
-async fn resolve_title(db: &Database, tmdb: &TmdbClient, title: &str, is_tv: Option<bool>) -> AppResult<Option<Matched>> {
+async fn resolve_title(
+    db: &Database,
+    tmdb: &TmdbClient,
+    title: &str,
+    is_tv: Option<bool>,
+    released_by: Option<i64>,
+) -> AppResult<Option<Matched>> {
     let cleaned = clean_search_title(title);
     if cleaned.is_empty() {
         return Ok(None);
     }
+    let year_hint = title_year_hint(title);
     let type_filter = is_tv.map(|t| if t { "tv".to_string() } else { "movie".to_string() });
     let (q, tf) = (cleaned.clone(), type_filter.clone());
     if let Some(local) = db.run(move |c| queries::find_media_by_title(c, &q, tf.as_deref())).await? {
-        return Ok(Some(Matched {
-            tmdb_id: local.tmdb_id,
-            media_type: local.media_type,
-            runtime_mins: local.runtime_mins,
-            catalog: None,
-        }));
+        // The local cache is exact-title only; it must also satisfy the year rules.
+        let year_ok = match local.release_year {
+            Some(y) => year_hint.is_none_or(|h| (h - y).abs() <= 1) && released_by.is_none_or(|by| y <= by),
+            None => year_hint.is_none(),
+        };
+        if year_ok {
+            return Ok(Some(Matched {
+                tmdb_id: local.tmdb_id,
+                media_type: local.media_type,
+                runtime_mins: local.runtime_mins,
+                catalog: None,
+            }));
+        }
     }
 
     let types: &[&'static str] = match is_tv {
@@ -1186,7 +945,7 @@ async fn resolve_title(db: &Database, tmdb: &TmdbClient, title: &str, is_tv: Opt
     let mut best: Option<(i32, TmdbHit)> = None;
     for &media_type in types {
         let hits = tmdb.search(media_type, &cleaned).await?;
-        if let Some(candidate) = pick_hit(&hits, &cleaned) {
+        if let Some(candidate) = pick_hit(&hits, &cleaned, year_hint, released_by) {
             if best.as_ref().is_none_or(|(s, _)| candidate.0 > *s) {
                 best = Some(candidate);
             }
@@ -1242,14 +1001,20 @@ async fn resolve_and_store(
 
     // 1. Unique titles -> TMDB ids (local cache first, bounded concurrency).
     let mut group_of: Vec<usize> = Vec::with_capacity(raw.len());
-    let mut groups: Vec<(String, Option<bool>)> = Vec::new();
+    // Each group also carries the earliest year it was watched: a title can't be a match if it
+    // was released after that (ghost-history guard, see `pick_hit`).
+    let mut groups: Vec<(String, Option<bool>, Option<i64>)> = Vec::new();
     let mut index: HashMap<(String, Option<bool>), usize> = HashMap::new();
     for item in &raw {
         let key = (normalize_title(&clean_search_title(&item.title)), item.is_tv);
         let gi = *index.entry(key).or_insert_with(|| {
-            groups.push((item.title.clone(), item.is_tv));
+            groups.push((item.title.clone(), item.is_tv, None));
             groups.len() - 1
         });
+        if let Some(year) = item.watched_at.map(|d| i64::from(d.year())) {
+            let earliest = &mut groups[gi].2;
+            *earliest = Some(earliest.map_or(year, |e| e.min(year)));
+        }
         group_of.push(gi);
     }
     groups.truncate(MAX_UNIQUE_TITLES);
@@ -1257,11 +1022,11 @@ async fn resolve_and_store(
     let total = groups.len();
     let sem = Arc::new(Semaphore::new(TMDB_CONCURRENCY));
     let mut set = JoinSet::new();
-    for (gi, (title, is_tv)) in groups.iter().cloned().enumerate() {
+    for (gi, (title, is_tv, released_by)) in groups.iter().cloned().enumerate() {
         let (db, tmdb, sem) = (db.clone(), tmdb.clone(), sem.clone());
         set.spawn(async move {
             let _permit = sem.acquire_owned().await;
-            (gi, resolve_title(&db, &tmdb, &title, is_tv).await)
+            (gi, resolve_title(&db, &tmdb, &title, is_tv, released_by).await)
         });
     }
     let mut matches: Vec<Option<Matched>> = vec![None; total];
@@ -1452,46 +1217,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_netflix_context_with_escapes() {
-        let html = r#"<script>netflix.reactContext = {"models":{"serverDefs":{"data":{"BUILD_IDENTIFIER":"vb4b9a1c2"}},"userInfo":{"data":{"name":"Ary\x20an","guid":"ABCDEF123","userGuid":"ZZZ"}}}};</script>"#;
-        let ctx = parse_netflix_context(html).unwrap();
-        assert_eq!(ctx.build_identifier.as_deref(), Some("vb4b9a1c2"));
-        assert_eq!(ctx.profile_guid.as_deref(), Some("ABCDEF123"));
-        assert_eq!(ctx.profile_name.as_deref(), Some("Ary an"));
-    }
-
-    #[test]
-    fn unescapes_js() {
-        // Inputs are built at runtime (b = backslash) so the escapes reach unescape_js verbatim.
-        let input = format!("Am{b}u00e9lie {b}x26 co {b}\"x{b}\"", b = '\\');
-        assert_eq!(unescape_js(&input), "Am\u{e9}lie & co \"x\"");
-        let surrogates = format!("{b}ud83c{b}udfac", b = '\\');
-        assert_eq!(unescape_js(&surrogates), "\u{1F3AC}");
-    }
-
-    #[test]
-    fn netflix_viewing_item() {
-        let v = json!({
-            "title": "Stranger Things: Season 4: Chapter One",
-            "seriesTitle": "Stranger Things",
-            "series": 80057281,
-            "seasonDescriptor": "Season 4",
-            "episodeTitle": "Chapter One: The Hellfire Club",
-            "date": 1_700_000_000_000i64,
-            "bookmark": 4500,
-            "duration": 4680
-        });
-        let item = netflix_item(&v).unwrap();
-        assert_eq!(item.title, "Stranger Things");
-        assert_eq!(item.is_tv, Some(true));
-        assert_eq!(item.season, Some(4));
-        assert_eq!(item.progress_seconds, Some(4500.0));
-        let movie = netflix_item(&json!({ "title": "Glass Onion", "date": 1_700_000_000_000i64 })).unwrap();
-        assert_eq!(movie.is_tv, Some(false));
-        assert_eq!(movie.season, None);
-    }
-
-    #[test]
     fn netflix_csv_titles() {
         assert_eq!(
             parse_netflix_title("Stranger Things: Season 1: Chapter One: The Vanishing of Will Byers"),
@@ -1516,15 +1241,11 @@ mod tests {
     }
 
     #[test]
-    fn netflix_identity_and_auth_url() {
+    fn netflix_identity_matching() {
         assert!(netflix_identity_matches("G1::Clara", "G1", Some("Clara")));
         assert!(!netflix_identity_matches("G1::Clara", "G1", Some("Aryan")), "same account guid, other profile");
         assert!(!netflix_identity_matches("G1::Clara", "G2", Some("Clara")));
         assert!(netflix_identity_matches("G1", "G1", Some("Anyone")), "legacy bare-guid links");
-        let html = r#"{"models":{"userInfo":{"data":{"name":"Clara","guid":"G1","authURL":"abc.123"}},"serverDefs":{"data":{"BUILD_IDENTIFIER":"v1"}}}}"#;
-        let ctx = parse_netflix_context(html).unwrap();
-        assert_eq!(ctx.auth_url.as_deref(), Some("abc.123"));
-        assert_eq!(ctx.build_identifier.as_deref(), Some("v1"));
     }
 
     #[test]
@@ -1576,8 +1297,29 @@ mod tests {
             genre_ids: Value::Null,
         };
         let hits = vec![hit(1, "The Matrix Reloaded"), hit(2, "The Matrix")];
-        assert_eq!(pick_hit(&hits, "The Matrix").unwrap().1.id, 2);
-        assert!(pick_hit(&[hit(3, "Something Else")], "The Matrix").is_none());
+        assert_eq!(pick_hit(&hits, "The Matrix", None, None).unwrap().1.id, 2);
+        assert!(pick_hit(&[hit(3, "Something Else")], "The Matrix", None, None).is_none());
+
+        // Ghost-history guards.
+        let dated = |id, title: &str, year| TmdbHit { year: Some(year), ..hit(id, title) };
+        // No substring matches, even on the top result.
+        assert!(pick_hit(&[dated(10, "Friends with Benefits", 2011)], "Friends", None, None).is_none());
+        // Subtitle-tolerant main-title match, top results only.
+        let onion = [dated(11, "Glass Onion: A Knives Out Mystery", 2022)];
+        assert_eq!(pick_hit(&onion, "Glass Onion", None, None).unwrap().1.id, 11);
+        let buried = [dated(1, "A", 2000), dated(2, "B", 2000), dated(3, "C", 2000), dated(12, "Glass Onion: A Knives Out Mystery", 2022)];
+        assert!(pick_hit(&buried, "Glass Onion", None, None).is_none());
+        // Released after it was watched => not the title the user saw (remakes, reboots).
+        let remakes = [dated(20, "The Office", 2025), dated(21, "The Office", 2005)];
+        assert_eq!(pick_hit(&remakes, "The Office", None, Some(2019)).unwrap().1.id, 21);
+        assert!(pick_hit(&[dated(22, "Dune", 2021)], "Dune", None, Some(2019)).is_none());
+        // A year in the source title is strict (±1).
+        let dunes = [dated(30, "Dune", 2021), dated(31, "Dune", 1984)];
+        assert_eq!(pick_hit(&dunes, "Dune", Some(1984), None).unwrap().1.id, 31);
+        assert!(pick_hit(&[dated(30, "Dune", 2021)], "Dune", Some(1984), None).is_none());
+        assert_eq!(title_year_hint("Dune (1984)"), Some(1984));
+        assert_eq!(title_year_hint("The Office (US) (2005)"), Some(2005));
+        assert_eq!(title_year_hint("RRR (Hindi)"), None);
     }
 
     #[test]

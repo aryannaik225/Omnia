@@ -90,6 +90,8 @@ export interface MediaSummary {
   posterPath: string | null;
   backdropPath: string | null;
   year: number | null;
+  /** Full release / first-air date ("YYYY-MM-DD") when TMDB provides one. */
+  releaseDate?: string | null;
   voteAverage: number | null;
   genreIds: number[];
   originalLanguage: string | null;
@@ -141,6 +143,7 @@ export function toSummary(r: RawListItem, fallbackType?: MediaType): MediaSummar
     posterPath: r.poster_path ?? null,
     backdropPath: r.backdrop_path ?? null,
     year: date ? Number(date.slice(0, 4)) || null : null,
+    releaseDate: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null,
     voteAverage: r.vote_average ?? null,
     genreIds: r.genre_ids ?? [],
     originalLanguage: r.original_language ?? null,
@@ -420,7 +423,13 @@ export async function person(id: number): Promise<PersonDetails> {
       seen.add(k);
       return true;
     })
-    .sort((a, b) => b.popularity - a.popularity);
+    // Filmography: newest first; undated (announced / in development) titles go last.
+    .sort((a, b) => {
+      const da = a.releaseDate ?? (a.year ? `${a.year}-00-00` : "");
+      const db = b.releaseDate ?? (b.year ? `${b.year}-00-00` : "");
+      if (da !== db) return !da ? 1 : !db ? -1 : db.localeCompare(da);
+      return b.popularity - a.popularity;
+    });
   return {
     id: raw.id,
     name: raw.name,
@@ -434,6 +443,28 @@ export async function person(id: number): Promise<PersonDetails> {
 export async function collectionParts(id: number): Promise<MediaSummary[]> {
   const raw = await request<any>(`/collection/${id}`, {}, 24 * 3600_000);
   return (raw.parts ?? []).map((r: RawListItem) => toSummary(r, "movie")).filter(Boolean) as MediaSummary[];
+}
+
+/** Streaming availability for one title, per region (cached a day; shared with `details`-free rows). */
+export async function watchProviders(mt: MediaType, id: number): Promise<Record<string, RegionProviders>> {
+  return mapProviders(await request<any>(`/${mt}/${id}/watch/providers`, {}, 24 * 3600_000));
+}
+
+export interface CollectionArt {
+  name: string;
+  posterPath: string | null;
+  backdropPath: string | null;
+}
+
+export async function collectionArt(id: number): Promise<CollectionArt> {
+  const raw = await request<any>(`/collection/${id}`, {}, 7 * 24 * 3600_000);
+  return { name: raw.name ?? "", posterPath: raw.poster_path ?? null, backdropPath: raw.backdrop_path ?? null };
+}
+
+/** Logo of a TV network (`/network/{id}`) or production company (`/company/{id}`). */
+export async function brandLogo(kind: "network" | "company", id: number): Promise<string | null> {
+  const raw = await request<any>(`/${kind}/${id}`, {}, 7 * 24 * 3600_000);
+  return raw.logo_path ?? null;
 }
 
 export async function searchKeywordId(query: string): Promise<number | null> {

@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { extractPalette } from "../../lib/color";
 import { formatRuntime, MONETIZATION_LABEL, ratingLabel } from "../../lib/format";
 import { useAsync } from "../../lib/hooks";
-import { groupLinks, isSubscribedLink } from "../../services/catalog";
+import { groupLinks, isSubscribedLink, providerLogo } from "../../services/catalog";
 import { providerFamily } from "../../lib/providers";
 import {
   details as tmdbDetails,
@@ -22,6 +22,7 @@ import { catalog, history, type ResolvedLink, type WatchHistoryEntry } from "../
 import { useAppStore, type ModalEntry } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { PosterCard } from "../common/Cards";
+import { HorizontalScroller } from "../common/HorizontalScroller";
 import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon, StarIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
 import { fromSummary, MediaCarouselRow } from "../home/MediaCarouselRow";
@@ -38,16 +39,15 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   const [force, setForce] = useState(0);
   const links = useAsync(() => resolveLinks(d, force > 0), [d.id, d.mediaType, region, force]);
   const [showAll, setShowAll] = useState(false);
+  const getPreference = usePlayerStore((s) => s.getPreference);
+  const clearPreference = usePlayerStore((s) => s.clearPreference);
+  const playTitle = usePlayerStore((s) => s.playTitle);
+  const preferenceVersion = usePlayerStore((s) => s.preferenceVersion);
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  const pref = useAsync(() => getPreference(d), [d.id, d.mediaType, profileId, preferenceVersion]);
+  const prefKey = pref.data ? providerFamily(pref.data.providerId, pref.data.providerName).key : null;
 
-  const logoFor = (l: ResolvedLink) => {
-    const r = d.providersByRegion[region];
-    const all = r ? [...r.flatrate, ...r.free, ...r.ads, ...r.rent, ...r.buy] : [];
-    const fam = providerFamily(l.providerId, l.providerName).key;
-    const hit =
-      all.find((p) => p.providerId === l.providerId) ??
-      all.find((p) => providerFamily(p.providerId, p.providerName).key === fam);
-    return img(hit?.logoPath, "w92");
-  };
+  const logoFor = (l: ResolvedLink) => providerLogo(d, region, l);
 
   if (links.loading) {
     return (
@@ -66,6 +66,7 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   const shown = showAll || !subscriptionsOnly ? all : primary.length ? primary : all;
 
   const groups = groupLinks(shown);
+  const prefName = groupLinks(all).find((g) => g.key === prefKey)?.name ?? pref.data?.providerName;
   return (
     <div>
       <div className="flex flex-wrap gap-3">
@@ -73,6 +74,7 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
           const l = g.primary;
           const logo = logoFor(l);
           const included = isSubscribedLink(l, subs) && ["flatrate", "free", "ads"].includes(l.monetizationType);
+          const isDefault = g.key === prefKey;
           const extras = [...new Set(g.alternatives.map((a) => MONETIZATION_LABEL[a.monetizationType]).filter((x) => x && x !== MONETIZATION_LABEL[l.monetizationType]))];
           return (
             <m.button
@@ -80,14 +82,14 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.97 }}
               onClick={() => onPlay(l)}
-              className={`glass-pill flex items-center gap-3 py-2 pl-2 pr-4 text-left ${included ? "ring-1 ring-[#30d158]/60" : ""}`}
-              title={l.isFallback ? `No direct link found; opens ${l.providerName} search` : l.directUrl}
+              className={`glass-pill flex items-center gap-3 py-2 pl-2 pr-4 text-left ${isDefault ? "ring-2 ring-white/80" : included ? "ring-1 ring-[#30d158]/60" : ""}`}
+              title={l.isFallback ? `No direct link found; opens ${l.providerName} search. Becomes your default for this title.` : `Play on ${g.name} (becomes your default for this title)`}
             >
               {logo ? <img src={logo} alt="" className="h-10 w-10 rounded-[10px]" /> : <span className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-white/10 font-bold">{l.providerName[0]}</span>}
               <span>
                 <span className="block text-[14px] font-semibold">{g.name}</span>
                 <span className="block text-[12px] text-label-tertiary">
-                  {[included ? "Included" : MONETIZATION_LABEL[l.monetizationType], l.quality, l.isFallback ? "Search" : null, extras.length ? `also ${extras.join(", ")}` : null]
+                  {[isDefault ? "Your default" : null, included ? "Included" : MONETIZATION_LABEL[l.monetizationType], l.quality, l.isFallback ? "Search" : null, extras.length ? `also ${extras.join(", ")}` : null]
                     .filter(Boolean)
                     .join(" · ")}
                 </span>
@@ -96,7 +98,18 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
           );
         })}
       </div>
-      <div className="mt-3 flex gap-2">
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {pref.data && (
+          <span className="chip !cursor-default" data-active>
+            Play opens {prefName}
+            <button className="ml-1 font-semibold text-[#0a84ff] hover:underline" onClick={() => void playTitle(d, { choose: true })}>
+              Change
+            </button>
+            <button className="font-semibold text-label-secondary hover:text-label-primary hover:underline" onClick={() => void clearPreference(d)}>
+              Forget
+            </button>
+          </span>
+        )}
         {subscriptionsOnly && shown.length < all.length && (
           <button className="chip" onClick={() => setShowAll(true)}>
             Show rent, buy & other services ({groupLinks(all).length - groups.length})
@@ -186,6 +199,8 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
   const openPerson = useAppStore((s) => s.openPerson);
   const setAmbient = useAppStore((s) => s.setAmbient);
   const toggleWatchlist = useAppStore((s) => s.toggleWatchlist);
+  const hideFromContinueWatching = useAppStore((s) => s.hideFromContinueWatching);
+  const inContinueWatching = useAppStore((s) => s.continueWatching.some((c) => c.tmdbId === entry.id && c.mediaType === entry.mediaType));
   const inWatchlist = useAppStore((s) => s.isInWatchlist);
   useAppStore((s) => s.watchlistKeys);
   const kids = useAppStore((s) => s.isKids());
@@ -265,6 +280,15 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
                   {trailerOpen ? "Hide trailer" : "Trailer"}
                 </button>
               )}
+              {inContinueWatching && (
+                <button
+                  className="glass-button !py-3"
+                  onClick={() => void hideFromContinueWatching(seed.id, seed.mediaType, seed.title)}
+                  title="Hides it from Continue Watching until you watch it again. Your history is kept."
+                >
+                  <CloseIcon size={16} /> Remove from Continue Watching
+                </button>
+              )}
             </div>
           </div>
           {d && (
@@ -306,7 +330,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
         {d && !kidsBlocked && (
           <section>
             <h2 className="section-title mb-4">Where to watch</h2>
-            <WatchOptions d={d} onPlay={(link) => void playTitle(d, { link })} />
+            <WatchOptions d={d} onPlay={(link) => void playTitle(d, { link, remember: true })} />
           </section>
         )}
 
@@ -321,7 +345,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
         {d && d.cast.length > 0 && (
           <section>
             <h2 className="section-title mb-4">Cast</h2>
-            <div className="row-scroller">
+            <HorizontalScroller label="cast">
               {d.cast.map((c) => (
                 <m.button key={`${c.id}-${c.character}`} whileHover={{ scale: 1.06 }} onClick={() => openPerson(c.id)} className="w-[112px] shrink-0 text-center">
                   <span className="mx-auto block h-[104px] w-[104px] overflow-hidden rounded-full bg-white/10 shadow-glass">
@@ -331,7 +355,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
                   <span className="block truncate text-[12px] text-label-tertiary">{c.character}</span>
                 </m.button>
               ))}
-            </div>
+            </HorizontalScroller>
           </section>
         )}
 
@@ -350,6 +374,7 @@ function PersonView({ id }: { id: number }) {
   const kids = useAppStore((s) => s.isKids());
   const p = useAsync(() => tmdbPerson(id), [id]);
   const [bioOpen, setBioOpen] = useState(false);
+  const [allCredits, setAllCredits] = useState(false);
   if (!p.data) return p.error ? <p className="p-10 text-label-secondary">{p.error}</p> : <div className="skeleton m-10 h-[40vh] rounded-panel" />;
   const person = p.data;
   const credits = kids ? person.credits.filter((c) => c.genreIds.some((g) => [16, 10751, 10762].includes(g))) : person.credits;
@@ -372,12 +397,18 @@ function PersonView({ id }: { id: number }) {
           )}
         </div>
       </div>
-      <h2 className="section-title mb-4 mt-10">Filmography</h2>
+      <h2 className="section-title mb-1 mt-10">Filmography</h2>
+      <p className="mb-4 text-[13px] text-label-tertiary">Newest first</p>
       <div className="grid gap-x-5 gap-y-7" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}>
-        {credits.slice(0, 60).map((c) => (
+        {credits.slice(0, allCredits ? credits.length : 60).map((c) => (
           <PosterCard key={`${c.mediaType}-${c.id}`} title={c.title} posterPath={c.posterPath} year={c.year} rating={c.voteAverage} width="fill" onClick={() => openTitle({ id: c.id, mediaType: c.mediaType, seed: c })} />
         ))}
       </div>
+      {!allCredits && credits.length > 60 && (
+        <button className="chip mt-6" onClick={() => setAllCredits(true)}>
+          Show all {credits.length} titles
+        </button>
+      )}
     </div>
   );
 }

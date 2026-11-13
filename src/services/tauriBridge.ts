@@ -368,6 +368,25 @@ export const ottMappings = {
     invoke<boolean>("delete_ott_profile_mapping", { appProfileId, providerId }),
 };
 
+/** The OTT a profile chose for a title; `providerId` is canonical (covers ad / store variants). */
+export interface PreferredProvider {
+  appProfileId: number;
+  tmdbId: number;
+  mediaType: MediaType;
+  providerId: number;
+  providerName: string;
+  updatedAt: string;
+}
+
+export const preferredProviders = {
+  get: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<PreferredProvider | null>("get_preferred_provider", { appProfileId, tmdbId, mediaType }),
+  set: (appProfileId: number, tmdbId: number, mediaType: MediaType, providerId: number, providerName: string) =>
+    invoke<PreferredProvider>("set_preferred_provider", { appProfileId, tmdbId, mediaType, providerId, providerName }),
+  clear: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<boolean>("clear_preferred_provider", { appProfileId, tmdbId, mediaType }),
+};
+
 export const subscriptions = {
   list: (regionCode: string, activeOnly = true) =>
     invoke<SubscribedProvider[]>("list_subscribed_providers", { regionCode, activeOnly }),
@@ -400,6 +419,11 @@ export const history = {
   titleProgress: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<WatchHistoryEntry[]>("get_title_progress", { appProfileId, tmdbId, mediaType }),
   remove: (appProfileId: number, id: number) => invoke<boolean>("delete_watch_history_entry", { appProfileId, id }),
+  /** "Remove from Continue Watching": hidden until watched again; history is kept. */
+  hideFromContinueWatching: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<void>("hide_from_continue_watching", { appProfileId, tmdbId, mediaType }),
+  unhideFromContinueWatching: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<boolean>("unhide_from_continue_watching", { appProfileId, tmdbId, mediaType }),
   importRows: (rows: HistoryImport[]) => invoke<number>("import_watch_history", { rows }),
   exportAll: (appProfileId: number) => invoke<WatchHistoryEntry[]>("export_watch_history", { appProfileId }),
 };

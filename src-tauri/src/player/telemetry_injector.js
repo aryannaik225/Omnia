@@ -956,132 +956,416 @@
     setTimeout(tick, 2500);
   }
 
-  /** Netflix viewing activity through Netflix's own in-page APIs (build id + authURL). */
+  // -------------------------------------------------------------------------------------------
+  // Netflix history import (hidden window)
+  //
+  // Strategies, most to least robust — none depends on Netflix's CSS class names:
+  //   1. Capture: fetch / XHR are hooked at document start (this script runs before any page
+  //      script), so the JSON that Netflix's own viewing-activity page requests is harvested,
+  //      whatever endpoint and headers the current web app uses. "Show more" pulls more pages.
+  //   2. Embedded state: window.netflix.reactContext / falcorCache and JSON <script> blobs.
+  //   3. Netflix's Shakti API called in-page with the web client's own headers.
+  //   4. DOM rows — only once the React page has hydrated, and without relying on class names.
+  // Entries are recognised by shape (a title plus a watch date), not by a fixed schema path.
+  // -------------------------------------------------------------------------------------------
+  var NFX = { items: [], keys: {}, total: 0, responses: 0, sources: {} };
+  var NFX_TITLE_KEYS = ["seriesTitle", "title", "videoTitle", "showTitle"];
+  var NFX_DATE_KEYS = ["date", "dateWatched", "watchedDate", "lastWatched", "viewedAt", "timestamp"];
+
+  function nfxText(v) {
+    var s = typeof v === "string" ? clean(v) : "";
+    return s || null;
+  }
+
+  function nfxEpochMs(v) {
+    if (typeof v === "number" && isFinite(v)) return v > 1e11 ? v : v > 1e9 ? v * 1000 : null;
+    if (typeof v === "string" && v.length < 40 && /\d{4}/.test(v)) {
+      var t = Date.parse(v);
+      return isNaN(t) ? null : t;
+    }
+    return null;
+  }
+
+  function nfxFirst(o, keys, pick) {
+    for (var i = 0; i < keys.length; i++) {
+      var r = pick(o[keys[i]]);
+      if (r != null) return r;
+    }
+    return null;
+  }
+
+  function nfxLooksViewed(o) {
+    return !!o && typeof o === "object" && !Array.isArray(o) && nfxFirst(o, NFX_TITLE_KEYS, nfxText) != null && nfxFirst(o, NFX_DATE_KEYS, nfxEpochMs) != null;
+  }
+
+  function nfxToItem(v) {
+    var series = nfxText(v.seriesTitle) || nfxText(v.showTitle);
+    var isTv = !!series || v.series != null;
+    var seasonMatch = String(v.seasonDescriptor || "").match(/\d+/);
+    var ms = nfxFirst(v, NFX_DATE_KEYS, nfxEpochMs);
+    return {
+      title: isTv ? series || nfxText(v.title) : nfxText(v.title) || nfxText(v.videoTitle),
+      isTv: isTv,
+      seasonNumber: isTv ? (seasonMatch ? parseInt(seasonMatch[0], 10) : 1) : null,
+      episodeNumber: null,
+      episodeTitle: nfxText(v.episodeTitle),
+      progressRatio: null,
+      progressSeconds: typeof v.bookmark === "number" ? v.bookmark : null,
+      durationSeconds: typeof v.duration === "number" ? v.duration : null,
+      watchedAt: ms ? new Date(ms).toISOString() : null,
+    };
+  }
+
+  function nfxHarvest(list, source) {
+    var added = 0;
+    list.forEach(function (v) {
+      var it = nfxToItem(v);
+      if (!it.title) return;
+      var key = [v.movieID || "", it.title, it.episodeTitle || "", it.watchedAt || ""].join("|");
+      if (NFX.keys[key]) return;
+      NFX.keys[key] = true;
+      NFX.items.push(it);
+      added++;
+    });
+    if (added) NFX.sources[source] = (NFX.sources[source] || 0) + added;
+    return added;
+  }
+
+  /** Harvests every viewing-activity-shaped array inside a JSON value (cycle- and size-safe). */
+  function nfxFindViewed(root, source) {
+    var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+    var budget = 250000;
+    var found = 0;
+    (function walk(node, depth) {
+      if (!node || typeof node !== "object" || depth > 12 || --budget < 0) return;
+      if (seen) {
+        if (seen.has(node)) return;
+        seen.add(node);
+      }
+      if (typeof node.vhSize === "number" && node.vhSize > NFX.total) NFX.total = node.vhSize;
+      if (Array.isArray(node)) {
+        var objects = 0;
+        var viewed = [];
+        for (var i = 0; i < node.length && i < 5000; i++) {
+          var x = node[i];
+          if (x && typeof x === "object") {
+            objects++;
+            if (nfxLooksViewed(x)) viewed.push(x);
+          }
+        }
+        if (viewed.length && viewed.length * 2 >= objects) {
+          found += nfxHarvest(viewed, source);
+          return;
+        }
+        for (var j = 0; j < node.length && j < 5000; j++) walk(node[j], depth + 1);
+        return;
+      }
+      var keys;
+      try { keys = Object.keys(node); } catch (_) { return; }
+      for (var k = 0; k < keys.length; k++) {
+        var child;
+        try { child = node[keys[k]]; } catch (_) { continue; }
+        walk(child, depth + 1);
+      }
+    })(root, 0);
+    return found;
+  }
+
+  function nfxConsiderText(text, source) {
+    if (typeof text !== "string" || text.length < 2 || text.length > 8e6) return;
+    var first = text.charAt(0);
+    if (first !== "{" && first !== "[") return;
+    try { nfxFindViewed(JSON.parse(text), source); } catch (_) {}
+  }
+
+  function nfxSameSite(url) {
+    try {
+      return /(^|\.)netflix\.com$/i.test(new URL(url, location.href).hostname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** Observes the page's own requests. Installed at document start, before Netflix's scripts. */
+  function installNetflixCapture() {
+    if (typeof window.fetch === "function") {
+      var origFetch = window.fetch;
+      window.fetch = function (input) {
+        var p = origFetch.apply(window, arguments);
+        try {
+          var url = typeof input === "string" ? input : (input && input.url) || String(input || "");
+          if (nfxSameSite(url)) {
+            p.then(function (r) {
+              var type = (r.headers && r.headers.get("content-type")) || "";
+              if (!r.ok || type.indexOf("json") < 0) return;
+              NFX.responses++;
+              r.clone().text().then(function (t) { nfxConsiderText(t, "page requests"); }).catch(function () {});
+            }).catch(function () {});
+          }
+        } catch (_) {}
+        return p;
+      };
+    }
+    var X = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (!X) return;
+    var origOpen = X.open;
+    var origSend = X.send;
+    X.open = function (method, url) {
+      try { this.__omniaUrl = String(url); } catch (_) {}
+      return origOpen.apply(this, arguments);
+    };
+    X.send = function () {
+      var xhr = this;
+      if (nfxSameSite(xhr.__omniaUrl || "")) {
+        xhr.addEventListener("load", function () {
+          try {
+            if (xhr.status < 200 || xhr.status >= 300) return;
+            NFX.responses++;
+            if (xhr.responseType === "json") nfxFindViewed(xhr.response, "page requests");
+            else if (!xhr.responseType || xhr.responseType === "text") nfxConsiderText(xhr.responseText, "page requests");
+          } catch (_) {}
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  /** The balanced `{...}` starting at `start` in script text, honouring string literals. */
+  function nfxBalanced(text, start) {
+    var depth = 0, quote = null, escaped = false;
+    for (var i = start; i < text.length; i++) {
+      var c = text.charAt(i);
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === quote) quote = null;
+        continue;
+      }
+      if (c === '"' || c === "'") quote = c;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) return text.slice(start, i + 1);
+    }
+    return null;
+  }
+
+  /** Strategy 2: activity embedded in the page's own state and inline <script> blobs. */
+  function harvestNetflixPageState() {
+    try {
+      if (window.netflix) {
+        nfxFindViewed(window.netflix.reactContext && window.netflix.reactContext.models, "page state");
+        nfxFindViewed(window.netflix.falcorCache, "page state");
+      }
+    } catch (_) {}
+    document.querySelectorAll("script:not([src])").forEach(function (s) {
+      var text = s.textContent || "";
+      if (text.length > 8e6 || !/viewedItems|viewingActivity|dateWatched|seriesTitle/.test(text)) return;
+      if (/json/i.test(s.type || "")) {
+        nfxConsiderText(text.trim(), "page state");
+        return;
+      }
+      // Inline `x = {...};` assignments: parse each object literal (JS-only \x escapes → \u00).
+      var re = /=\s*\{/g, m;
+      while ((m = re.exec(text))) {
+        var obj = nfxBalanced(text, m.index + m[0].length - 1);
+        if (!obj) continue;
+        re.lastIndex = m.index + obj.length;
+        nfxConsiderText(obj.replace(/\\x([0-9a-fA-F]{2})/g, "\\u00$1"), "page state");
+      }
+    });
+  }
+
+  /** Strategy 3: Netflix's Shakti API, called in-page as Netflix's own web client does. */
   function netflixApiHistory(deadline) {
     var build = netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]);
     var info = netflixUserInfo() || {};
     var auth = info.authURL || netflixContextValue(["memberContext", "data", "userInfo", "authURL"]) || "";
+    var esn = netflixContextValue(["esnGeneratorModel", "data", "esn"]) || "";
+    var locale = netflixContextValue(["geo", "data", "locale", "id"]) || "";
     var bases = (build ? ["/api/shakti/" + build + "/viewingactivity"] : []).concat(["/api/shakti/mre/viewingactivity"]);
-    var items = [];
-
-    function toItem(v) {
-      var series = v.seriesTitle && clean(v.seriesTitle);
-      var isTv = !!series || v.series != null;
-      var seasonMatch = String(v.seasonDescriptor || "").match(/\d+/);
-      return {
-        title: clean(isTv ? series || v.title : v.title),
-        isTv: isTv,
-        seasonNumber: isTv ? (seasonMatch ? parseInt(seasonMatch[0], 10) : 1) : null,
-        episodeNumber: null,
-        episodeTitle: v.episodeTitle ? clean(v.episodeTitle) : null,
-        progressRatio: null,
-        progressSeconds: typeof v.bookmark === "number" ? v.bookmark : null,
-        durationSeconds: typeof v.duration === "number" ? v.duration : null,
-        watchedAt: typeof v.date === "number" ? new Date(v.date).toISOString() : null,
-      };
-    }
+    var statuses = [];
+    var headers = {
+      Accept: "*/*",
+      "X-Netflix.client.request.name": "ui/xhrUnclassified",
+      "X-Netflix.clientType": "akira",
+    };
+    if (build) headers["X-Netflix.uiVersion"] = build;
+    if (typeof esn === "string" && esn) headers["X-Netflix.esnPrefix"] = esn.split("-").slice(0, 2).join("-") + "-";
 
     function page(base, pg) {
-      var url = base + "?pg=" + pg + "&pgSize=100" + (auth ? "&authURL=" + encodeURIComponent(auth) : "");
-      return fetch(url, { credentials: "include", headers: { Accept: "application/json" } }).then(function (r) {
-        return r.ok ? r.json() : null;
+      var url = base + "?" + (locale ? "languages=" + encodeURIComponent(locale) + "&" : "") + "pg=" + pg + "&pgSize=100" + (auth ? "&authURL=" + encodeURIComponent(auth) : "");
+      return fetch(url, { credentials: "include", headers: headers }).then(function (r) {
+        if (!r.ok) {
+          statuses.push("HTTP " + r.status + " from " + base.split("/api/")[1]);
+          return null;
+        }
+        return r.json();
       });
     }
 
     function fromBase(i) {
-      if (i >= bases.length) return Promise.resolve(null);
+      if (i >= bases.length) return Promise.resolve(false);
       return page(bases[i], 0)
         .then(function (first) {
           if (!first || !Array.isArray(first.viewedItems)) return fromBase(i + 1);
-          var total = first.vhSize || 0;
-          first.viewedItems.forEach(function (v) { items.push(toItem(v)); });
+          if (first.vhSize > NFX.total) NFX.total = first.vhSize;
+          nfxHarvest(first.viewedItems, "in-page API");
           var pg = 1;
           function next() {
-            if (Date.now() > deadline || (total && items.length >= total) || pg >= 60) return items;
+            if (Date.now() > deadline || (NFX.total && NFX.items.length >= NFX.total) || pg >= 60) return true;
             return page(bases[i], pg++).then(function (body) {
               var list = body && body.viewedItems;
-              if (!list || !list.length) return items;
-              list.forEach(function (v) { items.push(toItem(v)); });
+              if (!list || !list.length) return true;
+              nfxHarvest(list, "in-page API");
               return next();
             });
           }
-          return first.viewedItems.length ? next() : items;
+          return first.viewedItems.length ? next() : true;
         })
-        .catch(function () { return fromBase(i + 1); });
+        .catch(function (e) {
+          statuses.push(String((e && e.message) || e).slice(0, 80));
+          return fromBase(i + 1);
+        });
     }
-    return fromBase(0);
+    return fromBase(0).then(function () { return statuses.join(", "); });
   }
 
-  /** Last resort: the viewing-activity page itself ("Show more" until everything is listed). */
-  function scrapeNetflixActivityPage(deadline) {
+  function nfxRowLinks() {
+    return document.querySelectorAll('a[href*="/title/"]');
+  }
+
+  function nfxEmptyState() {
+    var text = document.body ? clean(String(document.body.innerText || "").slice(0, 4000)) : "";
+    return /haven.t watched anything|no viewing activity|nothing to show/i.test(text);
+  }
+
+  /** The activity page is ready once Netflix's app state exists and it rendered or fetched rows. */
+  function netflixActivityHydrated() {
+    return (
+      document.readyState === "complete" &&
+      !!(window.netflix && window.netflix.reactContext) &&
+      (NFX.items.length > 0 || nfxRowLinks().length > 0 || nfxEmptyState())
+    );
+  }
+
+  /** Clicks "Show more" until everything is listed; each click makes the page fetch another page. */
+  function expandNetflixActivity(deadline) {
     return new Promise(function (resolve) {
       var clicks = 0;
-      (function expand() {
-        var more = Array.prototype.find.call(document.querySelectorAll("button"), function (b) {
+      (function step() {
+        if (Date.now() > deadline || clicks >= 80 || (NFX.total && NFX.items.length >= NFX.total)) return resolve();
+        var more = Array.prototype.find.call(document.querySelectorAll("button, [role=button]"), function (b) {
           return /show more|load more|see more/i.test(clean(b.textContent)) && !b.disabled;
         });
-        if (more && clicks < 60 && Date.now() < deadline) {
-          clicks++;
-          more.click();
-          return setTimeout(expand, 1200);
-        }
-        var items = [];
-        var rows = document.querySelectorAll("li.retableRow, li[class*='retableRow'], [data-uia*='viewing-activity'] li, ul li");
-        rows.forEach(function (row) {
-          var link = row.querySelector('a[href*="/title/"]');
-          if (!link) return;
-          var dateEl = row.querySelector(".date, [class*='date']");
-          var watchedAt = parseDateText(dateEl ? dateEl.textContent : "");
-          if (!watchedAt) {
-            Array.prototype.some.call(row.querySelectorAll("*"), function (el) {
-              if (el.childElementCount === 0) watchedAt = parseDateText(el.textContent);
-              return !!watchedAt;
-            });
-          }
-          items.push({
-            title: clean(link.textContent),
-            isTv: false,
-            seasonNumber: null,
-            episodeNumber: null,
-            episodeTitle: null,
-            progressRatio: null,
-            watchedAt: watchedAt,
-          });
+        if (!more) return resolve();
+        var before = NFX.items.length + nfxRowLinks().length;
+        clicks++;
+        more.click();
+        waitFor(function () { return NFX.items.length + nfxRowLinks().length > before; }, 8000, 300).then(function (grew) {
+          if (!grew) return resolve();
+          setTimeout(step, 350);
         });
-        resolve(items);
       })();
     });
   }
 
+  /** Strategy 4: rows rendered on the page — title links plus the nearest date, no class names. */
+  function scrapeNetflixActivityDom() {
+    var items = [];
+    var seen = {};
+    nfxRowLinks().forEach(function (link) {
+      var title = clean(link.textContent);
+      if (!title) return;
+      var row = link;
+      var watchedAt = null;
+      for (var up = 0; up < 5 && !watchedAt; up++) {
+        row = row.parentElement;
+        if (!row) break;
+        Array.prototype.some.call(row.querySelectorAll("*"), function (el) {
+          if (el.childElementCount !== 0 || el === link || link.contains(el)) return false;
+          watchedAt = parseDateText(el.textContent);
+          return !!watchedAt;
+        });
+      }
+      var key = title + "|" + (watchedAt || "");
+      if (seen[key]) return;
+      seen[key] = true;
+      items.push({ title: title, isTv: false, seasonNumber: null, episodeNumber: null, episodeTitle: null, progressRatio: null, watchedAt: watchedAt });
+    });
+    return items;
+  }
+
   function runNetflixImport() {
-    var STEP = "omnia-import-" + TOKEN_KEY;
+    var NAV_KEY = "omnia-import-nav-" + TOKEN_KEY;
+    var API_KEY = "omnia-import-api-" + TOKEN_KEY;
     var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 120000);
+    if (/\/login/i.test(location.pathname)) {
+      submitHistory([], "Netflix asked to sign in again: this Omnia profile's Netflix session has expired. Sign in via Connect Accounts.");
+      return;
+    }
     waitFor(function () { return !onProfileGate() && detectOttProfile(); }, 25000).then(function (profile) {
       if (CONFIG.expectedOttProfileId && (!profile || profile.id !== CONFIG.expectedOttProfileId)) {
         submitHistory([], profile ? "Netflix is on " + (profile.name || "another profile") + ", not the linked profile." : "Couldn't detect the Netflix profile.");
         return;
       }
       var onActivityPage = /viewingactivity|settings\/viewed/i.test(location.pathname);
-      if (session(STEP) === "dom") {
-        if (!onActivityPage) {
+      var apiOutcome = session(API_KEY);
+
+      // Step 1 — on the homepage, already signed in: the Shakti API through a genuine in-page
+      // fetch() (Netflix's own TLS stack, cookies and headers). Most imports finish here.
+      if (!onActivityPage && apiOutcome === null) {
+        harvestNetflixPageState();
+        netflixApiHistory(deadline).then(function (status) {
+          if (NFX.items.length) {
+            submitHistory(NFX.items.slice(), null);
+            return;
+          }
+          session(API_KEY, status || "no entries returned");
+          session(NAV_KEY, "1");
           location.href = "/viewingactivity";
-          return;
-        }
-        scrapeNetflixActivityPage(deadline).then(function (items) {
-          submitHistory(items, "The Netflix viewing-activity page had no readable entries.");
         });
         return;
       }
-      netflixApiHistory(deadline).then(function (items) {
-        if (items && items.length) {
-          submitHistory(items, null);
-          return;
-        }
-        session(STEP, "dom");
+
+      var navigations = parseInt(session(NAV_KEY) || "0", 10);
+      if (!onActivityPage && navigations < 2) {
+        session(NAV_KEY, String(navigations + 1));
         location.href = "/viewingactivity";
-      });
+        return;
+      }
+
+      // Steps 2-4 — the viewing-activity page: captured app requests, embedded state, rows.
+      var notes = [];
+      if (apiOutcome !== null) notes.push("in-page API: " + apiOutcome);
+      if (!onActivityPage) notes.push("couldn't open the viewing-activity page (landed on " + location.pathname + ")");
+      waitFor(netflixActivityHydrated, 30000, 500)
+        .then(function (ready) {
+          if (!ready) notes.push("the page didn't finish loading within 30s");
+          harvestNetflixPageState();
+          return expandNetflixActivity(deadline);
+        })
+        .then(function () {
+          if (NFX.items.length || apiOutcome !== null) return null;
+          return netflixApiHistory(deadline).then(function (status) {
+            if (status) notes.push("in-page API: " + status);
+          });
+        })
+        .then(function () {
+          var items = NFX.items.slice();
+          var domRows = 0;
+          if (!items.length) {
+            items = scrapeNetflixActivityDom();
+            domRows = items.length;
+          }
+          notes.push(NFX.responses + " page responses inspected");
+          notes.push("embedded/captured entries: " + NFX.items.length);
+          notes.push("rendered rows: " + domRows);
+          submitHistory(items, "No readable Netflix viewing activity (" + notes.join("; ") + ").");
+        });
     });
   }
+
+  // Capture must be live before Netflix's own scripts issue their first request.
+  if (CONFIG.mode === "import" && CONFIG.scraper === "netflix_history") installNetflixCapture();
 
   // -------------------------------------------------------------------------------------------
   // Boot

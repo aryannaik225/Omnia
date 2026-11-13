@@ -1054,7 +1054,12 @@ pub fn continue_watching(
                 WHERE wh.app_profile_id = ?1 AND wh.abandoned = 0
              ) w
              LEFT JOIN media_catalog mc ON mc.tmdb_id = w.tmdb_id AND mc.media_type = w.media_type
-             WHERE w.rn = 1 AND (
+             LEFT JOIN continue_watching_hidden h
+                ON h.app_profile_id = w.app_profile_id AND h.tmdb_id = w.tmdb_id AND h.media_type = w.media_type
+             WHERE w.rn = 1
+               -- Hidden by the user, unless watched again after hiding.
+               AND (h.hidden_at IS NULL OR w.last_watched_at > h.hidden_at)
+               AND (
                 (w.is_completed = 0 AND w.progress_seconds >= 30)
                 OR (w.media_type = 'tv' AND w.is_completed = 1
                     AND w.last_watched_at >= datetime('now', '-30 days'))
@@ -1579,6 +1584,92 @@ pub fn list_watchlist(c: &Connection, app_profile_id: i64) -> rusqlite::Result<V
     )
 }
 
+/// "Remove from Continue Watching": hides the title until it is watched again. History is kept.
+pub fn hide_from_continue_watching(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO continue_watching_hidden (app_profile_id, tmdb_id, media_type, hidden_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(app_profile_id, tmdb_id, media_type) DO UPDATE SET hidden_at = excluded.hidden_at",
+        params![app_profile_id, tmdb_id, media_type],
+    )?;
+    Ok(())
+}
+
+pub fn unhide_from_continue_watching(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM continue_watching_hidden WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+    )? > 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// 12. preferred_providers
+// ---------------------------------------------------------------------------------------------
+
+/// The OTT a profile chose for a title ("Where do you want to watch this?"). `provider_id` is
+/// canonical, so it matches every monetisation variant of that service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreferredProvider {
+    pub app_profile_id: i64,
+    pub tmdb_id: i64,
+    pub media_type: String,
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub updated_at: String,
+}
+
+pub fn get_preferred_provider(
+    c: &Connection,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+) -> rusqlite::Result<Option<PreferredProvider>> {
+    c.query_row(
+        "SELECT app_profile_id, tmdb_id, media_type, provider_id, provider_name, updated_at
+         FROM preferred_providers WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+        |r| {
+            Ok(PreferredProvider {
+                app_profile_id: r.get(0)?,
+                tmdb_id: r.get(1)?,
+                media_type: r.get(2)?,
+                provider_id: r.get(3)?,
+                provider_name: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn set_preferred_provider(
+    c: &Connection,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+    provider_id: i64,
+    provider_name: &str,
+) -> rusqlite::Result<PreferredProvider> {
+    c.execute(
+        "INSERT INTO preferred_providers (app_profile_id, tmdb_id, media_type, provider_id, provider_name, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(app_profile_id, tmdb_id, media_type) DO UPDATE SET
+            provider_id = excluded.provider_id,
+            provider_name = excluded.provider_name,
+            updated_at = excluded.updated_at",
+        params![app_profile_id, tmdb_id, media_type, provider_id, provider_name],
+    )?;
+    get_preferred_provider(c, app_profile_id, tmdb_id, media_type)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn clear_preferred_provider(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM preferred_providers WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+    )? > 0)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -1609,6 +1700,49 @@ mod tests {
             progress_seconds: progress,
             duration_seconds: duration,
         }
+    }
+
+    #[test]
+    fn hiding_from_continue_watching_keeps_history_until_rewatched() {
+        let c = test_db();
+        record_progress(&c, &sample_update(600.0, 8160.0)).unwrap();
+        assert_eq!(continue_watching(&c, 1, 30).unwrap().len(), 1);
+
+        hide_from_continue_watching(&c, 1, 603, "movie").unwrap();
+        assert!(continue_watching(&c, 1, 30).unwrap().is_empty());
+        // History itself is untouched.
+        assert_eq!(get_title_history(&c, 1, 603, "movie").unwrap().len(), 1);
+
+        // Watching again after the hide brings it back.
+        c.execute("UPDATE continue_watching_hidden SET hidden_at = datetime('now', '-1 hour')", []).unwrap();
+        record_progress(&c, &sample_update(900.0, 8160.0)).unwrap();
+        assert_eq!(continue_watching(&c, 1, 30).unwrap().len(), 1);
+
+        hide_from_continue_watching(&c, 1, 603, "movie").unwrap();
+        assert!(unhide_from_continue_watching(&c, 1, 603, "movie").unwrap());
+        assert_eq!(continue_watching(&c, 1, 30).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn preferred_provider_is_per_profile_and_cascades() {
+        let mut c = test_db();
+        let other = create_profile(&c, "Clara", None, false).unwrap();
+        set_preferred_provider(&c, 1, 1668, "tv", 8, "Netflix").unwrap();
+        set_preferred_provider(&c, other.profile_id, 1668, "tv", 122, "JioHotstar").unwrap();
+        assert_eq!(get_preferred_provider(&c, 1, 1668, "tv").unwrap().unwrap().provider_id, 8);
+        assert_eq!(get_preferred_provider(&c, other.profile_id, 1668, "tv").unwrap().unwrap().provider_id, 122);
+        assert!(get_preferred_provider(&c, 1, 1668, "movie").unwrap().is_none());
+
+        // Changing the choice overwrites it.
+        let p = set_preferred_provider(&c, 1, 1668, "tv", 9, "Prime Video").unwrap();
+        assert_eq!((p.provider_id, p.provider_name.as_str()), (9, "Prime Video"));
+
+        assert!(clear_preferred_provider(&c, 1, 1668, "tv").unwrap());
+        assert!(get_preferred_provider(&c, 1, 1668, "tv").unwrap().is_none());
+
+        // Deleting a profile removes its choices.
+        assert!(delete_profile(&mut c, other.profile_id).unwrap());
+        assert!(get_preferred_provider(&c, other.profile_id, 1668, "tv").unwrap().is_none());
     }
 
     #[test]

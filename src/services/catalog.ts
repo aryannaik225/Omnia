@@ -4,10 +4,15 @@
  */
 import { hubRule } from "../config/hubsRegistry";
 import {
+  brandLogo,
+  collectionArt,
   collectionParts,
   discover,
+  img,
   searchKeywordId,
+  watchProviders,
   type CatalogContext,
+  type MediaDetails,
   type MediaSummary,
   type Paged,
 } from "./tmdbClient";
@@ -142,6 +147,107 @@ export async function loadHubPage(h: CustomHub, ctx: CatalogContext, facets: Hub
 }
 
 // ---------------------------------------------------------------------------------------------
+// Hub artwork (TMDB collection / network / company images)
+// ---------------------------------------------------------------------------------------------
+
+export interface HubArtwork {
+  /** 16:9 still for the card background. */
+  backdropPath: string | null;
+  /** Brand mark (network or studio logo); usually dark-on-transparent, so render it inverted. */
+  logoPath: string | null;
+}
+
+const firstId = (v: string | undefined) => {
+  const n = Number(v?.split(/[|,]/)[0]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+const artworkCache = new Map<string, Promise<HubArtwork>>();
+
+/**
+ * Resolves card art for a hub from its own rule: the first pinned collection's backdrop, else the
+ * backdrop of the hub's most popular title; the logo comes from the network (TV) or studio.
+ * Artwork is catalog-agnostic (no subscription filter) so every hub has a picture.
+ */
+export function hubArtwork(h: CustomHub, region: string): Promise<HubArtwork> {
+  const key = `${h.hubSlug}|${region}`;
+  let hit = artworkCache.get(key);
+  if (!hit) {
+    hit = resolveHubArtwork(h, region).catch(() => ({ backdropPath: null, logoPath: null }));
+    artworkCache.set(key, hit);
+  }
+  return hit;
+}
+
+async function resolveHubArtwork(h: CustomHub, region: string): Promise<HubArtwork> {
+  const rule = hubRule(h);
+  const networkId = firstId(rule.tv?.with_networks);
+  const companyId = firstId(rule.movie?.with_companies) ?? firstId(rule.tv?.with_companies);
+  const logo = (networkId ? brandLogo("network", networkId) : companyId ? brandLogo("company", companyId) : Promise.resolve(null)).catch(() => null);
+
+  let backdropPath: string | null = null;
+  const collectionId = rule.collections?.[0];
+  if (collectionId) backdropPath = (await collectionArt(collectionId).catch(() => null))?.backdropPath ?? null;
+  if (!backdropPath) {
+    const ctx: CatalogContext = { region, providers: [], kids: !!rule.kidsSafe };
+    // Movies first for studios/franchises, series first for networks.
+    const order: MediaType[] = networkId ? ["tv", "movie"] : ["movie", "tv"];
+    for (const mt of order) {
+      const params = await hubDiscoverParams(h, mt);
+      if (!params) continue;
+      const page = await discover(mt, ctx, params).catch(() => null);
+      backdropPath = page?.results.find((m) => m.backdropPath)?.backdropPath ?? null;
+      if (backdropPath) break;
+    }
+    if (!backdropPath && collectionId) {
+      backdropPath = (await collectionParts(collectionId).catch(() => [])).find((m) => m.backdropPath)?.backdropPath ?? null;
+    }
+  }
+  return { backdropPath, logoPath: await logo };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Subscription availability (client-side verification of rows the backend didn't filter)
+// ---------------------------------------------------------------------------------------------
+
+const AVAILABILITY_CONCURRENCY = 6;
+let activeChecks = 0;
+const checkQueue: (() => void)[] = [];
+
+async function limited<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeChecks >= AVAILABILITY_CONCURRENCY) await new Promise<void>((r) => checkQueue.push(r));
+  activeChecks++;
+  try {
+    return await fn();
+  } finally {
+    activeChecks--;
+    checkQueue.shift()?.();
+  }
+}
+
+const streamingCache = new Map<string, Promise<Set<string> | null>>();
+
+/** Provider family keys streaming (subscription / free / ads) a title in `region`; null if unknown. */
+export function streamingFamilies(mt: MediaType, id: number, region: string): Promise<Set<string> | null> {
+  const key = `${mt}:${id}|${region}`;
+  let hit = streamingCache.get(key);
+  if (!hit) {
+    hit = limited(() => watchProviders(mt, id))
+      .then((all) => {
+        const r = all[region];
+        if (!r) return new Set<string>();
+        return new Set([...r.flatrate, ...r.free, ...r.ads].map((p) => providerFamily(p.providerId, p.providerName).key));
+      })
+      .catch(() => {
+        streamingCache.delete(key); // transient failure: allow a retry on the next render
+        return null;
+      });
+    streamingCache.set(key, hit);
+  }
+  return hit;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Playback helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -186,6 +292,15 @@ export function groupLinks(ranked: ResolvedLink[]): LinkGroup[] {
     else groups.set(fam.key, { key: fam.key, name: fam.name, primary: l, alternatives: [] });
   }
   return [...groups.values()];
+}
+
+/** Provider logo for a link, from the title's TMDB availability (exact id, else same family). */
+export function providerLogo(d: MediaDetails, region: string, p: { providerId: number; providerName: string }): string | null {
+  const r = d.providersByRegion[region];
+  const all = r ? [...r.flatrate, ...r.free, ...r.ads, ...r.rent, ...r.buy] : [];
+  const fam = providerFamily(p.providerId, p.providerName).key;
+  const hit = all.find((x) => x.providerId === p.providerId) ?? all.find((x) => providerFamily(x.providerId, x.providerName).key === fam);
+  return img(hit?.logoPath, "w92");
 }
 
 /**

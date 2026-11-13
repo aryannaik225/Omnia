@@ -1,14 +1,15 @@
 /**
- * Floating Liquid Glass sidebar. It refracts the content scrolling beneath it, collapses to an
- * icon rail when the user scrolls deep into a grid, and re-expands on hover/focus.
+ * Floating Liquid Glass sidebar. It rests as a collapsed icon rail everywhere, refracting the
+ * content beneath it; it expands over the content on hover (or keyboard focus) and can be pinned
+ * open with the toggle, which also makes the content column make room for it.
  */
 import { m } from "framer-motion";
-import { useState, type ComponentType } from "react";
+import { useState, type ComponentType, type FocusEvent } from "react";
 import { flag } from "../../lib/format";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { Avatar } from "../common/Avatar";
-import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, TvIcon } from "../common/Icons";
+import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, SidebarIcon, TvIcon } from "../common/Icons";
 
 export const SIDEBAR_EXPANDED = 248;
 export const SIDEBAR_COLLAPSED = 76;
@@ -26,33 +27,60 @@ const NAV: { view: View; label: string; icon: ComponentType<{ size?: number }> }
 export function LiquidSidebar() {
   const view = useAppStore((s) => s.view);
   const navigate = useAppStore((s) => s.navigate);
-  const collapsedByScroll = useAppStore((s) => s.sidebarCollapsed);
+  const pinned = useAppStore((s) => s.sidebarPinned);
+  const togglePinned = useAppStore((s) => s.toggleSidebarPinned);
   const profile = useAppStore((s) => s.activeProfile);
   const openGate = useAppStore((s) => s.openProfileGate);
   const region = useAppStore((s) => s.region);
   const cwCount = useAppStore((s) => s.continueWatching.length);
   const playing = usePlayerStore((s) => s.status);
   const [hover, setHover] = useState(false);
-  const collapsed = collapsedByScroll && !hover;
+  const [keyboardFocus, setKeyboardFocus] = useState(false);
+  const collapsed = !pinned && !hover && !keyboardFocus;
+  // Only keyboard focus expands it: a mouse click leaves focus on the button, which must not
+  // keep the rail open after the pointer has left.
+  const onFocus = (e: FocusEvent<HTMLElement>) => setKeyboardFocus(e.target.matches(":focus-visible"));
+  const onBlur = (e: FocusEvent<HTMLElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboardFocus(false);
+  };
 
   return (
     <m.nav
       aria-label="Primary"
       onPointerEnter={() => setHover(true)}
       onPointerLeave={() => setHover(false)}
-      onFocusCapture={() => setHover(true)}
-      onBlurCapture={() => setHover(false)}
+      onFocusCapture={onFocus}
+      onBlurCapture={onBlur}
       animate={{ width: collapsed ? SIDEBAR_COLLAPSED : SIDEBAR_EXPANDED }}
       transition={{ type: "spring", stiffness: 300, damping: 32 }}
       className="glass fixed bottom-4 left-4 top-4 z-40 flex flex-col overflow-hidden rounded-card px-3 py-5"
     >
       <div className="mb-6 flex items-center gap-3 px-2.5">
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] bg-gradient-to-br from-white/90 to-white/50 text-[15px] font-bold text-ink-900 shadow-specular">
+        <button
+          onClick={togglePinned}
+          aria-pressed={pinned}
+          aria-label={pinned ? "Collapse sidebar" : "Keep sidebar open"}
+          title={pinned ? "Collapse sidebar" : "Keep sidebar open"}
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] bg-gradient-to-br from-white/90 to-white/50 text-[15px] font-bold text-ink-900 shadow-specular transition-transform hover:scale-105"
+        >
           O
-        </span>
-        <m.span animate={{ opacity: collapsed ? 0 : 1 }} className="whitespace-nowrap text-[20px] font-semibold tracking-tight">
+        </button>
+        <m.span animate={{ opacity: collapsed ? 0 : 1 }} className="flex-1 whitespace-nowrap text-[20px] font-semibold tracking-tight">
           Omnia
         </m.span>
+        <m.button
+          animate={{ opacity: collapsed ? 0 : 1 }}
+          onClick={togglePinned}
+          aria-pressed={pinned}
+          aria-label={pinned ? "Collapse sidebar" : "Keep sidebar open"}
+          title={pinned ? "Collapse sidebar" : "Keep sidebar open"}
+          tabIndex={collapsed ? -1 : 0}
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] transition-colors ${
+            pinned ? "bg-white/[0.14] text-label-primary shadow-specular" : "text-label-tertiary hover:bg-white/[0.07] hover:text-label-primary"
+          }`}
+        >
+          <SidebarIcon size={18} />
+        </m.button>
       </div>
 
       <ul className="flex flex-1 flex-col gap-1">

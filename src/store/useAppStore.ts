@@ -42,6 +42,7 @@ export interface Toast {
 }
 
 const TRAILER_AUTOPLAY = "trailer_autoplay";
+const SIDEBAR_PINNED = "sidebar_pinned";
 const keyOf = (id: number, mt: MediaType) => `${mt}:${id}`;
 let toastSeq = 1;
 
@@ -66,7 +67,8 @@ interface AppState {
   /** Provider family key (see lib/providers) shown exclusively, or null. */
   providerFilter: string | null;
   searchQuery: string;
-  sidebarCollapsed: boolean;
+  /** Sidebar held open by an explicit click; otherwise it is a rail that expands on hover. */
+  sidebarPinned: boolean;
   scrollPositions: Partial<Record<View, number>>;
 
   modalStack: ModalEntry[];
@@ -81,6 +83,8 @@ interface AppState {
   recsLoading: boolean;
   recsError: string | null;
   recsStale: boolean;
+  /** `availabilityKey` the current `recs` were computed under (rows trusted only when it matches). */
+  recsAvailabilityKey: string | null;
   toasts: Toast[];
 
   bootstrap: () => Promise<void>;
@@ -103,7 +107,7 @@ interface AppState {
   rememberScroll: (view: View, top: number) => void;
   setSearchQuery: (q: string) => void;
   setProviderFilter: (familyKey: string | null) => void;
-  setSidebarCollapsed: (collapsed: boolean) => void;
+  toggleSidebarPinned: () => void;
   setAmbient: (palette: [Rgb, Rgb, Rgb]) => void;
 
   openTitle: (entry: Omit<Extract<ModalEntry, { kind: "title" }>, "kind">) => void;
@@ -113,6 +117,8 @@ interface AppState {
   setAccountSyncOpen: (open: boolean) => void;
 
   refreshContinueWatching: () => Promise<void>;
+  /** Hides a title from Continue Watching (until it's watched again); its history is kept. */
+  hideFromContinueWatching: (tmdbId: number, mediaType: MediaType, title?: string | null) => Promise<void>;
   refreshWatchlist: () => Promise<void>;
   toggleWatchlist: (m: MediaSummary) => Promise<boolean>;
   isInWatchlist: (id: number, mt: MediaType) => boolean;
@@ -146,7 +152,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeHub: null,
   providerFilter: null,
   searchQuery: "",
-  sidebarCollapsed: false,
+  sidebarPinned: false,
   scrollPositions: {},
 
   modalStack: [],
@@ -161,6 +167,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   recsLoading: false,
   recsError: null,
   recsStale: true,
+  recsAvailabilityKey: null,
   toasts: [],
 
   // ------------------------------------------------------------------------------------------
@@ -205,6 +212,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         subscriptionsOnly: all[SettingKeys.subscriptionsOnly] === "true",
         kidsSafeMode: all[SettingKeys.kidsSafeMode] === "true",
         trailerAutoplay: all[TRAILER_AUTOPLAY] !== "false",
+        sidebarPinned: all[SIDEBAR_PINNED] === "true",
         tmdbReady: hasTmdbCredential(),
         hubs: hubList,
         profiles: profileList,
@@ -227,6 +235,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       recs: null,
       recsError: null,
       recsStale: true,
+      recsAvailabilityKey: null,
       modalStack: [],
       view: "home",
       activeHub: null,
@@ -290,8 +299,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setSubscriptionsOnly: async (on) => {
-    await settingsApi.set(SettingKeys.subscriptionsOnly, String(on));
+    if (get().subscriptionsOnly === on) return;
+    // Optimistic: Home rows re-filter on this render; the backend recompute follows.
     set({ subscriptionsOnly: on, recsStale: true });
+    try {
+      await settingsApi.set(SettingKeys.subscriptionsOnly, String(on));
+    } catch (e) {
+      set({ subscriptionsOnly: !on });
+      get().toast({ kind: "error", title: "Couldn't save the availability filter", body: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     void get().loadRecommendations(true);
   },
 
@@ -325,7 +342,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   rememberScroll: (view, top) => set((s) => ({ scrollPositions: { ...s.scrollPositions, [view]: top } })),
   setSearchQuery: (q) => set((s) => ({ searchQuery: q, view: q.trim() ? "search" : s.view === "search" ? "home" : s.view })),
   setProviderFilter: (familyKey) => set({ providerFilter: familyKey }),
-  setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
+  toggleSidebarPinned: () => {
+    const pinned = !get().sidebarPinned;
+    set({ sidebarPinned: pinned });
+    void settingsApi.set(SIDEBAR_PINNED, String(pinned)).catch(() => undefined);
+  },
   setAmbient: (palette) => set({ ambient: palette }),
 
   openTitle: (entry) => set((s) => ({ modalStack: [...s.modalStack, { kind: "title", ...entry }] })),
@@ -343,6 +364,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!p) return;
     const items = await history.continueWatching(p.profileId, 30);
     if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: items });
+  },
+
+  hideFromContinueWatching: async (tmdbId, mediaType, title) => {
+    const p = get().activeProfile;
+    if (!p) return;
+    const before = get().continueWatching;
+    set({ continueWatching: before.filter((c) => !(c.tmdbId === tmdbId && c.mediaType === mediaType)) });
+    try {
+      await history.hideFromContinueWatching(p.profileId, tmdbId, mediaType);
+      get().toast({ kind: "success", title: "Removed from Continue Watching", body: `${title ?? "It"} comes back if you watch it again. Your history is kept.` });
+    } catch (e) {
+      if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: before });
+      get().toast({ kind: "error", title: "Couldn't remove it", body: e instanceof Error ? e.message : String(e) });
+    }
   },
 
   refreshWatchlist: async () => {
@@ -377,9 +412,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!p || !get().tmdbReady) return;
     if (get().recsLoading && !force) return; // one in-flight computation at a time
     set({ recsLoading: true, recsError: null });
+    const key = availabilityKey(get());
     try {
       const recs = await recommendations.get(p.profileId, force);
-      if (get().activeProfile?.profileId === p.profileId) set({ recs, recsLoading: false, recsStale: false });
+      if (get().activeProfile?.profileId === p.profileId) set({ recs, recsLoading: false, recsStale: false, recsAvailabilityKey: key });
     } catch (e) {
       // Not stale anymore: failures must not trigger automatic retry loops (Retry is explicit).
       set({ recsLoading: false, recsStale: false, recsError: e instanceof Error ? e.message : String(e) });
@@ -411,6 +447,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   isKids: () => !!get().activeProfile?.isKidsProfile || get().kidsSafeMode,
 }));
+
+/**
+ * Identity of the "what may be shown" filter: region + the provider ids rows are restricted to
+ * (empty = all platforms). Rows produced under a different key must be re-checked client-side.
+ */
+export function availabilityKey(s: Pick<AppState, "region" | "catalogContext">): string {
+  return `${s.region}|${s.catalogContext().providers.slice().sort((a, b) => a - b).join(",")}`;
+}
 
 /** Subscribe to the catalog context as a stable string key (for effect deps). */
 export const useCatalogKey = () =>

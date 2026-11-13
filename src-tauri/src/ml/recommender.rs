@@ -33,7 +33,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::db::queries::{self, MediaCatalogEntry, PlaybackEvent, WatchHistoryEntry, WatchlistItem};
-use crate::ml::embeddings::{EmbeddingService, EmbeddingStatus, MediaDocument};
+use crate::ml::embeddings::{EmbeddingService, EmbeddingStatus, MediaDocument, Tone};
 use crate::sync::history_importer::TmdbClient;
 use crate::{AppError, AppResult, AppState};
 
@@ -910,11 +910,40 @@ fn taste_label(docs: &[(&MediaDocument, f64)]) -> Option<String> {
     })
 }
 
+/// Largest relevance penalty for a dark title in a clearly light row (cosine sims are ~0.2-0.8,
+/// so this sinks a clash well below on-tone picks without removing it outright).
+const TONE_CLASH_PENALTY: f32 = 0.45;
+/// Gentler penalty the other way round (a cartoon in a gritty-crime row).
+const TONE_CLASH_PENALTY_REVERSE: f32 = 0.15;
+
+/// Relevance penalty for a candidate whose tone conflicts with the row's intent. Proportional
+/// rather than a genre filter: a dark comedy in a comedy row is docked less than a serial-killer
+/// thriller, and nothing is excluded outright.
+pub fn tone_penalty(intent: Tone, candidate: Tone) -> f32 {
+    let intent_total = intent.light + intent.dark;
+    let cand_total = candidate.light + candidate.dark;
+    if intent_total < 0.5 || cand_total <= 0.0 {
+        return 0.0;
+    }
+    // -1 = entirely dark row, +1 = entirely light row.
+    let lean = (intent.light - intent.dark) / intent_total;
+    // Saturates at two strong signals (e.g. Thriller + "serial killer").
+    let strength = |x: f32| (x / 2.0).min(1.0);
+    if lean >= 0.3 {
+        TONE_CLASH_PENALTY * lean * strength(candidate.dark) * (candidate.dark / cand_total)
+    } else if lean <= -0.3 {
+        TONE_CLASH_PENALTY_REVERSE * -lean * strength(candidate.light) * (candidate.light / cand_total)
+    } else {
+        0.0
+    }
+}
+
 struct Pool {
     keys: Vec<TitleKey>,
     entries: Vec<MediaCatalogEntry>,
     vectors: Vec<Arc<Vec<f32>>>,
     popularity: Vec<f32>,
+    tones: Vec<Tone>,
 }
 
 impl Pool {
@@ -935,19 +964,25 @@ impl Pool {
         }
     }
 
-    /// Ranks the pool against `query` with MMR, skipping already-used titles.
+    /// Ranks the pool against `query` with MMR, skipping already-used titles. `intent` is the
+    /// row's tone; candidates that clash with it are penalised (see [`tone_penalty`]).
     fn rank(
         &self,
         query: &[f32],
         k: usize,
         used: &mut HashSet<usize>,
         seeds: &[(String, Arc<Vec<f32>>)],
+        intent: Option<Tone>,
     ) -> Vec<RecommendedItem> {
         let idx: Vec<usize> = (0..self.keys.len()).filter(|i| !used.contains(i)).collect();
         if idx.is_empty() {
             return Vec::new();
         }
-        let sims: Vec<f32> = idx.iter().map(|&i| cosine(query, &self.vectors[i])).collect();
+        // Penalised similarity drives both ranking and the displayed match %.
+        let sims: Vec<f32> = idx
+            .iter()
+            .map(|&i| cosine(query, &self.vectors[i]) - intent.map_or(0.0, |t| tone_penalty(t, self.tones[i])))
+            .collect();
         let rel: Vec<f32> = idx
             .iter()
             .zip(&sims)
@@ -1090,13 +1125,14 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
     let taste = TasteProfile::build(&taste_items);
 
     // Candidate pool.
-    let mut pool = Pool { keys: Vec::new(), entries: Vec::new(), vectors: Vec::new(), popularity: Vec::new() };
+    let mut pool = Pool { keys: Vec::new(), entries: Vec::new(), vectors: Vec::new(), popularity: Vec::new(), tones: Vec::new() };
     for (k, e) in &candidate_entries {
         if let Some(v) = vectors.get(k) {
             pool.keys.push(k.clone());
             pool.entries.push(e.clone());
             pool.vectors.push(v.clone());
             pool.popularity.push(*popularity.get(k).unwrap_or(&0.0) as f32);
+            pool.tones.push(MediaDocument::from_catalog(e).tone());
         }
     }
 
@@ -1119,6 +1155,7 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
             entries: keep.iter().map(|&i| pool.entries[i].clone()).collect(),
             vectors: keep.iter().map(|&i| pool.vectors[i].clone()).collect(),
             popularity: keep.iter().map(|&i| pool.popularity[i]).collect(),
+            tones: keep.iter().map(|&i| pool.tones[i]).collect(),
         };
     }
 
@@ -1139,7 +1176,10 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
             .filter_map(|k| Some((docs.get(k)?, affinities.get(k)?.weight)))
             .collect();
         let label = taste_label(&liked_docs).unwrap_or_else(|| "Top picks".into());
-        let items = pool.rank(&q_global, 20, &mut used, &seed_vectors);
+        // Row tone = what the liked titles feel like (a "Lighthearted Comedy" row stays light).
+        let taste_tone = Tone::blend(liked_docs.iter().map(|(d, w)| (d.tone(), *w)));
+        let seed_tone = |k: &TitleKey| docs.get(k).map(MediaDocument::tone);
+        let items = pool.rank(&q_global, 20, &mut used, &seed_vectors, taste_tone);
         if !items.is_empty() {
             rows.push(RecommendationRow {
                 id: "taste".into(),
@@ -1153,7 +1193,7 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
         // Time-of-day context row.
         if taste.bucket_weight(context) >= 0.15 {
             if let Some(q_ctx) = taste.query(Some(context)) {
-                let items = pool.rank(&q_ctx, 15, &mut used, &seed_vectors);
+                let items = pool.rank(&q_ctx, 15, &mut used, &seed_vectors, taste_tone);
                 if !items.is_empty() {
                     rows.push(RecommendationRow {
                         id: format!("context-{}", BUCKETS[context].to_lowercase()),
@@ -1172,7 +1212,7 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
             if let (Some(v), Some(title)) = (vectors.get(seed), title_of(seed)) {
                 let mut q = v.as_ref().clone();
                 q.iter_mut().zip(&q_global).for_each(|(x, g)| *x = 0.75 * *x + 0.25 * g);
-                let items = pool.rank(&q, 15, &mut used, &seed_vectors);
+                let items = pool.rank(&q, 15, &mut used, &seed_vectors, seed_tone(seed));
                 if !items.is_empty() {
                     let when = signals
                         .get(seed)
@@ -1197,7 +1237,7 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
             .take(2)
         {
             if let (Some(v), Some(title)) = (vectors.get(seed), title_of(seed)) {
-                let items = pool.rank(v, 15, &mut used, &seed_vectors);
+                let items = pool.rank(v, 15, &mut used, &seed_vectors, seed_tone(seed));
                 if items.len() >= 5 {
                     rows.push(RecommendationRow {
                         id: format!("because-{}-{}", seed.1, seed.0),
@@ -1457,6 +1497,48 @@ mod tests {
         assert!(cosine(&q_late, &sitcom) > cosine(&q_morning, &sitcom));
         assert!(cosine(&q_morning, &scifi) > cosine(&q_late, &scifi));
         assert!(cosine(&taste.query(None).unwrap(), &horror) < 0.0);
+    }
+
+    #[test]
+    fn tone_clashes_are_penalised_not_filtered() {
+        let doc = |genres: &[&str], moods: &[&str], keywords: &[&str]| MediaDocument {
+            title: String::new(),
+            overview: String::new(),
+            genres: genres.iter().map(|s| s.to_string()).collect(),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            directors: vec![],
+            cast: vec![],
+            studios: vec![],
+            moods: moods.iter().map(|s| s.to_string()).collect(),
+        };
+        let sitcom = doc(&["Comedy"], &["lighthearted", "funny"], &["sitcom", "friendship"]).tone();
+        let comedy_row = Tone::blend([(sitcom, 2.0), (doc(&["Comedy", "Romance"], &["funny", "romantic"], &[]).tone(), 1.0)]).unwrap();
+
+        let killer = doc(&["Thriller", "Crime"], &["suspenseful", "gritty", "dark"], &["serial killer", "detective"]).tone();
+        let dark_comedy = doc(&["Comedy", "Crime"], &["funny", "gritty"], &["dark comedy"]).tone();
+        let whodunit = doc(&["Comedy", "Mystery"], &["funny", "intriguing"], &["murder mystery", "whodunit"]).tone();
+        let another_sitcom = doc(&["Comedy"], &["funny"], &["sitcom"]).tone();
+
+        let p_killer = tone_penalty(comedy_row, killer);
+        let p_dark_comedy = tone_penalty(comedy_row, dark_comedy);
+        let p_whodunit = tone_penalty(comedy_row, whodunit);
+        let p_sitcom = tone_penalty(comedy_row, another_sitcom);
+
+        // Heavy for a clear clash (enough to sink a high-similarity title), proportional otherwise.
+        assert!(p_killer > 0.3, "killer thriller penalty {p_killer}");
+        assert!(p_dark_comedy > 0.0 && p_dark_comedy < p_killer, "dark comedy {p_dark_comedy} vs {p_killer}");
+        assert!(p_whodunit < p_dark_comedy, "a whodunit is not a dark title: {p_whodunit}");
+        assert_eq!(p_sitcom, 0.0);
+
+        // A dark row barely minds a darker title, and only gently penalises a light one.
+        let crime_row = killer;
+        assert_eq!(tone_penalty(crime_row, killer), 0.0);
+        let p_cartoon = tone_penalty(crime_row, doc(&["Animation", "Family"], &["wholesome", "feel-good"], &[]).tone());
+        assert!(p_cartoon > 0.0 && p_cartoon < p_killer);
+
+        // No tone signal, no penalty.
+        assert_eq!(tone_penalty(Tone::default(), killer), 0.0);
+        assert_eq!(tone_penalty(comedy_row, Tone::default()), 0.0);
     }
 
     #[test]

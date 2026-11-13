@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unhide-from-continue-watching"
+description = "Enables the unhide_from_continue_watching command without any pre-configured scope."
+commands.allow = ["unhide_from_continue_watching"]
+
+[[permission]]
+identifier = "deny-unhide-from-continue-watching"
+description = "Denies the unhide_from_continue_watching command without any pre-configured scope."
+commands.deny = ["unhide_from_continue_watching"]

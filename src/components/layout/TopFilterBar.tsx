@@ -1,13 +1,12 @@
 /**
- * Floating filter bar: search, My Subscriptions / All Platforms, quick OTT toggles and the
- * region (VPN) switcher.
+ * Floating filter bar: search, My Subscriptions / All Platforms and the region (VPN) switcher.
+ * Per-service shortcuts live in the sidebar's My OTTs view, so they aren't repeated here.
  */
 import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flag, regionName } from "../../lib/format";
-import { groupByFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
-import { availableRegions, img } from "../../services/tmdbClient";
+import { availableRegions } from "../../services/tmdbClient";
 import { useAppStore } from "../../store/useAppStore";
 import { CheckIcon, GlobeIcon, RefreshIcon, SearchIcon } from "../common/Icons";
 
@@ -77,8 +76,6 @@ export function TopFilterBar() {
   const subscriptionsOnly = useAppStore((s) => s.subscriptionsOnly);
   const setSubscriptionsOnly = useAppStore((s) => s.setSubscriptionsOnly);
   const subs = useAppStore((s) => s.subscriptions);
-  const providerFilter = useAppStore((s) => s.providerFilter);
-  const setProviderFilter = useAppStore((s) => s.setProviderFilter);
   const region = useAppStore((s) => s.region);
   const navigate = useAppStore((s) => s.navigate);
   const [regionOpen, setRegionOpen] = useState(false);
@@ -94,7 +91,7 @@ export function TopFilterBar() {
   }, [regionOpen]);
 
   return (
-    <div className="glass-panel sticky top-4 z-30 flex items-center gap-3 rounded-[20px] px-3 py-2.5">
+    <div className="glass-panel relative flex items-center gap-3 rounded-[20px] px-3 py-2.5">
       <label className="relative w-[300px] shrink-0">
         <SearchIcon size={17} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-label-tertiary" />
         <input
@@ -125,25 +122,7 @@ export function TopFilterBar() {
         </button>
       </div>
 
-      <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
-        {groupByFamily(subs, (p) => p.providerId, (p) => p.providerName).map(({ family, members }) => {
-          const p = members[0]!;
-          const active = providerFilter === family.key;
-          const logo = img(members.find((m) => m.logoPath)?.logoPath, "w92");
-          return (
-            <button
-              key={family.key}
-              onClick={() => setProviderFilter(active ? null : family.key)}
-              title={active ? `Showing ${family.name} only` : `Only ${family.name}`}
-              className={`relative h-9 w-9 shrink-0 overflow-hidden rounded-[10px] transition-all duration-200 ${
-                active ? "ring-2 ring-white" : providerFilter ? "opacity-40 hover:opacity-80" : "opacity-90 hover:opacity-100"
-              }`}
-            >
-              {logo ? <img src={logo} alt={family.name} className="h-full w-full object-cover" /> : <span className="text-xs">{p.providerName[0]}</span>}
-            </button>
-          );
-        })}
-      </div>
+      <div className="flex-1" />
 
       <div ref={popRef} className="relative shrink-0">
         <button className="chip !py-2" onClick={() => setRegionOpen((o) => !o)} aria-expanded={regionOpen} aria-label="Change region">

@@ -17,11 +17,18 @@
 //! On launch, providers that support it are switched to the linked profile first (Netflix
 //! `SwitchProfile`), then the deep link is opened.
 //!
+//! Session isolation: every OTT webview (player, hidden importer) runs in the
+//! browser profile of one Omnia profile — its own WebView2 user-data folder under
+//! `<local app data>/Profiles/<app_profile_id>` (a per-profile data store on macOS). Cookies,
+//! cache and local storage are never shared between Omnia profiles, so each person signs in to
+//! their own OTT accounts once and nobody else's session can leak into their player.
+//!
 //! Security: player windows load third-party pages. Their IPC is restricted by the `player`
 //! capability (remote OTT origins only, four telemetry commands only), and every call must carry
 //! the per-session random token that only the injected script knows.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +46,8 @@ use crate::{AppError, AppResult, AppState};
 const TELEMETRY_SCRIPT: &str = include_str!("telemetry_injector.js");
 
 pub const PLAYER_LABEL_PREFIX: &str = "player-";
+/// Folder (under the OS local app-data dir) holding one browser profile per Omnia profile.
+pub const PROFILES_DIR: &str = "Profiles";
 pub const MAIN_LABEL: &str = "main";
 const SYNC_INTERVAL_MS: u64 = 3000;
 /// Samples from media shorter than this are treated as ads / trailers / bumpers and ignored.
@@ -934,7 +943,91 @@ fn parse_https_url(raw: &str) -> AppResult<tauri::Url> {
     Ok(url)
 }
 
-/// Builds a WebView2 window for third-party OTT content with the telemetry script injected.
+// ---------------------------------------------------------------------------------------------
+// Per-profile browser sessions
+// ---------------------------------------------------------------------------------------------
+
+/// Root folder of all per-profile browser data (`%LOCALAPPDATA%\<identifier>\Profiles`).
+pub fn profiles_root(app: &AppHandle) -> AppResult<PathBuf> {
+    Ok(app.path().app_local_data_dir()?.join(PROFILES_DIR))
+}
+
+/// The browser data folder of one Omnia profile (created on demand).
+pub fn profile_data_dir(app: &AppHandle, app_profile_id: i64) -> AppResult<PathBuf> {
+    if app_profile_id <= 0 {
+        return Err(AppError::Message(format!("invalid profile id {app_profile_id}")));
+    }
+    let dir = profiles_root(app)?.join(app_profile_id.to_string());
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Stable 16-byte WKWebView data-store id for a profile (macOS has no data directories).
+pub fn profile_store_identifier(app_profile_id: i64) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    // "omnia.pr" prefix keeps it distinct from other stores; bytes 8..16 carry the profile id.
+    id[..8].copy_from_slice(b"omnia.pr");
+    id[8..16].copy_from_slice(&app_profile_id.to_be_bytes());
+    id
+}
+
+/// A webview builder bound to `app_profile_id`'s isolated browser session. Every OTT-facing
+/// webview must be created through here so no window ever falls back to the shared default store.
+pub(crate) fn profile_webview_builder<'a>(
+    app: &'a AppHandle,
+    label: &str,
+    url: WebviewUrl,
+    app_profile_id: i64,
+) -> AppResult<WebviewWindowBuilder<'a, tauri::Wry, AppHandle>> {
+    Ok(WebviewWindowBuilder::new(app, label, url)
+        .data_directory(profile_data_dir(app, app_profile_id)?)
+        .data_store_identifier(profile_store_identifier(app_profile_id)))
+}
+
+/// Is any webview currently using this profile's browser data?
+fn profile_session_in_use(app: &AppHandle, app_profile_id: i64) -> bool {
+    let state = app.state::<AppState>();
+    let player = state.player.lock().as_ref().is_some_and(|s| s.app_profile_id == app_profile_id);
+    player || state.importer.has_running_for(app_profile_id)
+}
+
+/// Permanently deletes a (deleted) profile's cookies, cache and storage. WebView2's browser
+/// process can hold the folder for a few seconds after its last window closes, so this retries;
+/// anything still locked is swept on the next launch by [`sweep_orphan_profile_data`].
+pub async fn purge_profile_data(app: &AppHandle, app_profile_id: i64) {
+    let Ok(root) = profiles_root(app) else { return };
+    let dir = root.join(app_profile_id.to_string());
+    for attempt in 0..8u64 {
+        if !dir.exists() {
+            return;
+        }
+        if !profile_session_in_use(app, app_profile_id) && std::fs::remove_dir_all(&dir).is_ok() {
+            log::info!("removed browser data of deleted profile {app_profile_id}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(750 * (attempt + 1))).await;
+    }
+    log::warn!("browser data of deleted profile {app_profile_id} is still locked; it will be removed on next launch");
+}
+
+/// Startup: removes browser data folders whose Omnia profile no longer exists.
+pub fn sweep_orphan_profile_data(app: &AppHandle, live_profile_ids: &[i64]) {
+    let Ok(root) = profiles_root(app) else { return };
+    let Ok(entries) = std::fs::read_dir(&root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.parse::<i64>().ok()) else { continue };
+        if !live_profile_ids.contains(&id) {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => log::info!("removed orphaned browser data for profile {id}"),
+                Err(e) => log::warn!("couldn't remove orphaned browser data for profile {id}: {e}"),
+            }
+        }
+    }
+}
+
+/// Builds a WebView2 window for third-party OTT content with the telemetry script injected,
+/// inside `app_profile_id`'s isolated browser session.
 /// Non-HTTPS navigations (http downgrades, `nflx://`-style app hand-offs) are blocked.
 pub(crate) fn build_ott_window(
     app: &AppHandle,
@@ -943,8 +1036,9 @@ pub(crate) fn build_ott_window(
     title: &str,
     script: String,
     visible: bool,
+    app_profile_id: i64,
 ) -> AppResult<WebviewWindow> {
-    let window = WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+    let window = profile_webview_builder(app, label, WebviewUrl::External(url), app_profile_id)?
         .title(title)
         .inner_size(1280.0, 760.0)
         .min_inner_size(640.0, 360.0)
@@ -1201,7 +1295,7 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
     };
     *state.player.lock() = Some(session);
 
-    let window = match build_ott_window(&app, &label, initial_url, &window_title, build_injection(&config), true) {
+    let window = match build_ott_window(&app, &label, initial_url, &window_title, build_injection(&config), true, profile_id) {
         Ok(w) => w,
         Err(e) => {
             state.player.lock().take();
@@ -1231,6 +1325,14 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
     };
     let _ = app.emit_to(MAIN_LABEL, EVT_PLAYER_OPENED, &opened);
     Ok(opened)
+}
+
+/// Closes the player if it belongs to `app_profile_id` (used before deleting a profile).
+pub async fn close_player_for_profile(app: &AppHandle, app_profile_id: i64) {
+    let owned = app.state::<AppState>().player.lock().as_ref().is_some_and(|s| s.app_profile_id == app_profile_id);
+    if owned {
+        close_active_player(app, "profile_deleted").await;
+    }
 }
 
 #[tauri::command]

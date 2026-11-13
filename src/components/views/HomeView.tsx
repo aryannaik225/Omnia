@@ -1,10 +1,11 @@
 /** Home dashboard: hero, Continue Watching, hubs, ML recommendation rows and regional TMDB rows. */
 import { useEffect, useMemo } from "react";
+import { useSubscriptionFilter } from "../../lib/availability";
 import { useAsync } from "../../lib/hooks";
 import { groupByFamily } from "../../lib/providers";
 import { discover, isKidsSafe, trending, type MediaSummary } from "../../services/tmdbClient";
 import { recommendations, type RecommendationRow } from "../../services/tauriBridge";
-import { useAppStore, useCatalogKey } from "../../store/useAppStore";
+import { availabilityKey, useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { MatchBadge, SkeletonCard } from "../common/Cards";
 import { RefreshIcon } from "../common/Icons";
 import { BrandHubsRow } from "../home/BrandHubsRow";
@@ -34,8 +35,21 @@ function recItems(row: RecommendationRow): CarouselItem[] {
   }));
 }
 
+/** Backend rows computed under the current filter are trusted; older ones are re-verified. */
+function useRecsTrusted() {
+  return useAppStore((s) => s.recsAvailabilityKey !== null && s.recsAvailabilityKey === availabilityKey(s));
+}
+
+function RecRow({ row, trusted }: { row: RecommendationRow; trusted: boolean }) {
+  const all = useMemo(() => recItems(row), [row]);
+  // Comfort favourites come from your own history, never from the filtered candidate pool.
+  const { items, checking } = useSubscriptionFilter(all, (it) => ({ id: it.id, mediaType: it.mediaType, trusted: trusted && row.kind !== "comfort" }));
+  return <MediaCarouselRow title={row.title} subtitle={row.subtitle ?? undefined} items={items} loading={checking && items.length === 0} />;
+}
+
 function RecommendationRows() {
   const recs = useAppStore((s) => s.recs);
+  const trusted = useRecsTrusted();
   const loading = useAppStore((s) => s.recsLoading);
   const error = useAppStore((s) => s.recsError);
   const load = useAppStore((s) => s.loadRecommendations);
@@ -72,7 +86,7 @@ function RecommendationRows() {
   return (
     <>
       {recs.rows.map((row) => (
-        <MediaCarouselRow key={row.id} title={row.title} subtitle={row.subtitle ?? undefined} items={recItems(row)} />
+        <RecRow key={row.id} row={row} trusted={trusted} />
       ))}
     </>
   );
@@ -88,6 +102,7 @@ export function HomeView() {
   const recsStale = useAppStore((s) => s.recsStale);
   const recsLoading = useAppStore((s) => s.recsLoading);
   const loadRecommendations = useAppStore((s) => s.loadRecommendations);
+  const recsTrusted = useRecsTrusted();
   const filtered = ctx.providers.length > 0;
 
   // Refresh once when new behaviour made the rows stale (e.g. after Back to Hub). Failures clear
@@ -96,15 +111,18 @@ export function HomeView() {
     if (recsStale && !recsLoading) void loadRecommendations();
   }, [recsStale, recsLoading, loadRecommendations]);
 
+  // Tagged with the catalog key it was fetched for: stale data shown during a refetch isn't trusted.
   const heroSource = useAsync(async () => {
+    const key = catalogKey;
     if (filtered || kids) {
       const [mv, tv] = await Promise.all([discover("movie", ctx), discover("tv", ctx)]);
-      return interleave(mv.results, tv.results);
+      return { key, items: interleave(mv.results, tv.results) };
     }
-    return (await trending("all", "week")).results;
+    return { key, items: (await trending("all", "week")).results };
   }, [catalogKey], tmdbReady);
+  const heroSourceTrusted = heroSource.data?.key === catalogKey;
 
-  const heroItems = useMemo(() => {
+  const heroCandidates = useMemo(() => {
     const personal: MediaSummary[] = (recs?.rows.find((r) => r.kind === "taste")?.items ?? []).slice(0, 3).map((it) => ({
       id: it.tmdbId,
       mediaType: it.mediaType,
@@ -119,19 +137,24 @@ export function HomeView() {
       originalLanguage: null,
       popularity: 0,
     }));
-    const general = (heroSource.data ?? []).filter((m) => !kids || isKidsSafe(m));
+    const general = (heroSource.data?.items ?? []).filter((m) => !kids || isKidsSafe(m));
     const seen = new Set<string>();
-    return [...personal, ...general].filter((m) => {
+    return [
+      ...personal.map((m) => ({ m, trusted: recsTrusted })),
+      ...general.map((m) => ({ m, trusted: heroSourceTrusted })),
+    ].filter(({ m }) => {
       const k = `${m.mediaType}-${m.id}`;
       if (seen.has(k) || !m.backdropPath) return false;
       seen.add(k);
       return true;
     });
-  }, [recs, heroSource.data, kids]);
+  }, [recs, heroSource.data, kids, recsTrusted, heroSourceTrusted]);
+  const heroFiltered = useSubscriptionFilter(heroCandidates, ({ m, trusted }) => ({ id: m.id, mediaType: m.mediaType, trusted }));
+  const heroItems = useMemo(() => heroFiltered.items.map(({ m }) => m), [heroFiltered.items]);
 
   if (!tmdbReady) {
     return (
-      <div className="px-10 pt-10" style={{ paddingLeft: "calc(var(--sidebar-expanded) + 48px)" }}>
+      <div className="px-10 pt-10" style={{ paddingLeft: "var(--content-left)" }}>
         <div className="glass-panel max-w-xl px-8 py-7">
           <h2 className="text-2xl font-semibold">Connect TMDB to start browsing</h2>
           <p className="mt-2 text-label-secondary">Add <code>TMDB_API_KEY</code> to your <code>.env</code> file (or paste a key in Settings). It's only used for public catalog metadata.</p>
