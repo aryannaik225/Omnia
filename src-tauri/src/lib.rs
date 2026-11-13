@@ -488,6 +488,25 @@ async fn delete_watch_history_entry(state: State<'_, AppState>, app_profile_id: 
         .await
 }
 
+/// "Clear Watch History" (Settings → Connect Accounts): wipes the profile's watch history and
+/// playback events so a clean re-import can follow. Refused while that profile is importing.
+#[tauri::command]
+async fn clear_watch_history(app: tauri::AppHandle, state: State<'_, AppState>, app_profile_id: i64) -> AppResult<queries::ClearedHistory> {
+    if state.importer.has_running_for(app_profile_id) {
+        return Err(AppError::Message("A history import is running for this profile. Wait for it to finish, then clear.".into()));
+    }
+    // A live player session would keep writing progress for the old episode; end it first.
+    window_manager::close_player_for_profile(&app, app_profile_id).await;
+    let cleared = state.db.run(move |c| queries::clear_profile_history(c, app_profile_id)).await?;
+    state.recommender.invalidate(app_profile_id);
+    log::info!(
+        "cleared watch history of profile {app_profile_id}: {} rows, {} events",
+        cleared.history_rows,
+        cleared.playback_events
+    );
+    Ok(cleared)
+}
+
 /// Manual CSV/JSON import (parsed on the frontend into typed rows).
 #[tauri::command]
 async fn import_watch_history(state: State<'_, AppState>, rows: Vec<HistoryImport>) -> AppResult<usize> {
@@ -797,6 +816,7 @@ pub fn run() {
             get_watch_history,
             get_title_progress,
             delete_watch_history_entry,
+            clear_watch_history,
             import_watch_history,
             export_watch_history,
             log_playback_event,

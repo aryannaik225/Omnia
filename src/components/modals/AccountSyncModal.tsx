@@ -54,12 +54,19 @@ export function AccountSyncModal() {
   const connect = usePlayerStore((s) => s.connect);
   const importFrom = usePlayerStore((s) => s.importFrom);
   const importFile = usePlayerStore((s) => s.importFile);
+  const clearWatchHistory = useAppStore((s) => s.clearWatchHistory);
   const [dragging, setDragging] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const anyImportRunning = profile
+    ? Object.entries(imports).some(([k, v]) => k.startsWith(`${profile.profileId}:`) && !["done", "error"].includes(v.stage))
+    : false;
 
   const regional = useAsync(() => regionProviders(region), [region], open && tmdbReady);
   useEffect(() => {
     if (open) void refreshMappings();
-  }, [open, refreshMappings]);
+    setConfirmClear(false);
+  }, [open, refreshMappings, profile?.profileId]);
 
   // One row per provider family, keyed by the canonical id Rust stores links under.
   const providers = useMemo(() => {
@@ -187,6 +194,46 @@ export function AccountSyncModal() {
                   <ImportProgress state={v} />
                 </div>
               ))}
+
+            <section className="mt-8 rounded-card bg-[#ff453a]/[0.06] px-5 py-4 shadow-[inset_0_0_0_1px_rgba(255,69,58,0.18)]">
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="min-w-0 flex-1">
+                  <p className="font-semibold">Clear Watch History</p>
+                  <p className="text-[12px] text-label-tertiary">
+                    Deletes every watched title and playback event for <strong className="text-label-secondary">{profile.profileName}</strong> only, so you can re-import
+                    cleanly. Account links, watchlist and other profiles are kept.
+                  </p>
+                </div>
+                {confirmClear ? (
+                  <div className="flex items-center gap-2">
+                    <button className="glass-button !px-4 !py-2" disabled={clearing} onClick={() => setConfirmClear(false)}>
+                      Cancel
+                    </button>
+                    <button
+                      className="glass-button !bg-[#ff453a]/80 !px-4 !py-2 !text-white hover:!bg-[#ff453a]"
+                      disabled={clearing || anyImportRunning}
+                      onClick={async () => {
+                        setClearing(true);
+                        const ok = await clearWatchHistory();
+                        setClearing(false);
+                        if (ok) setConfirmClear(false);
+                      }}
+                    >
+                      <TrashIcon size={15} /> {clearing ? "Clearing…" : `Delete ${profile.profileName}'s history`}
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    className="glass-button !px-4 !py-2 text-[#ff6961]"
+                    disabled={anyImportRunning}
+                    title={anyImportRunning ? "Wait for the running import to finish" : undefined}
+                    onClick={() => setConfirmClear(true)}
+                  >
+                    <TrashIcon size={15} /> Clear Watch History
+                  </button>
+                )}
+              </div>
+            </section>
           </m.div>
         </m.div>
       )}

@@ -119,6 +119,8 @@ interface AppState {
   refreshContinueWatching: () => Promise<void>;
   /** Hides a title from Continue Watching (until it's watched again); its history is kept. */
   hideFromContinueWatching: (tmdbId: number, mediaType: MediaType, title?: string | null) => Promise<void>;
+  /** Wipes the active profile's watch history + playback events (for a clean re-import). */
+  clearWatchHistory: () => Promise<boolean>;
   refreshWatchlist: () => Promise<void>;
   toggleWatchlist: (m: MediaSummary) => Promise<boolean>;
   isInWatchlist: (id: number, mt: MediaType) => boolean;
@@ -377,6 +379,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (e) {
       if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: before });
       get().toast({ kind: "error", title: "Couldn't remove it", body: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  clearWatchHistory: async () => {
+    const p = get().activeProfile;
+    if (!p) return false;
+    try {
+      const r = await history.clearAll(p.profileId);
+      if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: [], recsStale: true });
+      get().toast({
+        kind: "success",
+        title: "Watch history cleared",
+        body: `Removed ${r.historyRows} history entries and ${r.playbackEvents} playback events from ${p.profileName}. Import again for a clean start.`,
+      });
+      void get().loadRecommendations(true);
+      return true;
+    } catch (e) {
+      get().toast({ kind: "error", title: "Couldn't clear history", body: e instanceof Error ? e.message : String(e) });
+      return false;
     }
   },
 

@@ -51,6 +51,9 @@ const NETFLIX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(150);
 const TMDB_CONCURRENCY: usize = 4;
 const MAX_UNIQUE_TITLES: usize = 1500;
 const MAX_SEASON_LOOKUPS: usize = 400;
+/// Series scanned season-by-season to place episodes whose season couldn't be parsed.
+const MAX_FULL_SERIES_LOOKUPS: usize = 60;
+const MAX_SEASONS_PER_SHOW: usize = 40;
 const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
 fn msg(m: impl Into<String>) -> AppError {
     AppError::Message(m.into())
@@ -119,6 +122,9 @@ pub struct ScrapedItem {
     pub episode_number: Option<i64>,
     #[serde(default)]
     pub episode_title: Option<String>,
+    /// The provider's raw season label ("Season 2", "Part 3", "Volume II", "Limited Series").
+    #[serde(default)]
+    pub season_label: Option<String>,
     #[serde(default)]
     pub is_tv: bool,
     #[serde(default)]
@@ -338,15 +344,6 @@ fn netflix_identity_matches(mapped: &str, guid: &str, name: Option<&str>) -> boo
     }
 }
 
-fn first_number(s: &str) -> Option<i64> {
-    let digits: String = s
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
-}
-
 /// Netflix history is read *only* inside a hidden WebView2 window in the Omnia profile's own
 /// browser session: Netflix sees its genuine web client (TLS stack, cookies, headers), never a
 /// Rust HTTP client, and session cookies never leave WebView2. The window starts on the profile
@@ -457,12 +454,24 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
                 i.season_number,
                 i.episode_title.clone(),
             );
+            let mut episode = i.episode_number;
+            if season.is_none() {
+                season = i.season_label.as_deref().and_then(season_segment).map(|(s, _)| s);
+            }
+            // An episode "title" that is only a marker ("Episode 4", "E04: Title") carries the number.
+            if episode.is_none() {
+                if let Some((n, rest)) = episode_title.as_deref().and_then(episode_marker) {
+                    episode = Some(n);
+                    episode_title = rest;
+                }
+            }
             let title = if netflix && season.is_none() && episode_title.is_none() {
-                let (series, tv, s, ep) = parse_netflix_title(&title);
-                is_tv = is_tv.or(tv);
-                season = s;
-                episode_title = ep;
-                series
+                let parsed = parse_netflix_title(&title);
+                is_tv = is_tv.or(parsed.is_tv);
+                season = parsed.season;
+                episode = episode.or(parsed.episode);
+                episode_title = parsed.episode_title;
+                parsed.series
             } else {
                 title
             };
@@ -470,7 +479,7 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
                 title,
                 is_tv,
                 season,
-                episode: i.episode_number,
+                episode,
                 episode_title,
                 watched_at: i.watched_at.as_deref().and_then(parse_loose_date),
                 has_time_of_day: false,
@@ -588,28 +597,173 @@ pub(crate) fn parse_loose_date(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Splits Netflix's "Series: Season 1: Episode Title" naming.
-fn parse_netflix_title(full: &str) -> (String, Option<bool>, Option<i64>, Option<String>) {
-    let parts: Vec<&str> = full.split(": ").collect();
+/// A Netflix activity title split into its parts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct NetflixTitle {
+    series: String,
+    is_tv: Option<bool>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    episode_title: Option<String>,
+}
+
+/// Words Netflix (and other providers) use for a season-like unit.
+const SEASON_WORDS: &[&str] = &["season", "series", "part", "volume", "book", "collection", "chapter", "temporada", "staffel", "saison"];
+const EPISODE_WORDS: &[&str] = &["episode", "ep", "e", "épisode", "episodio", "folge"];
+
+/// A season/episode number written as digits, a word ("Two") or a roman numeral ("II").
+fn number_token(token: &str) -> Option<i64> {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        return t.parse().ok().filter(|n| (0..=2000).contains(n));
+    }
+    const WORDS: &[&str] = &[
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    ];
+    if let Some(i) = WORDS.iter().position(|w| *w == t) {
+        return Some(i as i64 + 1);
+    }
+    const ROMAN: &[&str] = &["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii", "xiii", "xiv", "xv"];
+    ROMAN.iter().position(|r| *r == t).map(|i| i as i64 + 1)
+}
+
+/// `S2E3`, `S02E03`, `S2:E3`, `S2.E3`, `S2 E3` → (2, 3).
+fn compact_se(token: &str) -> Option<(i64, Option<i64>)> {
+    let t = token.to_lowercase();
+    let rest = t.strip_prefix('s')?;
+    let season_len = rest.chars().take_while(char::is_ascii_digit).count();
+    if season_len == 0 || season_len > 3 {
+        return None;
+    }
+    let season: i64 = rest[..season_len].parse().ok()?;
+    let after = rest[season_len..].trim_start_matches([':', '.', ' ', '-', '|', '·']);
+    if after.is_empty() {
+        return Some((season, None));
+    }
+    let ep = after.strip_prefix('e')?;
+    let ep = ep.strip_prefix("p.").or_else(|| ep.strip_prefix("p")).unwrap_or(ep).trim_start();
+    let ep_len = ep.chars().take_while(char::is_ascii_digit).count();
+    (ep_len > 0 && ep_len == ep.len()).then(|| Some((season, ep.parse().ok())))?
+}
+
+/// Reads a season marker segment: "Season 2", "Series 3", "Part II", "Volume Two", "Vol. 1",
+/// "Limited Series", "S2", "S2E3", "Season 2 Episode 3", "Season 2, Ep. 3" …
+/// Returns (season, episode-if-present).
+fn season_segment(segment: &str) -> Option<(i64, Option<i64>)> {
+    let seg = segment.trim();
+    let lower = seg.to_lowercase();
+    if matches!(lower.as_str(), "limited series" | "miniseries" | "mini-series" | "the complete series") {
+        return Some((1, None));
+    }
+    if let Some(se) = compact_se(&lower.replace(' ', "")) {
+        return Some(se);
+    }
+    let tokens: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == '-' || c == '|' || c == '·')
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() < 2 || tokens.len() > 5 {
+        return None;
+    }
+    let word = tokens[0].trim_end_matches('.');
+    if !SEASON_WORDS.contains(&word) {
+        return None;
+    }
+    let season = number_token(tokens[1])?;
+    let episode = match &tokens[2..] {
+        [] => None,
+        [w, n] if EPISODE_WORDS.contains(&w.trim_end_matches('.')) => Some(number_token(n)?),
+        [t] => compact_episode(t),
+        _ => return None,
+    };
+    Some((season, episode))
+}
+
+/// `E3`, `Ep3`, `Ep.3` → 3.
+fn compact_episode(token: &str) -> Option<i64> {
+    let t = token.to_lowercase();
+    let t = t.strip_prefix("ep.").or_else(|| t.strip_prefix("ep")).or_else(|| t.strip_prefix('e'))?;
+    t.parse().ok()
+}
+
+/// An explicit episode marker at the start of an episode segment: "Episode 3", "Ep. 3",
+/// "E03", "Episode Three". Returns (episode, the title text after it if any).
+fn episode_marker(segment: &str) -> Option<(i64, Option<String>)> {
+    let seg = segment.trim();
+    let mut words = seg.splitn(3, char::is_whitespace);
+    let first = words.next()?.to_lowercase();
+    let first_clean = first.trim_end_matches(['.', ':', ',']);
+    let (number, rest) = if EPISODE_WORDS.contains(&first_clean) && first_clean != "e" {
+        (number_token(words.next()?)?, words.next())
+    } else {
+        let after_first = seg[first.len()..].trim_start();
+        (compact_episode(first_clean)?, Some(after_first).filter(|r| !r.is_empty()))
+    };
+    let rest = rest
+        .map(|r| r.trim_start_matches([':', '-', '–', '—', '.', ',', ' ']).trim().trim_matches('"').to_string())
+        .filter(|r| !r.is_empty());
+    Some((number, rest))
+}
+
+/// Splits Netflix's activity titles. Handles "Series: Season 1: Episode Title" and the variants
+/// Netflix uses per show and region: "Series 2", "Part 3", "Volume 1", "Vol. 2", "Book Two",
+/// "Collection 1", "Limited Series", "S2:E3", "Season 2 Episode 3", "Season 2: Episode 3",
+/// "Season 2: Episode 3: Title" and roman / spelled-out numbers.
+fn parse_netflix_title(full: &str) -> NetflixTitle {
+    let full = full.trim();
+    // Netflix separates with ": "; a few regions/exports use " - " around the season marker.
+    let normalized = full.replace(" - Season ", ": Season ").replace(" - Part ", ": Part ").replace(" - Volume ", ": Volume ");
+    let parts: Vec<&str> = normalized.split(": ").collect();
     for i in 1..parts.len() {
-        let p = parts[i].trim();
-        let lower = p.to_lowercase();
-        let numbered = ["season", "series", "part", "volume", "book", "collection", "chapter"]
-            .iter()
-            .any(|w| lower.starts_with(w))
-            && first_number(&lower).is_some()
-            && p.split_whitespace().count() <= 3;
-        if numbered || lower == "limited series" || lower == "miniseries" {
-            let episode_title = parts[i + 1..].join(": ");
-            return (
-                parts[..i].join(": ").trim().to_string(),
-                Some(true),
-                Some(first_number(&lower).unwrap_or(1)),
-                Some(episode_title).filter(|t| !t.trim().is_empty()),
-            );
+        let Some((season, mut episode)) = season_segment(parts[i]) else { continue };
+        let mut rest: Vec<&str> = parts[i + 1..].to_vec();
+        // A trailing marker with nothing after it is a movie sequel ("Deathly Hallows: Part 1",
+        // "Kill Bill: Volume 1"): Netflix always follows a season with the episode.
+        if rest.is_empty() && episode.is_none() {
+            continue;
+        }
+        let mut episode_title = None;
+        if let Some(first) = rest.first().copied() {
+            if episode.is_none() {
+                if let Some((n, tail)) = episode_marker(first) {
+                    episode = Some(n);
+                    rest.remove(0);
+                    episode_title = tail;
+                }
+            }
+        }
+        if episode_title.is_none() {
+            episode_title = Some(rest.join(": ").trim().trim_matches('"').to_string()).filter(|t| !t.is_empty());
+        }
+        return NetflixTitle {
+            series: parts[..i].join(": ").trim().to_string(),
+            is_tv: Some(true),
+            season: Some(season),
+            episode,
+            episode_title,
+        };
+    }
+    // No season marker, but an explicit episode marker: "Show: Episode 4" / "Show: E4: Title".
+    for i in 1..parts.len() {
+        if let Some((n, tail)) = episode_marker(parts[i]) {
+            let mut title = parts[i + 1..].join(": ");
+            if let Some(t) = tail {
+                title = if title.is_empty() { t } else { format!("{t}: {title}") };
+            }
+            return NetflixTitle {
+                series: parts[..i].join(": ").trim().to_string(),
+                is_tv: Some(true),
+                season: None,
+                episode: Some(n),
+                episode_title: Some(title.trim().trim_matches('"').to_string()).filter(|t| !t.is_empty()),
+            };
         }
     }
-    (full.trim().to_string(), None, None, None)
+    NetflixTitle { series: full.to_string(), ..Default::default() }
 }
 
 fn parse_viewing_activity_csv(text: &str) -> AppResult<Vec<RawItem>> {
@@ -626,13 +780,13 @@ fn parse_viewing_activity_csv(text: &str) -> AppResult<Vec<RawItem>> {
             if full.is_empty() {
                 return None;
             }
-            let (title, is_tv, season, episode_title) = parse_netflix_title(full);
+            let parsed = parse_netflix_title(full);
             Some(RawItem {
-                title,
-                is_tv,
-                season,
-                episode: None,
-                episode_title,
+                title: parsed.series,
+                is_tv: parsed.is_tv,
+                season: parsed.season,
+                episode: parsed.episode,
+                episode_title: parsed.episode_title,
                 watched_at: date_col.and_then(|c| r.get(c)).and_then(|d| parse_loose_date(d)),
                 has_time_of_day: false,
                 assume_completed: true,
@@ -714,10 +868,32 @@ struct Matched {
 }
 
 #[derive(Debug, Clone)]
-struct EpisodeInfo {
-    number: i64,
-    name: String,
-    runtime_mins: Option<i64>,
+pub(crate) struct EpisodeInfo {
+    pub(crate) number: i64,
+    pub(crate) name: String,
+    pub(crate) runtime_mins: Option<i64>,
+}
+
+/// Finds an episode by name: exact (normalised) match first, then a unique containment match
+/// ("The One with the Thumb" vs "The One With The Thumb (Part 1)"). Regular seasons win over
+/// specials when names repeat.
+pub(crate) fn match_episode_name<'a, T>(episodes: &'a [T], wanted: &str, name_of: impl Fn(&T) -> &str) -> Option<&'a T> {
+    let wanted = normalize_title(wanted);
+    if wanted.is_empty() {
+        return None;
+    }
+    if let Some(e) = episodes.iter().find(|e| normalize_title(name_of(e)) == wanted) {
+        return Some(e);
+    }
+    if wanted.chars().count() < 8 {
+        return None;
+    }
+    let mut hits = episodes.iter().filter(|e| {
+        let name = normalize_title(name_of(e));
+        name.chars().count() >= 8 && (name.contains(&wanted) || wanted.contains(&name))
+    });
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
 }
 
 impl TmdbClient {
@@ -792,7 +968,7 @@ impl TmdbClient {
             .collect())
     }
 
-    async fn season_episodes(&self, tv_id: i64, season: i64) -> AppResult<Vec<EpisodeInfo>> {
+    pub(crate) async fn season_episodes(&self, tv_id: i64, season: i64) -> AppResult<Vec<EpisodeInfo>> {
         let body = self.get(&format!("/tv/{tv_id}/season/{season}"), &[]).await?;
         Ok(body["episodes"]
             .as_array()
@@ -807,6 +983,34 @@ impl TmdbClient {
                 })
             })
             .collect())
+    }
+
+    /// Season numbers of a series, regular seasons first and specials (season 0) last.
+    async fn season_numbers(&self, tv_id: i64) -> AppResult<Vec<i64>> {
+        let body = self.get(&format!("/tv/{tv_id}"), &[]).await?;
+        let mut seasons: Vec<i64> = body["seasons"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s["season_number"].as_i64())
+            .collect();
+        seasons.sort_by_key(|n| (*n == 0, *n));
+        seasons.dedup();
+        Ok(seasons)
+    }
+
+    /// Every episode of a series as (season, episode), for matching by episode name.
+    pub(crate) async fn series_episodes(&self, tv_id: i64) -> AppResult<Vec<(i64, EpisodeInfo)>> {
+        let mut out = Vec::new();
+        for season in self.season_numbers(tv_id).await?.into_iter().take(MAX_SEASONS_PER_SHOW) {
+            match self.season_episodes(tv_id, season).await {
+                Ok(eps) => out.extend(eps.into_iter().map(|e| (season, e))),
+                Err(e) if e.to_string().contains("API key") => return Err(e),
+                Err(e) => log::debug!("TMDB season {season} of {tv_id} failed: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     async fn runtime_mins(&self, tmdb_id: i64, media_type: &str) -> AppResult<Option<i64>> {
@@ -1069,6 +1273,41 @@ async fn resolve_and_store(
         }
     }
 
+    // 2b. Episode-name fallback: when the season couldn't be parsed (or Netflix's "Part"/"Volume"
+    // numbering differs from TMDB's seasons), look the episode title up across the whole series.
+    let in_hinted_season = |item: &RawItem, tmdb_id: i64| -> bool {
+        let Some(name) = item.episode_title.as_deref() else { return false };
+        seasons
+            .get(&(tmdb_id, item.season.unwrap_or(1)))
+            .is_some_and(|eps| match_episode_name(eps, name, |e| e.name.as_str()).is_some())
+    };
+    let mut full_scan: HashSet<i64> = HashSet::new();
+    for (item, &gi) in raw.iter().zip(&group_of) {
+        if let Some(Some(m)) = matches.get(gi) {
+            if m.media_type == "tv" && item.episode.is_none() && item.episode_title.is_some() && !in_hinted_season(item, m.tmdb_id) {
+                full_scan.insert(m.tmdb_id);
+            }
+        }
+    }
+    let mut whole_series: HashMap<i64, Vec<(i64, EpisodeInfo)>> = HashMap::new();
+    let mut set = JoinSet::new();
+    for tv_id in full_scan.into_iter().take(MAX_FULL_SERIES_LOOKUPS) {
+        let (tmdb, sem) = (tmdb.clone(), sem.clone());
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            (tv_id, tmdb.series_episodes(tv_id).await)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((tv_id, Ok(eps))) => {
+                whole_series.insert(tv_id, eps);
+            }
+            Ok((_, Err(e))) if e.to_string().contains("API key") => return Err(e),
+            _ => {}
+        }
+    }
+
     // Movie runtimes for percent-only entries (Continue-Watching trays).
     let mut runtime_needed: HashSet<usize> = HashSet::new();
     for (item, &gi) in raw.iter().zip(&group_of) {
@@ -1108,6 +1347,7 @@ async fn resolve_and_store(
     let mut merged: HashMap<(i64, String, i64, i64), Agg> = HashMap::new();
     let mut unmatched: Vec<String> = Vec::new();
     let mut matched_groups: HashSet<usize> = HashSet::new();
+    let mut built: Vec<((i64, String, i64, i64), HistoryImport, String, bool)> = Vec::new();
 
     for (item, &gi) in raw.iter().zip(&group_of) {
         let Some(Some(m)) = matches.get(gi) else {
@@ -1118,14 +1358,30 @@ async fn resolve_and_store(
         };
         matched_groups.insert(gi);
         let is_tv = m.media_type == "tv";
-        let season = if is_tv { item.season.unwrap_or(1) } else { 0 };
-        let season_eps = seasons.get(&(m.tmdb_id, season));
-        let by_title = || {
-            let wanted = normalize_title(item.episode_title.as_deref()?);
-            season_eps?.iter().find(|e| normalize_title(&e.name) == wanted)
+        let mut season = if is_tv { item.season.unwrap_or(1) } else { 0 };
+        let mut season_eps = seasons.get(&(m.tmdb_id, season));
+        let mut ep_info = if is_tv && item.episode.is_none() {
+            item.episode_title
+                .as_deref()
+                .and_then(|name| season_eps.and_then(|eps| match_episode_name(eps, name, |e| e.name.as_str())))
+        } else {
+            None
         };
-        let ep_info = by_title();
+        if is_tv && item.episode.is_none() && ep_info.is_none() {
+            // Whole-series lookup by episode name fixes the season too.
+            let found = item.episode_title.as_deref().and_then(|name| {
+                let all = whole_series.get(&m.tmdb_id)?;
+                match_episode_name(all, name, |(_, e)| e.name.as_str())
+            });
+            if let Some((s, e)) = found {
+                season = *s;
+                season_eps = None;
+                ep_info = Some(e);
+            }
+        }
         let episode = if is_tv { item.episode.or(ep_info.map(|e| e.number)).unwrap_or(0) } else { 0 };
+        // Known to be an episode, but no number and no TMDB episode of that name.
+        let unplaced = is_tv && episode == 0 && item.episode_title.is_some();
         let runtime = ep_info
             .and_then(|e| e.runtime_mins)
             .or_else(|| season_eps.and_then(|eps| eps.iter().find(|e| e.number == episode)).and_then(|e| e.runtime_mins))
@@ -1165,6 +1421,22 @@ async fn resolve_and_store(
         };
         let key = (m.tmdb_id, m.media_type.clone(), season, episode);
         let day = watched_at.as_deref().map(|w| w[..10.min(w.len())].to_string()).unwrap_or_default();
+        built.push((key, row, day, unplaced));
+    }
+
+    // Unplaced episodes would all collapse into one "episode 0" row that can outrank the real
+    // latest episode; only keep them for series where nothing else was placed.
+    let placed_series: HashSet<i64> = built
+        .iter()
+        .filter(|(key, _, _, unplaced)| !unplaced && key.3 > 0)
+        .map(|(key, ..)| key.0)
+        .collect();
+    let mut unplaced_dropped = 0usize;
+    for (key, row, day, unplaced) in built {
+        if unplaced && placed_series.contains(&key.0) {
+            unplaced_dropped += 1;
+            continue;
+        }
         match merged.get_mut(&key) {
             Some(agg) => {
                 agg.days.insert(day);
@@ -1179,6 +1451,9 @@ async fn resolve_and_store(
                 merged.insert(key, Agg { row, days: HashSet::from([day]) });
             }
         }
+    }
+    if unplaced_dropped > 0 {
+        log::info!("{unplaced_dropped} imported episodes had no matching TMDB episode name and were skipped");
     }
 
     let rows: Vec<HistoryImport> = merged
@@ -1216,17 +1491,61 @@ async fn resolve_and_store(
 mod tests {
     use super::*;
 
+    fn nt(series: &str, season: Option<i64>, episode: Option<i64>, title: Option<&str>) -> NetflixTitle {
+        NetflixTitle {
+            series: series.into(),
+            is_tv: Some(true),
+            season,
+            episode,
+            episode_title: title.map(str::to_string),
+        }
+    }
+
     #[test]
     fn netflix_csv_titles() {
         assert_eq!(
             parse_netflix_title("Stranger Things: Season 1: Chapter One: The Vanishing of Will Byers"),
-            ("Stranger Things".into(), Some(true), Some(1), Some("Chapter One: The Vanishing of Will Byers".into()))
+            nt("Stranger Things", Some(1), None, Some("Chapter One: The Vanishing of Will Byers"))
         );
-        assert_eq!(
-            parse_netflix_title("The Queen's Gambit: Limited Series: Openings"),
-            ("The Queen's Gambit".into(), Some(true), Some(1), Some("Openings".into()))
-        );
-        assert_eq!(parse_netflix_title("Spider-Man: No Way Home"), ("Spider-Man: No Way Home".into(), None, None, None));
+        assert_eq!(parse_netflix_title("The Queen's Gambit: Limited Series: Openings"), nt("The Queen's Gambit", Some(1), None, Some("Openings")));
+        assert_eq!(parse_netflix_title("Spider-Man: No Way Home"), NetflixTitle { series: "Spider-Man: No Way Home".into(), ..Default::default() });
+    }
+
+    #[test]
+    fn netflix_title_variants() {
+        let friends = Some("The One with Ross's New Girlfriend");
+        assert_eq!(parse_netflix_title("Friends: Season 2: The One with Ross's New Girlfriend"), nt("Friends", Some(2), None, friends));
+        assert_eq!(parse_netflix_title("Sherlock: Series 3: The Empty Hearse"), nt("Sherlock", Some(3), None, Some("The Empty Hearse")));
+        assert_eq!(parse_netflix_title("Money Heist: Part 3: Episode 1"), nt("Money Heist", Some(3), Some(1), None));
+        assert_eq!(parse_netflix_title("Love, Death & Robots: Volume 2: Snow in the Desert"), nt("Love, Death & Robots", Some(2), None, Some("Snow in the Desert")));
+        assert_eq!(parse_netflix_title("Avatar: The Last Airbender: Book Two: The Avatar State"), nt("Avatar: The Last Airbender", Some(2), None, Some("The Avatar State")));
+        assert_eq!(parse_netflix_title("Narcos: Season II: Free at Last"), nt("Narcos", Some(2), None, Some("Free at Last")));
+        assert_eq!(parse_netflix_title("Friends: S2:E2: The One with the Breast Milk"), nt("Friends", Some(2), Some(2), Some("The One with the Breast Milk")));
+        assert_eq!(parse_netflix_title("Friends: S02E02"), nt("Friends", Some(2), Some(2), None));
+        assert_eq!(parse_netflix_title("Dark: Season 1 Episode 4: Double Lives"), nt("Dark", Some(1), Some(4), Some("Double Lives")));
+        assert_eq!(parse_netflix_title("Dark: Season 1: Episode 4: Double Lives"), nt("Dark", Some(1), Some(4), Some("Double Lives")));
+        assert_eq!(parse_netflix_title("Dark - Season 2: Lost and Found"), nt("Dark", Some(2), None, Some("Lost and Found")));
+        assert_eq!(parse_netflix_title("Wednesday: Episode 3: Friend or Woe"), nt("Wednesday", None, Some(3), Some("Friend or Woe")));
+        // Movie sequels with a trailing "Part"/"Volume" stay movies.
+        for movie in ["Harry Potter and the Deathly Hallows: Part 1", "Kill Bill: Volume 1", "Mission: Impossible - Dead Reckoning Part One"] {
+            assert_eq!(parse_netflix_title(movie).is_tv, None, "{movie}");
+        }
+    }
+
+    #[test]
+    fn episode_names_match_exactly_then_uniquely() {
+        let eps: Vec<(i64, String)> = [(1, "The One Where Monica Gets a Roommate"), (2, "The One with the Sonogram at the End"), (3, "The One with the Thumb")]
+            .into_iter()
+            .map(|(n, t)| (n, t.to_string()))
+            .collect();
+        fn name(e: &(i64, String)) -> &str {
+            &e.1
+        }
+        assert_eq!(match_episode_name(&eps, "the one with the thumb", name).map(|e| e.0), Some(3));
+        assert_eq!(match_episode_name(&eps, "The One with the Sonogram", name).map(|e| e.0), Some(2));
+        // Ambiguous containment ("The One") and short names don't match.
+        assert_eq!(match_episode_name(&eps, "The One", name), None);
+        assert_eq!(match_episode_name(&eps, "Pilot", name), None);
     }
 
     #[test]
@@ -1256,6 +1575,7 @@ mod tests {
                 season_number: None,
                 episode_number: None,
                 episode_title: None,
+                season_label: None,
                 is_tv: false,
                 progress_ratio: None,
                 progress_seconds: Some(600.0),

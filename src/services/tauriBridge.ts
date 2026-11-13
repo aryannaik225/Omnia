@@ -408,6 +408,11 @@ export const deepLinks = {
     invoke<ResolvedLink[]>("get_cached_deep_links", { tmdbId, mediaType, regionCode }),
 };
 
+export interface ClearedHistory {
+  historyRows: number;
+  playbackEvents: number;
+}
+
 export const history = {
   recordProgress: (update: ProgressUpdate) => invoke<WatchHistoryEntry>("record_watch_progress", { update }),
   markCompleted: (appProfileId: number, tmdbId: number, mediaType: MediaType, seasonNumber = 0, episodeNumber = 0) =>
@@ -419,6 +424,8 @@ export const history = {
   titleProgress: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<WatchHistoryEntry[]>("get_title_progress", { appProfileId, tmdbId, mediaType }),
   remove: (appProfileId: number, id: number) => invoke<boolean>("delete_watch_history_entry", { appProfileId, id }),
+  /** "Clear Watch History": wipes this profile's history + playback events (other profiles untouched). */
+  clearAll: (appProfileId: number) => invoke<ClearedHistory>("clear_watch_history", { appProfileId }),
   /** "Remove from Continue Watching": hidden until watched again; history is kept. */
   hideFromContinueWatching: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<void>("hide_from_continue_watching", { appProfileId, tmdbId, mediaType }),

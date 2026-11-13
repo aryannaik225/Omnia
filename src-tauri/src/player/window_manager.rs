@@ -27,7 +27,7 @@
 //! capability (remote OTT origins only, four telemetry commands only), and every call must carry
 //! the per-session random token that only the injected script knows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,7 @@ use tokio::sync::Notify;
 use crate::db::queries::{self, ProgressUpdate};
 use crate::db::Database;
 use crate::resolver::justwatch::normalize_title;
+use crate::sync::history_importer::{match_episode_name, TmdbClient};
 use crate::{AppError, AppResult, AppState};
 
 const TELEMETRY_SCRIPT: &str = include_str!("telemetry_injector.js");
@@ -575,6 +576,33 @@ struct PlayerSession {
     play_start_logged: bool,
     last_progress_emit: Option<Instant>,
     final_flush: Arc<Notify>,
+    /// Episode names resolved to (season, episode) via TMDB, for players that show the episode
+    /// name but not its numbers. Keyed by (tmdb id, normalised name).
+    episode_lookups: HashMap<(i64, String), EpisodeLookup>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpisodeLookup {
+    Pending,
+    Found(i64, i64),
+    Missing(Instant),
+}
+
+/// Retry a failed episode-name lookup after this long (network blips, TMDB rate limits).
+const EPISODE_LOOKUP_RETRY: Duration = Duration::from_secs(60);
+
+/// A season/episode-less detection of the series being played that carries an episode name.
+fn episode_lookup_job(item: Option<&SessionItem>, d: Option<&DetectedMedia>) -> Option<(i64, String, Option<i64>)> {
+    let (item, d) = (item?, d?);
+    if item.media_type != "tv" || d.episode_number.is_some_and(|e| e > 0) {
+        return None;
+    }
+    let name = d.episode_title.as_deref().map(str::trim).filter(|n| n.chars().count() >= 2)?;
+    let detected_title = d.title.as_deref().unwrap_or_default();
+    if !item.titles.iter().any(|t| titles_match(t, detected_title)) || item.titles.iter().any(|t| normalize_title(t) == normalize_title(name)) {
+        return None;
+    }
+    Some((item.tmdb_id, normalize_title(name), d.season_number.filter(|s| *s > 0)))
 }
 
 impl PlayerSession {
@@ -1292,6 +1320,7 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         play_start_logged: false,
         last_progress_emit: None,
         final_flush: Arc::new(Notify::new()),
+        episode_lookups: HashMap::new(),
     };
     *state.player.lock() = Some(session);
 
@@ -1399,16 +1428,44 @@ pub async fn sync_playback_telemetry(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
-    payload: TelemetryPayload,
+    mut payload: TelemetryPayload,
 ) -> AppResult<TelemetryAck> {
-    let provider_id = {
-        let guard = state.player.lock();
+    let (provider_id, lookup) = {
+        let mut guard = state.player.lock();
         let s = guard
-            .as_ref()
+            .as_mut()
             .filter(|s| s.label == window.label() && tokens_equal(&s.token, &payload.token))
             .ok_or_else(unauthorized)?;
-        s.provider_id
+        let mut lookup = None;
+        if let Some((tmdb_id, name, season_hint)) = episode_lookup_job(s.item.as_ref(), payload.detected.as_ref()) {
+            let key = (tmdb_id, name.clone());
+            match s.episode_lookups.get(&key).copied() {
+                Some(EpisodeLookup::Found(season, episode)) => fill_episode(&mut payload, season, episode),
+                Some(EpisodeLookup::Pending) => {}
+                Some(EpisodeLookup::Missing(at)) if at.elapsed() < EPISODE_LOOKUP_RETRY => {}
+                _ => {
+                    s.episode_lookups.insert(key, EpisodeLookup::Pending);
+                    lookup = Some((tmdb_id, name, season_hint));
+                }
+            }
+        }
+        (s.provider_id, lookup)
     };
+
+    // The player only showed the episode's name: place it with TMDB's season data.
+    if let Some((tmdb_id, name, season_hint)) = lookup {
+        let found = resolve_episode_by_name(&state, tmdb_id, &name, season_hint).await;
+        if let Some((season, episode)) = found {
+            log::info!("live telemetry: placed episode by name via TMDB as S{season}E{episode}");
+            fill_episode(&mut payload, season, episode);
+        }
+        if let Some(s) = state.player.lock().as_mut().filter(|s| s.label == window.label()) {
+            s.episode_lookups.insert(
+                (tmdb_id, name),
+                found.map_or(EpisodeLookup::Missing(Instant::now()), |(se, ep)| EpisodeLookup::Found(se, ep)),
+            );
+        }
+    }
 
     let observed = payload
         .ott_profile
@@ -1457,6 +1514,38 @@ pub async fn sync_playback_telemetry(
         }
     }
     Ok(ack)
+}
+
+fn fill_episode(payload: &mut TelemetryPayload, season: i64, episode: i64) {
+    if let Some(d) = payload.detected.as_mut() {
+        d.season_number = Some(season);
+        d.episode_number = Some(episode);
+    }
+}
+
+/// Finds (season, episode) for an episode name: the detected season first, then the series.
+async fn resolve_episode_by_name(state: &AppState, tmdb_id: i64, name: &str, season_hint: Option<i64>) -> Option<(i64, i64)> {
+    let tmdb = match TmdbClient::from_settings(state).await {
+        Ok(t) => t,
+        Err(e) => {
+            log::debug!("episode lookup skipped: {e}");
+            return None;
+        }
+    };
+    if let Some(season) = season_hint {
+        if let Ok(eps) = tmdb.season_episodes(tmdb_id, season).await {
+            if let Some(e) = match_episode_name(&eps, name, |e| e.name.as_str()) {
+                return Some((season, e.number));
+            }
+        }
+    }
+    match tmdb.series_episodes(tmdb_id).await {
+        Ok(all) => match_episode_name(&all, name, |(_, e)| e.name.as_str()).map(|(s, e)| (*s, e.number)),
+        Err(e) => {
+            log::debug!("episode lookup failed: {e}");
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -1598,6 +1687,7 @@ mod tests {
             play_start_logged: false,
             last_progress_emit: None,
             final_flush: Arc::new(Notify::new()),
+            episode_lookups: HashMap::new(),
         }
     }
 
@@ -1719,6 +1809,34 @@ mod tests {
         let plan = s.apply(&sample(TelemetryKind::Progress, 126.0, 1320.0, Some(det("Friends", 2, 1))), REC);
         assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Progress(u) if (u.season_number, u.episode_number) == (2, 1))));
         assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Event { event_type: "episode_hop", .. })), "a guess isn't a hop");
+    }
+
+    #[test]
+    fn episode_name_only_detection_needs_a_tmdb_lookup() {
+        let mut s = session("tv", 1, 24);
+        s.item.as_mut().unwrap().titles = vec!["Friends".into()];
+        let name_only = DetectedMedia {
+            title: Some("Friends".into()),
+            season_number: None,
+            episode_number: None,
+            episode_title: Some("The One with the Breast Milk".into()),
+            ott_title_id: Some("70274078".into()),
+            confidence: Confidence::High,
+        };
+        let job = episode_lookup_job(s.item.as_ref(), Some(&name_only)).expect("lookup needed");
+        assert_eq!(job, (s.item.as_ref().unwrap().tmdb_id, "the one with the breast milk".into(), None));
+        // Numbers already known, another title, or the "episode name" is just the series name: no lookup.
+        assert!(episode_lookup_job(s.item.as_ref(), Some(&det("Friends", 2, 2))).is_none());
+        let other = DetectedMedia { title: Some("Dark".into()), ..name_only.clone() };
+        assert!(episode_lookup_job(s.item.as_ref(), Some(&other)).is_none());
+        let series_only = DetectedMedia { episode_title: Some("Friends".into()), ..name_only.clone() };
+        assert!(episode_lookup_job(s.item.as_ref(), Some(&series_only)).is_none());
+
+        // Once the lookup fills the numbers, the hop from S1E24 to S2E2 is tracked.
+        let mut payload = sample(TelemetryKind::Progress, 60.0, 1320.0, Some(name_only));
+        fill_episode(&mut payload, 2, 2);
+        let plan = s.apply(&payload, REC);
+        assert!(plan.ops.iter().any(|o| matches!(o, DbOp::Progress(u) if (u.season_number, u.episode_number) == (2, 2))));
     }
 
     #[test]

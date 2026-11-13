@@ -1015,6 +1015,30 @@ pub fn delete_history_entry(c: &Connection, app_profile_id: i64, id: i64) -> rus
     )? > 0)
 }
 
+/// Rows removed by [`clear_profile_history`].
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearedHistory {
+    pub history_rows: usize,
+    pub playback_events: usize,
+}
+
+/// "Clear Watch History": wipes one profile's `watch_history` and `playback_events` (plus its
+/// Continue Watching hides and learned affinity scores, which only describe that history) in one
+/// transaction. Other profiles, links, watchlist and preferences are untouched.
+pub fn clear_profile_history(c: &mut Connection, app_profile_id: i64) -> rusqlite::Result<ClearedHistory> {
+    let tx = c.transaction()?;
+    let history_rows = tx.execute("DELETE FROM watch_history WHERE app_profile_id = ?1", params![app_profile_id])?;
+    let playback_events = tx.execute("DELETE FROM playback_events WHERE app_profile_id = ?1", params![app_profile_id])?;
+    tx.execute("DELETE FROM continue_watching_hidden WHERE app_profile_id = ?1", params![app_profile_id])?;
+    tx.execute(
+        "UPDATE media_embeddings SET computed_affinity_score = 0.0 WHERE app_profile_id = ?1",
+        params![app_profile_id],
+    )?;
+    tx.commit()?;
+    Ok(ClearedHistory { history_rows, playback_events })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContinueWatchingItem {
@@ -1721,6 +1745,33 @@ mod tests {
         hide_from_continue_watching(&c, 1, 603, "movie").unwrap();
         assert!(unhide_from_continue_watching(&c, 1, 603, "movie").unwrap());
         assert_eq!(continue_watching(&c, 1, 30).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clearing_history_only_touches_the_active_profile() {
+        let mut c = test_db();
+        let other = create_profile(&c, "Clara", None, false).unwrap();
+        record_progress(&c, &sample_update(600.0, 8160.0)).unwrap();
+        let mut theirs = sample_update(300.0, 8160.0);
+        theirs.app_profile_id = other.profile_id;
+        record_progress(&c, &theirs).unwrap();
+        insert_playback_event(&c, 1, 603, "movie", "pause", 10.0).unwrap();
+        insert_playback_event(&c, other.profile_id, 603, "movie", "pause", 10.0).unwrap();
+        hide_from_continue_watching(&c, 1, 603, "movie").unwrap();
+
+        let cleared = clear_profile_history(&mut c, 1).unwrap();
+        assert_eq!(cleared, ClearedHistory { history_rows: 1, playback_events: 1 });
+        assert!(get_title_history(&c, 1, 603, "movie").unwrap().is_empty());
+        let hidden: i64 = c
+            .query_row("SELECT COUNT(*) FROM continue_watching_hidden WHERE app_profile_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hidden, 0);
+        // The other profile keeps everything.
+        assert_eq!(get_title_history(&c, other.profile_id, 603, "movie").unwrap().len(), 1);
+        let events: i64 = c
+            .query_row("SELECT COUNT(*) FROM playback_events WHERE app_profile_id = ?1", [other.profile_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 1);
     }
 
     #[test]

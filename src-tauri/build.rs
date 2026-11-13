@@ -30,6 +30,7 @@ const COMMANDS: &[&str] = &[
     "get_watch_history",
     "get_title_progress",
     "delete_watch_history_entry",
+    "clear_watch_history",
     "import_watch_history",
     "export_watch_history",
     "log_playback_event",

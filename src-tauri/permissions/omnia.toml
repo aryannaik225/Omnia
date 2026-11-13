@@ -43,6 +43,7 @@ permissions = [
   "allow-set-preferred-provider",
   "allow-clear-preferred-provider",
   "allow-hide-from-continue-watching",
+  "allow-clear-watch-history",
   "allow-unhide-from-continue-watching",
   "allow-open-player",
   "allow-close-player",

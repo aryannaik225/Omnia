@@ -240,7 +240,13 @@
   }
 
   // -------------------------------------------------------------------------------------------
-  // Netflix metadata (season / episode) — player state first, then APIs, then the DOM
+  // Netflix metadata (season / episode) — merged from every source that knows something
+  //
+  // No single source is reliable during playback: `netflix.reactContext` is often absent on
+  // /watch pages, the player store's shape changes between builds, the title overlay is only in
+  // the DOM while the controls are visible, and Shakti endpoints get refused. So every source
+  // fills in whatever the previous ones left missing, and every episode Netflix's own metadata
+  // describes is indexed by its video id (the id in /watch/<id>).
   // -------------------------------------------------------------------------------------------
   function netflixContextValue(path) {
     try {
@@ -252,68 +258,206 @@
     }
   }
 
-  function fromNetflixVideo(v, videoId) {
-    if (!v || !v.title) return null;
-    var result = { title: clean(v.title), seasonNumber: null, episodeNumber: null, episodeTitle: null };
-    if (v.type === "show" && Array.isArray(v.seasons)) {
-      var wanted = [String(videoId), v.currentEpisode != null ? String(v.currentEpisode) : null];
-      for (var w = 0; w < wanted.length && result.episodeNumber == null; w++) {
-        if (!wanted[w]) continue;
-        v.seasons.forEach(function (season) {
-          (season.episodes || []).forEach(function (ep) {
-            var id = String(ep.episodeId != null ? ep.episodeId : ep.id);
-            if (id === wanted[w] && result.episodeNumber == null) {
-              result.seasonNumber = season.seq != null ? season.seq : season.num;
-              result.episodeNumber = ep.seq != null ? ep.seq : ep.num;
-              result.episodeTitle = ep.title ? clean(ep.title) : null;
-            }
-          });
-        });
-      }
-    }
-    return result;
-  }
-
-  /** Netflix's in-memory player store (no network). */
-  function netflixFromPlayerState(videoId) {
-    try {
-      var app = window.netflix && window.netflix.appContext && window.netflix.appContext.state && window.netflix.appContext.state.playerApp;
-      var st = app && typeof app.getState === "function" ? app.getState() : null;
-      var vm = st && st.videoPlayer && st.videoPlayer.videoMetadata;
-      if (!vm) return null;
-      var keys = Object.keys(vm);
-      for (var i = 0; i < keys.length; i++) {
-        var entry = vm[keys[i]];
-        var video = (entry && entry._metadata && entry._metadata.video) || (entry && entry.video) || null;
-        if (!video) continue;
-        var r = fromNetflixVideo(video, videoId);
-        if (r && (keys[i] === String(videoId) || r.episodeNumber != null || String(video.id) === String(videoId))) return r;
-      }
-    } catch (_) {}
+  function toInt(v) {
+    if (typeof v === "number" && isFinite(v)) return Math.round(v);
+    if (typeof v === "string" && /^\d{1,4}$/.test(v.trim())) return parseInt(v, 10);
     return null;
   }
 
-  var netflixMeta = { id: null, value: null, pending: false, failedAt: 0 };
+  /** Netflix video id → { title, seasonNumber, episodeNumber, episodeTitle }, from any metadata seen. */
+  var NFX_VIDEOS = {};
+  var NFX_VIDEO_COUNT = 0;
+  /** Build identifiers seen in page requests / scripts (for the metadata endpoint). */
+  var NFX_BUILDS = [];
 
+  function rememberBuild(b) {
+    if (b && /^v[0-9a-f]{4,}$/i.test(b) && NFX_BUILDS.indexOf(b) < 0) NFX_BUILDS.push(b);
+  }
+
+  function indexVideo(v) {
+    if (!v || typeof v !== "object") return false;
+    var title = typeof v.title === "string" ? clean(v.title) : "";
+    if (!title || title.length > 200) return false;
+    if (Array.isArray(v.seasons)) {
+      var added = false;
+      v.seasons.forEach(function (season, si) {
+        if (!season || !Array.isArray(season.episodes)) return;
+        var sNum = toInt(season.seq != null ? season.seq : season.num);
+        if (sNum == null) sNum = si + 1;
+        season.episodes.forEach(function (ep, ei) {
+          if (!ep) return;
+          var id = ep.episodeId != null ? ep.episodeId : ep.id;
+          if (id == null) return;
+          var eNum = toInt(ep.seq != null ? ep.seq : ep.num);
+          if (eNum == null) eNum = ei + 1;
+          if (!NFX_VIDEOS[id]) NFX_VIDEO_COUNT++;
+          NFX_VIDEOS[id] = {
+            title: title,
+            seasonNumber: sNum,
+            episodeNumber: eNum,
+            episodeTitle: typeof ep.title === "string" ? clean(ep.title) || null : null,
+          };
+          added = true;
+        });
+      });
+      return added;
+    }
+    if (v.type === "movie" && v.id != null && !NFX_VIDEOS[v.id]) {
+      NFX_VIDEO_COUNT++;
+      NFX_VIDEOS[v.id] = { title: title, seasonNumber: null, episodeNumber: null, episodeTitle: null };
+      return true;
+    }
+    return false;
+  }
+
+  /** Walks any JSON-ish tree (player store, API response) for Netflix video metadata objects. */
+  function indexNetflixVideos(root) {
+    var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+    var budget = 60000;
+    var found = false;
+    (function walk(node, depth) {
+      if (!node || typeof node !== "object" || depth > 9 || --budget < 0) return;
+      if (seen) {
+        if (seen.has(node)) return;
+        seen.add(node);
+      }
+      if (!Array.isArray(node) && indexVideo(node)) {
+        found = true;
+        return;
+      }
+      var keys;
+      try { keys = Object.keys(node); } catch (_) { return; }
+      for (var i = 0; i < keys.length && i < 400; i++) {
+        var child;
+        try { child = node[keys[i]]; } catch (_) { continue; }
+        if (child && typeof child === "object") walk(child, depth + 1);
+      }
+    })(root, 0);
+    return found;
+  }
+
+  function considerMetadataText(text) {
+    if (!text || text.length > 6e6 || text.indexOf('"seasons"') < 0 && text.indexOf('"movie"') < 0) return;
+    try {
+      indexNetflixVideos(JSON.parse(text));
+    } catch (_) {}
+  }
+
+  /**
+   * Play mode: read the metadata Netflix's own player downloads for the episode being played
+   * (response bodies only; requests are untouched). Installed at document start.
+   */
+  function installNetflixPlayerTap() {
+    function sameSite(url) {
+      try {
+        return /(^|\.)netflix\.com$/i.test(new URL(url, location.href).hostname);
+      } catch (_) {
+        return false;
+      }
+    }
+    function noteUrl(url) {
+      var m = String(url || "").match(/\/(?:api\/shakti|nq\/website\/memberapi)\/(v[0-9a-f]+)\//i);
+      if (m) rememberBuild(m[1]);
+    }
+    if (typeof window.fetch === "function") {
+      var origFetch = window.fetch;
+      window.fetch = function (input) {
+        var p = origFetch.apply(window, arguments);
+        try {
+          var url = typeof input === "string" ? input : (input && input.url) || String(input || "");
+          if (sameSite(url)) {
+            noteUrl(url);
+            p.then(function (r) {
+              var type = (r.headers && r.headers.get("content-type")) || "";
+              if (!r.ok || type.indexOf("json") < 0) return;
+              r.clone().text().then(considerMetadataText).catch(function () {});
+            }).catch(function () {});
+          }
+        } catch (_) {}
+        return p;
+      };
+    }
+    var X = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (!X) return;
+    var origOpen = X.open;
+    var origSend = X.send;
+    X.open = function (method, url) {
+      try { this.__omniaMetaUrl = String(url); } catch (_) {}
+      return origOpen.apply(this, arguments);
+    };
+    X.send = function () {
+      var xhr = this;
+      var url = xhr.__omniaMetaUrl || "";
+      if (sameSite(url)) {
+        noteUrl(url);
+        xhr.addEventListener("load", function () {
+          try {
+            if (xhr.status < 200 || xhr.status >= 300) return;
+            if (xhr.responseType === "json") indexNetflixVideos(xhr.response);
+            else if (!xhr.responseType || xhr.responseType === "text") considerMetadataText(xhr.responseText);
+          } catch (_) {}
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  /** Build id from page state or inline scripts (reactContext is often missing on /watch). */
+  function discoverNetflixBuilds() {
+    rememberBuild(netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]));
+    if (NFX_BUILDS.length) return;
+    var scripts = document.querySelectorAll("script:not([src])");
+    for (var i = 0; i < scripts.length && i < 60; i++) {
+      var m = (scripts[i].textContent || "").match(/"BUILD_IDENTIFIER"\s*:\s*"(v[0-9a-f]+)"/i);
+      if (m) {
+        rememberBuild(m[1]);
+        return;
+      }
+    }
+  }
+
+  /** Netflix's in-memory player store (no network); the shape varies, so search it. */
+  function netflixFromPlayerState() {
+    try {
+      var app = window.netflix && window.netflix.appContext && window.netflix.appContext.state && window.netflix.appContext.state.playerApp;
+      var st = app && typeof app.getState === "function" ? app.getState() : null;
+      if (st) indexNetflixVideos(st.videoPlayer || st);
+    } catch (_) {}
+    try {
+      if (window.netflix && window.netflix.falcorCache) indexNetflixVideos(window.netflix.falcorCache.videos);
+    } catch (_) {}
+  }
+
+  var netflixMeta = { id: null, pending: false, failedAt: 0, attempts: 0 };
+
+  /** Asks Netflix's own metadata endpoint (same-origin, as its web client does) about the id. */
   function refreshNetflixMetadata(videoId) {
-    if (!videoId || netflixMeta.pending || netflixMeta.id === videoId) return;
-    if (Date.now() - netflixMeta.failedAt < 20000) return;
-    var build = netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]);
-    var bases = (build ? ["/api/shakti/" + build + "/metadata"] : []).concat(["/api/shakti/mre/metadata"]);
+    if (!videoId || netflixMeta.pending) return;
+    if (netflixMeta.id !== videoId) {
+      netflixMeta.id = videoId;
+      netflixMeta.failedAt = 0;
+      netflixMeta.attempts = 0;
+    }
+    if (netflixMeta.attempts >= 4 || Date.now() - netflixMeta.failedAt < 15000) return;
+    discoverNetflixBuilds();
+    var bases = [];
+    NFX_BUILDS.forEach(function (b) {
+      bases.push("/nq/website/memberapi/" + b + "/metadata");
+      bases.push("/api/shakti/" + b + "/metadata");
+    });
+    bases.push("/nq/website/memberapi/release/metadata", "/api/shakti/mre/metadata");
     netflixMeta.pending = true;
+    netflixMeta.attempts++;
     (function attempt(i) {
       if (i >= bases.length) {
         netflixMeta.pending = false;
         netflixMeta.failedAt = Date.now();
         return;
       }
-      fetch(bases[i] + "?movieid=" + encodeURIComponent(videoId), { credentials: "include" })
+      fetch(bases[i] + "?movieid=" + encodeURIComponent(videoId) + "&imageFormat=webp&withSize=true&materialize=true", { credentials: "include" })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (json) {
-          var r = json && json.video ? fromNetflixVideo(json.video, videoId) : null;
-          if (!r) return attempt(i + 1);
-          netflixMeta.id = videoId;
-          netflixMeta.value = r;
+          if (!json || !indexNetflixVideos(json) || !NFX_VIDEOS[videoId]) return attempt(i + 1);
           netflixMeta.pending = false;
           sendSync("metadata");
         })
@@ -323,7 +467,9 @@
 
   /** Netflix's title overlay: <h4>Series</h4><span>S2:E1</span><span>Episode</span> and variants. */
   function netflixFromDom() {
-    var root = document.querySelector('[data-uia="video-title"]');
+    var root =
+      document.querySelector('[data-uia="video-title"]') ||
+      document.querySelector('[data-uia="player-title"], [data-uia*="video-title"], .video-title');
     if (!root) return null;
     var h4 = root.querySelector("h4");
     var series = clean(h4 ? h4.textContent : "");
@@ -331,6 +477,7 @@
       .call(root.querySelectorAll("*"), function (el) { return el.childElementCount === 0; })
       .map(function (el) { return clean(el.textContent); })
       .filter(Boolean);
+    if (!leaves.length) leaves = [clean(root.textContent)].filter(Boolean);
     if (!series) series = leaves[0] || "";
     var season = null, episode = null, epTitle = null;
     var joined = leaves.filter(function (t) { return t !== series; }).join(" | ");
@@ -355,7 +502,47 @@
       episode = combined.episode;
       if (season == null) season = combined.season;
     }
+    // A single leaf like "Friends S2:E2 The One with the Breast Milk".
+    if (episode == null && leaves.length === 1) {
+      var single = parseSE(leaves[0]);
+      if (single) {
+        series = clean(leaves[0].split(SE_PATTERNS[0])[0] || "").replace(/[\s:,\-|·]+$/, "") || series;
+        season = single.season;
+        episode = single.episode;
+        epTitle = single.rest;
+      }
+    }
+    if (!series) return null;
     return { title: series, seasonNumber: season, episodeNumber: episode, episodeTitle: epTitle };
+  }
+
+  /** Last good overlay read per video id: the overlay disappears with the player controls. */
+  var nfxDomCache = {};
+
+  /** Fills the gaps in `into` from `from` (never overwrites what an earlier source knew). */
+  function mergeDetected(into, from) {
+    if (!from) return into;
+    if (!into) into = { title: null, seasonNumber: null, episodeNumber: null, episodeTitle: null };
+    if (!into.title && from.title) into.title = from.title;
+    if (into.episodeNumber == null && from.episodeNumber != null) {
+      into.episodeNumber = from.episodeNumber;
+      if (from.seasonNumber != null) into.seasonNumber = from.seasonNumber;
+    }
+    if (into.seasonNumber == null && from.seasonNumber != null) into.seasonNumber = from.seasonNumber;
+    if (!into.episodeTitle && from.episodeTitle) into.episodeTitle = from.episodeTitle;
+    return into;
+  }
+
+  function netflixMediaSessionHint() {
+    try {
+      var md = navigator.mediaSession && navigator.mediaSession.metadata;
+      if (!md || !md.title) return null;
+      var p = parseSE(md.title) || parseSE(md.album || "") || parseSE(md.artist || "");
+      if (!p) return null;
+      return { title: clean(md.artist || md.album) || null, seasonNumber: p.season, episodeNumber: p.episode, episodeTitle: p.rest };
+    } catch (_) {
+      return null;
+    }
   }
 
   // -------------------------------------------------------------------------------------------
@@ -365,17 +552,25 @@
     netflix: function () {
       var id = matchUrl(/\/watch\/(\d+)/);
       if (!id) return null;
-      var r = netflixFromPlayerState(id);
-      if (!r || r.episodeNumber == null) {
-        if (netflixMeta.id === id && netflixMeta.value) r = netflixMeta.value;
-        else refreshNetflixMetadata(id);
-      }
-      if (!r || (r.episodeNumber == null && !r.title)) r = netflixFromDom() || r;
+      if (!NFX_VIDEOS[id]) netflixFromPlayerState();
+
+      // 1. Netflix's own metadata for this exact video id (captured, store, or fetched).
+      var r = mergeDetected(null, NFX_VIDEOS[id] || null);
+      // 2. The on-screen title overlay, live or the last read for this id.
+      var dom = netflixFromDom();
+      if (dom) nfxDomCache[id] = mergeDetected(nfxDomCache[id] || null, dom);
+      r = mergeDetected(r, dom);
+      r = mergeDetected(r, nfxDomCache[id] || null);
+      // 3. The OS media session (Netflix sets it on some builds).
+      r = mergeDetected(r, netflixMediaSessionHint());
+      // Still missing the episode: ask Netflix's metadata endpoint for this id.
+      if (!r || r.episodeNumber == null) refreshNetflixMetadata(id);
       if (!r || !r.title) return null;
       return {
         title: r.title,
         seasonNumber: r.seasonNumber,
         episodeNumber: r.episodeNumber,
+        // With only an episode name, Rust places it by name in TMDB's season data.
         episodeTitle: r.episodeTitle,
         ottTitleId: id,
         confidence: "high",
@@ -1006,7 +1201,10 @@
     return {
       title: isTv ? series || nfxText(v.title) : nfxText(v.title) || nfxText(v.videoTitle),
       isTv: isTv,
-      seasonNumber: isTv ? (seasonMatch ? parseInt(seasonMatch[0], 10) : 1) : null,
+      // "Part Three" / "Volume II" / "Limited Series" have no digits: Rust parses the raw label
+      // and, failing that, places the episode by its name across the whole series.
+      seasonNumber: isTv && seasonMatch ? parseInt(seasonMatch[0], 10) : null,
+      seasonLabel: isTv ? nfxText(v.seasonDescriptor) || null : null,
       episodeNumber: null,
       episodeTitle: nfxText(v.episodeTitle),
       progressRatio: null,
@@ -1366,6 +1564,7 @@
 
   // Capture must be live before Netflix's own scripts issue their first request.
   if (CONFIG.mode === "import" && CONFIG.scraper === "netflix_history") installNetflixCapture();
+  if (CONFIG.mode === "play" && IS_NETFLIX) installNetflixPlayerTap();
 
   // -------------------------------------------------------------------------------------------
   // Boot
