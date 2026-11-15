@@ -58,6 +58,8 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 - Sign-in is detected automatically on every service. Once you've signed in (and picked your profile, where the service has profiles), the account is linked and the import starts.
 - Titles are matched to TMDB strictly. When several titles share a name (*The Traitors* US vs India), Omnia picks the one that service actually carries in your region.
 - **Imported history is silent.** It shapes your recommendations and Watch History, but stays off *Continue Watching* until you play the title in Omnia.
+- **Background sync for your other devices.** On startup and whenever Omnia comes back from the tray, every linked account is quietly checked in a hidden window. Only activity since the last sync is read (Netflix stops at the first older entry). New viewing, like an episode you watched on your phone, lands in Watch History and Continue Watching. Connect Accounts shows when each account last synced; turn it off in **Settings → Privacy & Playback**.
+- **Real watch dates** where the service shows them: Netflix's activity dates, Prime Video's day headings, and dates in other services' app data ("Watched on 14 Nov", "Yesterday", "3 days ago"…). Entries without a date keep the service's own order.
 - **Clear by provider.** Delete only one service's history (say, someone else's Prime Video imported by mistake) and keep everything else.
 - Or drop in Netflix's **"Download viewing activity" CSV**, or an Omnia JSON backup.
 
@@ -176,13 +178,13 @@ The installer is written to `src-tauri/target/release/bundle/`.
 │  │ TMDB client            │◄──────────┤ + injected telemetry  │  │
 │  │ Liquid Glass UI        │           │   observer + pill     │  │
 │  └──────────┬─────────────┘           └──────────┬────────────┘  │
-│             │ typed IPC (75 commands)            │ 5 token-gated │
+│             │ typed IPC (76 commands)            │ 5 token-gated │
 │  ┌──────────▼────────────────────────────────────▼────────────┐  │
 │  │ Rust backend                                               │  │
 │  │  db/        SQLite (rusqlite, WAL)                         │  │
 │  │  resolver/  JustWatch deep links + 7-day cache             │  │
 │  │  player/    window manager, profile attribution, hotkeys   │  │
-│  │  sync/      in-page history importer, airing-show checks   │  │
+│  │  sync/      importer, background delta sync, airing shows  │  │
 │  │  ml/        ONNX embeddings, affinity, centroids, MMR      │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
@@ -226,7 +228,7 @@ The embedding model is `all-MiniLM-L6-v2` (uint8-quantised), with a built-in tok
 | Logs | `%LOCALAPPDATA%\app.omnia.hub\logs\` |
 | Per-profile browser data (service sign-ins) | `%LOCALAPPDATA%\app.omnia.hub\Profiles\<profile id>\` |
 
-Schema: 17 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subscribed_providers`, `media_catalog`, `deep_links`, `watch_history`, `playback_events`, `media_embeddings`, `custom_hubs`, `watchlist`, `preferred_providers`, `continue_watching_hidden`, `favorites`, `collections`, `collection_items`, `airing_checks`). They're created by `src-tauri/src/db/schema.sql` and the numbered migrations in `src-tauri/src/db/migrations/`, which run automatically on startup.
+Schema: 18 tables (`ott_sync_state`, `app_profiles`, `ott_profile_mappings`, `app_settings`, `subscribed_providers`, `media_catalog`, `deep_links`, `watch_history`, `playback_events`, `media_embeddings`, `custom_hubs`, `watchlist`, `preferred_providers`, `continue_watching_hidden`, `favorites`, `collections`, `collection_items`, `airing_checks`). They're created by `src-tauri/src/db/schema.sql` and the numbered migrations in `src-tauri/src/db/migrations/`, which run automatically on startup.
 
 ---
 
@@ -257,7 +259,7 @@ Schema: 17 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subs
         ├── db/                   connection, migrations, queries
         ├── resolver/justwatch.rs deep-link resolver
         ├── player/               window_manager.rs, telemetry_injector.js
-        ├── sync/                 history_importer.rs, airing.rs
+        ├── sync/                 history_importer.rs, background.rs, airing.rs
         └── ml/                   embeddings.rs, recommender.rs
 ```
 

@@ -306,6 +306,8 @@ CREATE TABLE IF NOT EXISTS continue_watching_hidden (
 
 Migration v5 also adds (all isolated by profile, `ON DELETE CASCADE`): `favorites (app_profile_id, tmdb_id, media_type, added_at)` — "Love", a +3.0 recommender weight; `collections (collection_id, app_profile_id, name UNIQUE per profile NOCASE, created_at, updated_at)` and `collection_items (collection_id, tmdb_id, media_type, added_at)` — custom lists; `airing_checks (app_profile_id, tmdb_id, checked_at, new_season, new_episode, new_air_date)` — a caught-up airing series with a newly aired episode returns to Continue Watching (re-checked at most every 12 h).
 
+Migration v6 adds `ott_sync_state (app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows)` (isolated by profile): the headless background delta sync (on startup and tray wake) reads only provider activity newer than `last_success_at` (48 h overlap); fresh activity is stored live (`is_imported = 0`) so viewing on other devices reaches Continue Watching.
+
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 
 ---

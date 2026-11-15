@@ -209,6 +209,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
           imports: { ...s.imports, [importKey(e.appProfileId, e.providerName)]: { providerName: e.providerName, stage: e.stage, done: e.done, total: e.total } },
         })),
       ),
+      events.onBackgroundSync((e) => {
+        if (e.appProfileId !== app().activeProfile?.profileId) return;
+        void app().refreshContinueWatching();
+        app().markRecsStale();
+        app().toast({ kind: "info", title: `Synced from ${e.providerName}`, body: `${e.updated} new ${e.updated === 1 ? "entry" : "entries"} from your other devices.` });
+      }),
       events.onHistoryImportFinished((e) => {
         if (e.ok) {
           const r = e.report;

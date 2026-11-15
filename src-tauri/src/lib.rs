@@ -12,6 +12,7 @@ pub mod player {
 
 pub mod sync {
     pub mod airing;
+    pub mod background;
     pub mod history_importer;
 }
 
@@ -823,6 +824,19 @@ async fn get_title_collections(state: State<'_, AppState>, app_profile_id: i64, 
         .await
 }
 
+/// "Sync now" in Connect Accounts: a delta sync of every linked account of the profile, now.
+/// `None` when a background sync is already running.
+#[tauri::command]
+async fn sync_accounts_now(app: tauri::AppHandle, app_profile_id: i64) -> AppResult<Option<usize>> {
+    sync::background::sync_now(&app, app_profile_id).await
+}
+
+/// Per-account background sync status for Connect Accounts.
+#[tauri::command]
+async fn get_sync_states(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<Vec<queries::OttSyncState>> {
+    state.db.run(move |c| queries::list_sync_states(c, app_profile_id)).await
+}
+
 /// Home load: brings caught-up airing series with a new episode back to Continue Watching.
 #[tauri::command]
 async fn check_airing_shows(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<usize> {
@@ -1069,13 +1083,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            TRAY_OPEN => window_manager::focus_main_window(app),
+            TRAY_OPEN => wake_main_window(app),
             TRAY_QUIT => quit_app(app.clone()),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                window_manager::focus_main_window(tray.app_handle());
+                wake_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -1085,6 +1099,12 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 /// Real exit (tray "Quit"): flush the open player's final position to SQLite first, then exit.
 /// The window-state plugin saves the main window's size / position on exit.
 #[cfg(desktop)]
+/// Back from the tray (or a second launch): show the hub and catch up on other devices' viewing.
+fn wake_main_window(app: &tauri::AppHandle) {
+    window_manager::focus_main_window(app);
+    sync::background::on_wake(app);
+}
+
 fn quit_app(app: tauri::AppHandle) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -1116,7 +1136,7 @@ pub fn run() {
     // the tray) focuses the running hub instead of opening the database twice.
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        window_manager::focus_main_window(app);
+        wake_main_window(app);
     }));
 
     let builder = builder.plugin(
@@ -1133,9 +1153,14 @@ pub fn run() {
         // recommender cache and isolated WebView2 sessions warm. "Quit Omnia" in the tray exits.
         .on_window_event(|window, event| {
             if window.label() == window_manager::MAIN_LABEL {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    // Coming back to Omnia (alt-tab, click): catch up (debounced, throttled).
+                    tauri::WindowEvent::Focused(true) => sync::background::on_wake(window.app_handle()),
+                    _ => {}
                 }
             }
         });
@@ -1155,6 +1180,9 @@ pub fn run() {
                 .build()?;
 
             let resolver = JustWatchResolver::new(http.clone());
+
+            // Cross-device viewing: a quiet delta sync of every linked account shortly after start.
+            sync::background::spawn_after(app.handle().clone(), sync::background::STARTUP_DELAY);
 
             // Startup maintenance: canonicalise OTT links, drop stale deep links and apply the
             // early-abandonment rule.
@@ -1285,6 +1313,8 @@ pub fn run() {
             get_title_collections,
             check_airing_shows,
             fetch_avatar_image,
+            get_sync_states,
+            sync_accounts_now,
             identify_title,
             import_watch_history,
             export_watch_history,

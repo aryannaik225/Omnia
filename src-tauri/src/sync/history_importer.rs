@@ -70,6 +70,8 @@ struct PendingScrape {
     tx: oneshot::Sender<ScrapePayload>,
     app_profile_id: i64,
     provider_name: String,
+    /// Background delta sync: no progress in the UI.
+    quiet: bool,
 }
 
 #[derive(Default)]
@@ -171,6 +173,8 @@ pub struct ImportReport {
     pub fetched: usize,
     /// watch_history rows written (after merging repeat viewings).
     pub imported: usize,
+    /// Rows that are new or whose date / progress / completion actually changed.
+    pub changed: usize,
     pub matched_titles: usize,
     /// Titles TMDB couldn't identify (first 50).
     pub unmatched_titles: Vec<String>,
@@ -186,6 +190,9 @@ struct RawItem {
     episode: Option<i64>,
     episode_title: Option<String>,
     watched_at: Option<DateTime<Utc>>,
+    /// Undated entries: a placeholder that keeps the service's order. Only used when the row is
+    /// first created; it never overwrites a stored date.
+    order_hint: Option<DateTime<Utc>>,
     /// Whether `watched_at` carries a real time of day (for time-of-day buckets).
     has_time_of_day: bool,
     progress_seconds: Option<f64>,
@@ -209,10 +216,20 @@ fn emit_progress(app: &AppHandle, app_profile_id: i64, provider_name: &str, stag
     );
 }
 
+/// Full lifetime import, or a background delta that only reads activity newer than `since`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImportMode {
+    Full,
+    Delta { since: DateTime<Utc> },
+}
+
+/// Overlap re-read on each delta sync: provider dates are often day-precision only.
+const DELTA_OVERLAP_HOURS: i64 = 48;
+
 /// Fire-and-forget import (used right after the profile handshake). Emits `EVT_IMPORT_FINISHED`.
 pub fn spawn_import(app: AppHandle, app_profile_id: i64, provider_id: i64, provider_name: String) {
     tauri::async_runtime::spawn(async move {
-        let result = import_ott_history_inner(&app, app_profile_id, provider_id, &provider_name).await;
+        let result = import_ott_history_inner(&app, app_profile_id, provider_id, &provider_name, ImportMode::Full).await;
         let body = match result {
             Ok(report) => json!({ "ok": true, "report": report }),
             Err(e) => {
@@ -224,16 +241,40 @@ pub fn spawn_import(app: AppHandle, app_profile_id: i64, provider_id: i64, provi
     });
 }
 
-async fn import_ott_history_inner(
+pub(crate) async fn import_ott_history_inner(
     app: &AppHandle,
     app_profile_id: i64,
     provider_id: i64,
     provider_name: &str,
+    mode: ImportMode,
 ) -> AppResult<ImportReport> {
     let state = app.state::<AppState>();
     // Links are stored per provider family ("Prime Video with Ads" == "Prime Video").
     let provider_id = canonical_provider_id(provider_id, provider_name);
     let _guard = RunGuard::acquire(&state.importer, (app_profile_id, provider_id))?;
+    // Reading starts now: the next delta continues from here.
+    let started_at = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let result = import_locked(app, app_profile_id, provider_id, provider_name, mode).await;
+    let outcome = match &result {
+        Ok(report) => Ok(report.changed),
+        Err(e) => Err(e.to_string()),
+    };
+    let st = started_at.clone();
+    let _ = state
+        .db
+        .run(move |c| queries::record_sync_result(c, app_profile_id, provider_id, &st, outcome.as_ref().map(|n| *n).map_err(String::as_str)))
+        .await;
+    result
+}
+
+async fn import_locked(
+    app: &AppHandle,
+    app_profile_id: i64,
+    provider_id: i64,
+    provider_name: &str,
+    mode: ImportMode,
+) -> AppResult<ImportReport> {
+    let state = app.state::<AppState>();
 
     let mapping = state
         .db
@@ -247,22 +288,31 @@ async fn import_ott_history_inner(
         .await?
         .unwrap_or_else(|| "US".into());
 
-    emit_progress(app, app_profile_id, provider_name, "fetching", 0, 0);
+    let delta = matches!(mode, ImportMode::Delta { .. });
+    if !delta {
+        emit_progress(app, app_profile_id, provider_name, "fetching", 0, 0);
+    }
+    // Delta: the provider pages stop at entries older than this (with an overlap for day-only dates).
+    let since_ms = match mode {
+        ImportMode::Delta { since } => Some((since - chrono::Duration::hours(DELTA_OVERLAP_HOURS)).timestamp_millis()),
+        ImportMode::Full => None,
+    };
     let provider = OttProvider::detect(provider_id, provider_name);
     let raw = match provider {
-        OttProvider::Netflix => scrape_netflix_in_page(app, &mapping, provider_name).await?,
+        OttProvider::Netflix => scrape_netflix_in_page(app, &mapping, provider_name, since_ms).await?,
         OttProvider::Generic => {
             return Err(msg(format!(
                 "Automatic import isn't available for {provider_name}. Use a CSV/JSON file import instead."
             )))
         }
-        other => scrape_provider_history(app, other, provider_name, &mapping, &region).await?,
+        other => scrape_provider_history(app, other, provider_name, &mapping, &region, since_ms).await?,
     };
+    let raw = prepare_raw(raw, mode);
 
     // Netflix's own titles are unambiguous enough (and its imports large); other services get
     // the regional-availability tie-break.
     let availability = (provider != OttProvider::Netflix).then(|| Availability { region: region.clone(), provider_id });
-    resolve_and_store(app, &state.db, &tmdb, app_profile_id, provider_name, Some(mapping.ott_native_profile_id), raw, availability).await
+    resolve_and_store(app, &state.db, &tmdb, app_profile_id, provider_name, Some(mapping.ott_native_profile_id), raw, availability, delta).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -277,7 +327,7 @@ pub async fn import_ott_history(
     provider_id: i64,
     provider_name: String,
 ) -> AppResult<ImportReport> {
-    let report = import_ott_history_inner(&app, app_profile_id, provider_id, &provider_name).await?;
+    let report = import_ott_history_inner(&app, app_profile_id, provider_id, &provider_name, ImportMode::Full).await?;
     let _ = app.emit_to(wm::MAIN_LABEL, EVT_IMPORT_FINISHED, json!({ "ok": true, "report": report }));
     Ok(report)
 }
@@ -314,6 +364,7 @@ pub async fn import_history_file(
             provider_name: provider_name.unwrap_or_else(|| "Omnia backup".into()),
             fetched: count,
             imported: count,
+            changed: count,
             matched_titles: count,
             ..Default::default()
         };
@@ -324,7 +375,7 @@ pub async fn import_history_file(
     let provider_name = provider_name.unwrap_or_else(|| "Netflix".into());
     let raw = parse_viewing_activity_csv(text)?;
     let tmdb = TmdbClient::from_settings(&state).await?;
-    let report = resolve_and_store(&app, &state.db, &tmdb, app_profile_id, &provider_name, None, raw, None).await?;
+    let report = resolve_and_store(&app, &state.db, &tmdb, app_profile_id, &provider_name, None, raw, None, false).await?;
     let _ = app.emit_to(wm::MAIN_LABEL, EVT_IMPORT_FINISHED, json!({ "ok": true, "report": report }));
     Ok(report)
 }
@@ -347,11 +398,14 @@ pub fn report_scrape_progress(window: WebviewWindow, app: AppHandle, state: Stat
     let target = {
         let map = state.importer.pending();
         match map.get(window.label()) {
-            Some(p) if wm::tokens_equal(&p.token, &payload.token) => Some((p.app_profile_id, p.provider_name.clone())),
+            Some(p) if wm::tokens_equal(&p.token, &payload.token) => Some((p.app_profile_id, p.provider_name.clone(), p.quiet)),
             _ => None,
         }
     };
-    let (app_profile_id, provider_name) = target.ok_or_else(|| msg("unauthorized importer session"))?;
+    let (app_profile_id, provider_name, quiet) = target.ok_or_else(|| msg("unauthorized importer session"))?;
+    if quiet {
+        return Ok(());
+    }
     let total = payload.total.unwrap_or(0).max(payload.fetched);
     emit_progress(&app, app_profile_id, &provider_name, "fetching", payload.fetched, if payload.total.is_some() { total } else { 0 });
     Ok(())
@@ -392,7 +446,7 @@ fn netflix_identity_matches(mapped: &str, guid: &str, name: Option<&str>) -> boo
 /// Rust HTTP client, and session cookies never leave WebView2. The window starts on the profile
 /// switch URL; the injected script calls the Shakti API in-page and, if that is refused, reads
 /// the viewing-activity page (captured app requests, embedded state, then hydrated rows).
-async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, provider_name: &str) -> AppResult<Vec<RawItem>> {
+async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, provider_name: &str, since_ms: Option<i64>) -> AppResult<Vec<RawItem>> {
     let start = OttProvider::Netflix
         .profile_switch_url(&mapping.ott_native_profile_id)
         .unwrap_or_else(|| "https://www.netflix.com/browse".to_string());
@@ -404,7 +458,9 @@ async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, pr
         &start,
         "netflix_history",
         Some(&mapping.ott_native_profile_id),
-        NETFLIX_SCRAPE_TIMEOUT,
+        mapping.ott_native_profile_name.as_deref(),
+        if since_ms.is_some() { SCRAPE_TIMEOUT * 2 } else { NETFLIX_SCRAPE_TIMEOUT },
+        since_ms,
     )
     .await?;
     // Netflix exposes the active profile reliably, so verification is mandatory here.
@@ -446,7 +502,9 @@ async fn scrape_with_hidden_window(
     url: &str,
     scraper: &str,
     expected_profile: Option<&str>,
+    expected_name: Option<&str>,
     timeout: Duration,
+    since_ms: Option<i64>,
 ) -> AppResult<ScrapePayload> {
     let state = app.state::<AppState>();
     let parsed = tauri::Url::parse(url).map_err(|e| msg(e.to_string()))?;
@@ -455,7 +513,7 @@ async fn scrape_with_hidden_window(
     let (tx, rx) = oneshot::channel();
     state.importer.pending().insert(
         label.clone(),
-        PendingScrape { token: token.clone(), tx, app_profile_id, provider_name: provider_name.to_string() },
+        PendingScrape { token: token.clone(), tx, app_profile_id, provider_name: provider_name.to_string(), quiet: since_ms.is_some() },
     );
 
     let config = json!({
@@ -469,8 +527,12 @@ async fn scrape_with_hidden_window(
         "syncIntervalMs": 3000,
         "scraper": scraper,
         "expectedOttProfileId": expected_profile,
+        // Account-level links remember the profile picked on "Who's watching?" by name.
+        "expectedOttProfileName": expected_name,
         // Leave headroom so the script reports what it has before Rust gives up.
         "scrapeTimeoutMs": timeout.saturating_sub(Duration::from_secs(20)).as_millis() as u64,
+        // Delta sync: stop reading at activity older than this (epoch ms).
+        "sinceMs": since_ms,
     });
     let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false, app_profile_id) {
         Ok(w) => w,
@@ -532,6 +594,7 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
                 episode,
                 episode_title,
                 watched_at: i.watched_at.as_deref().and_then(parse_loose_date),
+                order_hint: None,
                 has_time_of_day: false,
                 progress_seconds: if has_seconds { i.progress_seconds } else { None },
                 duration_seconds: if has_seconds { i.duration_seconds } else { None },
@@ -541,6 +604,39 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
             }
         })
         .collect()
+}
+
+/// Mode-specific clean-up before matching.
+///
+/// * Delta: entries dated before the window (minus the overlap) are dropped; undated entries
+///   (Continue Watching tiles) are kept: the store only treats them as new when progress moved.
+/// * Full import: undated entries get an order hint (just below the entry above them) that is
+///   only used when their row is created, so the history keeps the provider's order and a
+///   re-import never overwrites a stored date.
+fn prepare_raw(mut raw: Vec<RawItem>, mode: ImportMode) -> Vec<RawItem> {
+    match mode {
+        ImportMode::Delta { since } => {
+            let cutoff = since - chrono::Duration::hours(DELTA_OVERLAP_HOURS);
+            raw.retain(|i| i.watched_at.is_none_or(|d| d >= cutoff));
+        }
+        ImportMode::Full => {
+            // Sources list activity newest first. An undated entry sits just below the entry
+            // above it (a second older), or, at the top of the list, just below "now".
+            let mut above: Option<DateTime<Utc>> = None;
+            let now = Utc::now();
+            for item in &mut raw {
+                match item.watched_at {
+                    Some(d) => above = Some(d),
+                    None => {
+                        let d = above.unwrap_or(now) - chrono::Duration::seconds(1);
+                        item.order_hint = Some(d);
+                        above = Some(d);
+                    }
+                }
+            }
+        }
+    }
+    raw
 }
 
 /// `https://www.netflix.com/watch/<id>` for a numeric Netflix video id. Opening it starts that
@@ -556,6 +652,7 @@ async fn scrape_provider_history(
     provider_name: &str,
     mapping: &OttProfileMapping,
     region: &str,
+    since_ms: Option<i64>,
 ) -> AppResult<Vec<RawItem>> {
     let (urls, scraper, history_page) = match provider {
         OttProvider::PrimeVideo => (vec!["https://www.primevideo.com/settings/watch-history/".to_string()], "primevideo_history", true),
@@ -572,7 +669,7 @@ async fn scrape_provider_history(
     };
     let mut payload = None;
     for url in &urls {
-        let p = scrape_with_hidden_window(app, mapping.app_profile_id, provider, provider_name, url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
+        let p = scrape_with_hidden_window(app, mapping.app_profile_id, provider, provider_name, url, scraper, Some(&mapping.ott_native_profile_id), mapping.ott_native_profile_name.as_deref(), SCRAPE_TIMEOUT, since_ms).await?;
         if let Some(notes) = p.notes.as_deref() {
             log::info!("{provider_name} history read: {} entries ({notes})", p.items.len());
         }
@@ -595,6 +692,9 @@ async fn scrape_provider_history(
     .map_err(msg)?;
 
     if payload.items.is_empty() {
+        if since_ms.is_some() && payload.ott_profile.is_some() {
+            return Ok(Vec::new()); // signed in, nothing new since the last sync
+        }
         return Err(msg(payload.error.unwrap_or_else(|| format!("No {provider_name} history was found."))));
     }
     Ok(scraped_to_raw(payload.items, history_page, false))
@@ -956,8 +1056,10 @@ fn parse_omnia_json(text: &str, app_profile_id: i64) -> AppResult<Vec<HistoryImp
                 duration_seconds: o["durationSeconds"].as_f64().unwrap_or(0.0),
                 is_completed: o["isCompleted"].as_bool().unwrap_or(false),
                 watched_at: o["lastWatchedAt"].as_str().or_else(|| o["watchedAt"].as_str()).map(str::to_string),
+                fallback_watched_at: None,
                 time_of_day_bucket: o["timeOfDayBucket"].as_str().map(str::to_string),
                 watch_count: o["watchCount"].as_i64(),
+                live: false,
             })
         })
         .collect();
@@ -1633,6 +1735,7 @@ async fn resolve_and_store(
     ott_profile_id: Option<String>,
     raw: Vec<RawItem>,
     availability: Option<Availability>,
+    delta: bool,
 ) -> AppResult<ImportReport> {
     let fetched = raw.len();
     let mut report = ImportReport {
@@ -1690,7 +1793,7 @@ async fn resolve_and_store(
             Err(e) => log::debug!("TMDB lookup failed: {e}"),
         }
         done += 1;
-        if done % 10 == 0 || done == total {
+        if !delta && (done % 10 == 0 || done == total) {
             emit_progress(app, app_profile_id, provider_name, "matching", done, total);
         }
     }
@@ -1862,8 +1965,10 @@ async fn resolve_and_store(
             duration_seconds: duration,
             is_completed: completed,
             watched_at: watched_at.clone(),
+            fallback_watched_at: item.order_hint.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()),
             time_of_day_bucket: bucket,
             watch_count: None,
+            live: delta,
         };
         let key = (m.tmdb_id, m.media_type.clone(), season, episode);
         let day = watched_at.as_deref().map(|w| w[..10.min(w.len())].to_string()).unwrap_or_default();
@@ -1918,16 +2023,20 @@ async fn resolve_and_store(
         .filter_map(|gi| matches[*gi].as_ref().and_then(|m| m.catalog.clone()))
         .collect();
 
-    emit_progress(app, app_profile_id, provider_name, "saving", rows.len(), rows.len());
+    if !delta {
+        emit_progress(app, app_profile_id, provider_name, "saving", rows.len(), rows.len());
+    }
     let imported = rows.len();
-    db.run(move |c| {
-        queries::upsert_media_batch(c, &catalog)?;
-        queries::upsert_imported_history(c, &rows)
-    })
-    .await?;
+    let changed = db
+        .run(move |c| {
+            queries::upsert_media_batch(c, &catalog)?;
+            queries::upsert_imported_history_tracked(c, &rows).map(|(_, changed)| changed)
+        })
+        .await?;
 
     app.state::<AppState>().recommender.invalidate(app_profile_id);
     report.imported = imported;
+    report.changed = changed;
     report.matched_titles = matched_groups.len();
     report.unmatched_titles = unmatched;
     Ok(report)
@@ -1949,6 +2058,21 @@ mod tests {
             episode,
             episode_title: title.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn undated_entries_keep_the_service_order_without_inventing_dates() {
+        let at = |d: &str| Some(DateTime::parse_from_rfc3339(d).unwrap().with_timezone(&Utc));
+        let item = |w: Option<DateTime<Utc>>| RawItem { title: "x".into(), watched_at: w, ..Default::default() };
+        let out = prepare_raw(vec![item(None), item(None), item(at("2025-11-10T12:00:00Z")), item(None)], ImportMode::Full);
+        // No real date is invented: undated entries only get an insert-time order hint.
+        assert!(out.iter().filter(|i| i.order_hint.is_some()).all(|i| i.watched_at.is_none()));
+        assert!(out[0].order_hint > out[1].order_hint);
+        assert_eq!(out[3].order_hint, at("2025-11-10T11:59:59Z"));
+        // Delta: entries older than the window are dropped, undated tiles are kept.
+        let since = at("2025-11-12T00:00:00Z").unwrap();
+        let kept = prepare_raw(vec![item(at("2025-11-01T12:00:00Z")), item(at("2025-11-11T12:00:00Z")), item(None)], ImportMode::Delta { since });
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

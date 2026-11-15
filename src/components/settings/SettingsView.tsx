@@ -8,7 +8,7 @@ import { flag, regionName } from "../../lib/format";
 import { groupByFamily, providerFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
 import { envTmdbKey, img, regionProviders } from "../../services/tmdbClient";
-import { recommendations, type Affinity, type SubscribedProvider } from "../../services/tauriBridge";
+import { BACKGROUND_SYNC_SETTING, recommendations, settings as settingsApi, type Affinity, type SubscribedProvider } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { Avatar, AvatarPicker, defaultAvatarFor } from "../common/Avatar";
@@ -288,6 +288,29 @@ function RecommendationsSection() {
   );
 }
 
+function BackgroundSyncToggle() {
+  const toast = useAppStore((s) => s.toast);
+  const [on, setOn] = useState<boolean | null>(null);
+  useEffect(() => {
+    settingsApi.get(BACKGROUND_SYNC_SETTING).then((v) => setOn(v !== "false")).catch(() => setOn(true));
+  }, []);
+  if (on === null) return null;
+  return (
+    <Toggle
+      on={on}
+      onChange={(v) => {
+        setOn(v);
+        settingsApi.set(BACKGROUND_SYNC_SETTING, String(v)).catch((e) => {
+          setOn(!v);
+          toast({ kind: "error", title: "Couldn't save the setting", body: String(e) });
+        });
+      }}
+      label="Sync other devices in the background"
+      hint="On startup and when Omnia comes back from the tray, linked accounts are quietly checked for new viewing (on your phone, TV…) in a hidden window. Only activity since the last sync is read."
+    />
+  );
+}
+
 function PrivacySection() {
   const trailerAutoplay = useAppStore((s) => s.trailerAutoplay);
   const setTrailerAutoplay = useAppStore((s) => s.setTrailerAutoplay);
@@ -301,6 +324,7 @@ function PrivacySection() {
     <Section title="Privacy & Playback">
       <Toggle on={trailerAutoplay} onChange={(v) => void setTrailerAutoplay(v)} label="Trailer previews" hint="Muted trailers start after hovering the hero for 2 seconds (loaded from youtube-nocookie.com)" />
       <Toggle on={kidsSafeMode} onChange={(v) => void setKidsSafeMode(v)} label="Kids & Family Safe Mode" hint="Apply family-safe filtering to every profile on this device" />
+      <BackgroundSyncToggle />
       <div className="mt-4 rounded-card bg-white/[0.04] px-4 py-3 text-[13px] text-label-secondary">
         <p className="font-medium text-label-primary">Back to Hub hotkeys</p>
         <p className="mt-1">

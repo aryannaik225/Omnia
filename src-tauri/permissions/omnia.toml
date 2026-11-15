@@ -63,6 +63,8 @@ permissions = [
   "allow-get-title-collections",
   "allow-check-airing-shows",
   "allow-fetch-avatar-image",
+  "allow-get-sync-states",
+  "allow-sync-accounts-now",
   "allow-identify-title",
   "allow-unhide-from-continue-watching",
   "allow-open-player",

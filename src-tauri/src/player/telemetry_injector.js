@@ -254,6 +254,41 @@
       document.querySelectorAll('[class*="profile" i] img, [data-testid*="profile" i], [aria-label*="profile" i]').length > 1;
   }
 
+  /** Profile tiles on a generic "Who's watching?" page: [{ el, name }] (no add / edit tiles). */
+  function gateTiles() {
+    var out = [];
+    var seen = [];
+    Array.prototype.forEach.call(document.querySelectorAll('button,a,[role=button],[role=link],[tabindex],li'), function (el) {
+      if (!isVisible(el) || !el.querySelector("img,svg,[class*='avatar' i]")) return;
+      var img = el.querySelector("img[alt]");
+      var name = clean(el.getAttribute("aria-label") || el.innerText || (img && img.getAttribute("alt")) || "");
+      if (!name || name.length > 30 || /^(add|edit|manage|done|cancel|back|sign ?out|log ?out|help)\b/i.test(name)) return;
+      // Keep the innermost clickable of nested matches.
+      for (var i = 0; i < seen.length; i++) if (seen[i].contains(el) || el.contains(seen[i])) {
+        if (seen[i].contains(el)) { out[i] = { el: el, name: name }; seen[i] = el; }
+        return;
+      }
+      seen.push(el);
+      out.push({ el: el, name: name });
+    });
+    return out;
+  }
+
+  /** The profile picked on a generic gate during this window (connect mode remembers its name). */
+  var PICKED_KEY = "omnia-picked-profile";
+  function rememberGateClicks() {
+    document.addEventListener("click", function (e) {
+      if (!onGenericProfileGate()) return;
+      var tiles = gateTiles();
+      for (var i = 0; i < tiles.length; i++) {
+        if (tiles[i].el.contains(e.target)) {
+          session(PICKED_KEY, tiles[i].name);
+          return;
+        }
+      }
+    }, true);
+  }
+
   function hasStoredSession() {
     var stores = [];
     try { stores.push(window.localStorage); } catch (_) {}
@@ -278,7 +313,8 @@
     if (hasSignInCta()) return null;
     var stored = detectGenericProfile();
     if (stored) return stored;
-    if (document.querySelector(SIGNED_IN_HINTS) || hasStoredSession()) return { id: "account", name: null };
+    // Account-level link: the name of the profile picked on the gate (lets imports pick it again).
+    if (document.querySelector(SIGNED_IN_HINTS) || hasStoredSession()) return { id: "account", name: session(PICKED_KEY) || null };
     return null;
   }
 
@@ -1236,34 +1272,127 @@
         if (!label || seen[key]) return;
         seen[key] = true;
         var card = a.closest("li,article,[role=listitem]") || a;
-        var item = itemFromText(label, { progressRatio: progressWithin(card) });
+        var cardDate = null;
+        Array.prototype.some.call(card.querySelectorAll("time,span,p,div"), function (el) {
+          if (el.childElementCount) return false;
+          cardDate = watchDate(el.getAttribute("datetime") || el.textContent, null);
+          return !!cardDate;
+        });
+        var item = itemFromText(label, { progressRatio: progressWithin(card), watchedAt: cardDate });
         if (item && !GEN_TRAY_TEXT.test(item.title)) items.push(item);
       });
     });
     return items;
   }
 
+  /**
+   * A watch date as printed by a provider, as ISO (calendar dates at 12:00 UTC so no time zone
+   * moves their day), or null. Reads "Watched on 14 November 2025", "Nov 14, 2025", "14/11/25"
+   * (day/month order from `order`, see nfxDateOrder), "2025-11-14", "Today", "Yesterday",
+   * "3 days ago", "a week ago" and month-day without a year ("14 Nov": this year, or last year
+   * if that would be in the future). Future dates and years before 2000 are rejected.
+   */
+  var NFX_NUMERIC_DATE = /^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/;
+  var WATCH_PREFIX = /^(?:(?:last\s+)?(?:watched|viewed|played|seen|streamed)(?:\s+on)?|on|date)\s*[:\-\u2013]?\s*/i;
+  var MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split(" ");
+  function isoDay(y, mo, d) {
+    if (!(y > 2000 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31)) return null;
+    var t = Date.UTC(y, mo - 1, d, 12);
+    return t <= Date.now() + 864e5 ? new Date(t).toISOString() : null;
+  }
+  function localDayIso(offsetDays) {
+    var n = new Date(Date.now() - offsetDays * 864e5);
+    return isoDay(n.getFullYear(), n.getMonth() + 1, n.getDate());
+  }
+  function watchDate(text, order) {
+    var t = clean(text).replace(WATCH_PREFIX, "").replace(/[.,\s]+$/, "");
+    if (!t || t.length > 40) return null;
+    if (/^today\b/i.test(t)) return new Date().toISOString();
+    if (/^yesterday\b/i.test(t)) return localDayIso(1);
+    var rel = /^(\d+|an?|one)\s+(minute|hour|day|week|month|year)s?\s+ago$/i.exec(t);
+    if (rel) {
+      var n = /^\d+$/.test(rel[1]) ? +rel[1] : 1;
+      var unit = { minute: 6e4, hour: 36e5, day: 864e5, week: 6048e5, month: 2592e6, year: 31536e6 }[rel[2].toLowerCase()];
+      return new Date(Date.now() - n * unit).toISOString();
+    }
+    var iso = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/.exec(t);
+    if (iso) {
+      if (iso[4]) {
+        var full = new Date(t);
+        return isNaN(full.getTime()) || full.getTime() > Date.now() + 864e5 ? null : full.toISOString();
+      }
+      return isoDay(+iso[1], +iso[2], +iso[3]);
+    }
+    var num = NFX_NUMERIC_DATE.exec(t);
+    if (num) return nfxRowDate(t, order || nfxDateOrder([t]));
+    // Month names, with or without a year: "14 November 2025", "Nov 14, 2025", "14 Nov".
+    var words = /^(?:[a-z]+,?\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,})\.?,?(?:\s+(\d{4}))?$/i.exec(t) ||
+      null;
+    var wordsUs = words ? null : /^(?:[a-z]+,?\s+)?([a-z]{3,})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?(?:\s+(\d{4}))?$/i.exec(t);
+    var day, monthName, year;
+    if (words) { day = +words[1]; monthName = words[2]; year = words[3]; }
+    else if (wordsUs) { day = +wordsUs[2]; monthName = wordsUs[1]; year = wordsUs[3]; }
+    else return null;
+    var mo = MONTHS.indexOf(monthName.slice(0, 3).toLowerCase()) + 1;
+    if (!mo) return null;
+    var now = new Date();
+    var y = year ? +year : now.getFullYear();
+    var out = isoDay(y, mo, day);
+    if (!out && !year) out = isoDay(y - 1, mo, day);
+    return out;
+  }
+
   function parseDateText(t) {
-    var s = clean(t);
-    if (!s || s.length > 40 || !/\d{4}|\d{1,2}[\/.\-]\d{1,2}/.test(s)) return null;
-    var d = new Date(s);
-    return isNaN(d.getTime()) ? null : d.toISOString();
+    return watchDate(t, null);
+  }
+
+  /** Date headings / labels on a history page, in document order: [{ el, iso }]. */
+  function dateHeadings(root) {
+    var nodes = Array.prototype.filter.call((root || document).querySelectorAll("h1,h2,h3,h4,h5,h6,[role=heading],time,span,div,p,li,dt,dd"), function (el) {
+      if (el.childElementCount > 1) return false;
+      var t = clean(el.getAttribute("datetime") || el.textContent);
+      return t.length >= 4 && t.length <= 44 && /\d|today|yesterday/i.test(t);
+    });
+    var texts = nodes.map(function (el) { return clean(el.textContent).replace(WATCH_PREFIX, ""); });
+    var order = nfxDateOrder(texts);
+    var out = [];
+    nodes.forEach(function (el, i) {
+      var iso = watchDate(el.getAttribute("datetime") || texts[i], order);
+      if (!iso) return;
+      // A container and its only child can both match: keep the innermost.
+      var prev = out[out.length - 1];
+      if (prev && prev.el.contains(el)) out[out.length - 1] = { el: el, iso: iso };
+      else out.push({ el: el, iso: iso });
+    });
+    return out;
+  }
+
+  /** The last date heading that comes before `el` in the page (headings are in document order). */
+  function dateBefore(headings, el) {
+    var found = null;
+    for (var i = 0; i < headings.length; i++) {
+      var h = headings[i];
+      if (h.el === el || el.contains(h.el)) continue;
+      if (h.el.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) found = h.iso;
+      else break;
+    }
+    return found;
   }
 
   function scrapePrimeHistory() {
     var items = [];
     var seen = {};
+    var headings = dateHeadings(document);
+    PRIME.datedHeadings = headings.length;
     document.querySelectorAll('a[href*="/detail/"]').forEach(function (a) {
       var key = a.href + "|" + clean(a.textContent);
       if (seen[key]) return;
       seen[key] = true;
-      var watchedAt = null;
-      for (var el = a; el && !watchedAt && el !== document.body; el = el.parentElement) {
-        for (var sib = el.previousElementSibling; sib && !watchedAt; sib = sib.previousElementSibling) {
-          if (sib.childElementCount <= 2) watchedAt = parseDateText(sib.textContent);
-        }
-      }
-      var row = a.closest("li,article,[role=listitem]") || a.parentElement || a;
+      // A date inside the entry's own row wins; otherwise the day heading above it.
+      var rowEl = a.closest("li,article,[role=listitem]") || a.parentElement || a;
+      var own = headings.filter(function (h) { return rowEl.contains(h.el) && !a.contains(h.el); });
+      var watchedAt = own.length ? own[0].iso : dateBefore(headings, a);
+      var row = rowEl;
       var rowText = clean(row.textContent);
       var item = itemFromText(cardTitle(a), { watchedAt: watchedAt, progressRatio: progressWithin(row) });
       if (!item) return;
@@ -1277,6 +1406,8 @@
     });
     return items;
   }
+
+  var PRIME = { datedHeadings: 0 };
 
   function submitHistory(items, error, notes) {
     return invoke("submit_scraped_history", {
@@ -1300,7 +1431,7 @@
   // a tray is found by its heading ("Continue Watching", "Watch History"…) or key name, then its
   // items are read by shape (a title plus show / season / episode / progress fields).
   // -------------------------------------------------------------------------------------------
-  var GEN = { items: [], keys: {}, sources: {}, responses: 0, trays: 0, paths: {} };
+  var GEN = { items: [], keys: {}, sources: {}, responses: 0, trays: 0, paths: {}, shapes: [], undatedKeys: [], gate: null, noSignal: 0 };
   var GEN_TRAY_TEXT = /\b(continue|resume|keep) watching\b|\bwatch(ing)? history\b|\brecently watched\b|\bwatched recently\b/i;
   var GEN_TRAY_KEY = /^(continue_?watching|cw|cw_?tray|cw_?widget|watch_?history|recently_?watched|resume_?watching|keep_?watching)$/i;
   var GEN_TITLE = ["title", "name", "displayTitle", "display_title", "contentTitle", "content_title", "episodeTitle", "episodeName", "heading"];
@@ -1311,7 +1442,16 @@
   var GEN_RATIO = ["watchedRatio", "watched_ratio", "progressRatio", "progress_ratio", "completionRatio", "percentWatched", "watchedPercentage", "progressPercent", "progress_percentage", "watchProgress", "progress", "percentage"];
   var GEN_POS = ["watchedDuration", "watched_duration", "resumeAt", "resume_at", "resumePoint", "resumePosition", "bookmark", "playbackPosition", "offsetSeconds", "watchedSeconds", "position"];
   var GEN_DUR = ["duration", "contentDuration", "durationSeconds", "duration_seconds", "runtime", "totalDuration", "durationInSeconds"];
-  var GEN_DATE = ["lastWatched", "lastWatchedAt", "last_watched", "watchedAt", "watched_at", "updatedAt", "lastPlayed", "lastViewed", "timestamp"];
+  // Watch-activity dates only (never release / air dates): when it was watched or last updated.
+  var GEN_DATE = [
+    "lastWatched", "lastWatchedAt", "last_watched", "last_watched_at", "lastWatchedDate", "lastWatchedTime", "last_watched_time",
+    "watchedAt", "watched_at", "watchedOn", "watched_on", "watchedDate", "watched_date", "dateWatched", "date_watched", "watchDate",
+    "lastPlayed", "lastPlayedAt", "lastPlayedDate", "last_played", "last_played_at", "playedAt", "played_at", "playedDate",
+    "lastViewed", "lastViewedAt", "last_viewed_at", "viewedAt", "viewed_at", "viewDate",
+    "updatedAt", "updated_at", "lastUpdated", "last_updated", "modifiedAt", "modified_at", "lastModified",
+    "resumeTimestamp", "bookmarkTimestamp", "bookmarkedAt", "progressUpdatedAt", "lastActivity", "lastActivityAt", "activityTime",
+    "consumedAt", "consumptionTime", "lastConsumedAt", "timestamp", "ts",
+  ];
   var GEN_TYPE = ["contentType", "content_type", "assetType", "asset_type", "type", "entityType", "mediaType"];
   var GEN_LABEL_KEYS = ["title", "name", "header", "heading", "trayTitle", "widgetName"];
 
@@ -1338,6 +1478,9 @@
     return typeof v === "number" && isFinite(v) ? v : null;
   }
   function genDate(v) {
+    // Nested { timestamp } / { value } / { date } objects.
+    if (v && typeof v === "object" && !Array.isArray(v)) v = v.timestamp != null ? v.timestamp : v.value != null ? v.value : v.date != null ? v.date : v.epoch;
+    if (typeof v === "string" && !/^\s*\d+(\.\d+)?\s*$/.test(v) && !/^\d{4}-\d{2}-\d{2}/.test(v)) return watchDate(v, null);
     var n = genNum(v);
     if (n !== null) {
       if (n > 1e9 && n < 1e11) n *= 1000; // epoch seconds
@@ -1352,18 +1495,43 @@
     return null;
   }
 
+  var GEN_WRAPPER = /card|tile|content|item|asset|info|meta|data|widget|entity|video|show|episode|program/i;
+
+  /**
+   * The object inside an entry that carries the title: the entry itself, or a wrapper up to
+   * three levels down ({ cw_card: { data: { title } } }). Wrapper-like keys are tried first.
+   */
+  function genTitleHolder(o) {
+    var queue = [{ n: o, d: 0 }];
+    var seenKeys = 0;
+    var altHolder = null;
+    while (queue.length) {
+      var cur = queue.shift();
+      if (genStr(genPick(cur.n, GEN_TITLE)) || genStr(genPick(cur.n, GEN_SHOW))) return cur.n;
+      if (!altHolder && typeof cur.n.alt === "string" && cur.n.alt.trim()) altHolder = cur.n;
+      if (cur.d >= 3) continue;
+      var keys;
+      try { keys = Object.keys(cur.n); } catch (_) { continue; }
+      keys.sort(function (a, b) { return Number(GEN_WRAPPER.test(b)) - Number(GEN_WRAPPER.test(a)); });
+      for (var i = 0; i < keys.length && i < 40 && seenKeys < 200; i++, seenKeys++) {
+        var c = cur.n[keys[i]];
+        // Not into analytics / action / image blocks.
+        if (c && typeof c === "object" && !Array.isArray(c) && !GEN_SKIP_BLOCK.test(keys[i]) && !/action/i.test(keys[i])) queue.push({ n: c, d: cur.d + 1 });
+      }
+    }
+    return altHolder || o;
+  }
+
   /** One watched item from a tray entry, or null when it isn't shaped like one. */
   function genItem(o) {
     if (!o || typeof o !== "object" || Array.isArray(o)) return null;
     // Many apps wrap the payload: { content: {...} }, { data: {...} }, { item: {...} }.
-    var src = o;
-    for (var w = 0; w < 3; w++) {
-      if (genStr(genPick(src, GEN_TITLE))) break;
-      var inner = src.content || src.data || src.item || src.asset || src.contentInfo || src.widget || src.playable_content || src.playableContent || src.tile || null;
-      if (!inner || typeof inner !== "object" || Array.isArray(inner)) break;
-      src = inner;
-    }
+    var src = genTitleHolder(o);
     var title = genStr(genPick(src, GEN_TITLE));
+    if (!title && !genStr(genPick(src, GEN_SHOW))) {
+      var alt = genStr(genPick(src, ["alt", "accessibility_label", "a11y_label", "content_description", "ariaLabel"]));
+      if (alt && alt.length <= 120) title = alt.replace(/^(?:watch|play|resume|continue watching)\s+/i, "");
+    }
     var show = genStr(genPick(src, GEN_SHOW)) || genStr(genPick(o, GEN_SHOW));
     if (!title && !show) return null;
     if (title && (title.length > 160 || BRAND_ONLY.test(title) || GEN_TRAY_TEXT.test(title))) return null;
@@ -1371,10 +1539,13 @@
     var episode = genNum(genPick(src, GEN_EPISODE));
     var type = String(genPick(src, GEN_TYPE) || "").toLowerCase();
     var isTv = !!(show && show !== title) || episode !== null || /episode|show|series|tv/.test(type);
-    var ratio = genNum(genPick(src, GEN_RATIO));
+    var ratio = genNum(genDeepPick(src, GEN_RATIO));
+    if (ratio === null && src !== o) ratio = genNum(genDeepPick(o, GEN_RATIO));
     if (ratio !== null) ratio = ratio > 1 ? Math.min(100, ratio) / 100 : Math.max(0, ratio);
-    var pos = genNum(genPick(src, GEN_POS));
-    var dur = genNum(genPick(src, GEN_DUR));
+    var pos = genNum(genDeepPick(src, GEN_POS));
+    if (pos === null && src !== o) pos = genNum(genDeepPick(o, GEN_POS));
+    var dur = genNum(genDeepPick(src, GEN_DUR));
+    if (dur === null && src !== o) dur = genNum(genDeepPick(o, GEN_DUR));
     // Milliseconds (anything longer than a day) → seconds.
     if (dur !== null && dur > 86400) { dur /= 1000; if (pos !== null) pos /= 1000; }
     if (pos !== null && dur && ratio === null) ratio = Math.max(0, Math.min(1, pos / dur));
@@ -1399,6 +1570,11 @@
     }
     series = stripProviderSuffix(series);
     if (!series) return null;
+    var watchedAt = genDeepDate(src) || (src !== o ? genDeepDate(o) : null);
+    if (ratio === null && pos === null && !watchedAt) {
+      GEN.noSignal++;
+      return null;
+    }
     return {
       title: series,
       seasonNumber: season && season > 0 && season < 200 ? Math.round(season) : null,
@@ -1408,8 +1584,68 @@
       progressRatio: ratio,
       progressSeconds: pos !== null && dur ? pos : null,
       durationSeconds: pos !== null && dur ? dur : null,
-      watchedAt: genDate(genPick(src, GEN_DATE)) || genDate(genPick(o, GEN_DATE)),
+      watchedAt: watchedAt,
     };
+  }
+
+  var GEN_SKIP_BLOCK = /image|artwork|poster|logo|thumbnail|track|metric|analytic|instrumentation|event|template|commons|button|cta/i;
+
+  /** A field on the object, else anywhere in its blocks up to 4 levels down (cw_card.data.cw_info…). */
+  function genDeepPick(obj, keys) {
+    var found = null;
+    (function walk(n, depth) {
+      if (found !== null || !n || typeof n !== "object" || Array.isArray(n) || depth > 4) return;
+      var v = genPick(n, keys);
+      if (v !== null && typeof v !== "object") { found = v; return; }
+      var ks;
+      try { ks = Object.keys(n); } catch (_) { return; }
+      // Progress-like blocks first ("cw_info", "progress", "watch_progress").
+      ks.sort(function (a, b) { return Number(/progress|watch|resume|bookmark|cw|playback|position/i.test(b)) - Number(/progress|watch|resume|bookmark|cw|playback|position/i.test(a)); });
+      for (var i = 0; i < ks.length && i < 60 && found === null; i++) {
+        if (!GEN_SKIP_BLOCK.test(ks[i])) walk(n[ks[i]], depth + 1);
+      }
+    })(obj, 0);
+    return found;
+  }
+
+  /** A watch date on the object or one / two levels down (progress, bookmark, user-data blocks). */
+  function genDeepDate(obj) {
+    var found = null;
+    (function walk(n, depth) {
+      if (found || !n || typeof n !== "object" || depth > 4) return;
+      var d = genDate(genPick(n, GEN_DATE));
+      if (d) { found = d; return; }
+      var keys;
+      try { keys = Object.keys(n); } catch (_) { return; }
+      for (var i = 0; i < keys.length && i < 60 && !found; i++) {
+        var c = n[keys[i]];
+        // Not into lists or release / air-date metadata.
+        if (c && typeof c === "object" && !Array.isArray(c) && !/release|air|premiere|publish|expir|avail|start|end|schedule/i.test(keys[i])) walk(c, depth + 1);
+      }
+    })(obj, 0);
+    return found;
+  }
+
+  /** Field names three levels deep ("cw_card{data{title,…},…}"), never values. */
+  function genKeySketch(o, depth) {
+    var keys;
+    try { keys = Object.keys(o); } catch (_) { return ""; }
+    return keys.slice(0, depth ? 10 : 12).map(function (k) {
+      var v = o[k];
+      if (depth < 3 && v && typeof v === "object" && !Array.isArray(v)) return k + "{" + genKeySketch(v, depth + 1) + "}";
+      return Array.isArray(v) ? k + "[]" : k;
+    }).join(",");
+  }
+
+  /** Diagnostics: field *names* of an undated item (two levels), never values. */
+  function genNoteUndated(o) {
+    if (GEN.undatedKeys.length >= 3 || !o || typeof o !== "object") return;
+    var parts = Object.keys(o).slice(0, 16).map(function (k) {
+      var v = o[k];
+      return v && typeof v === "object" && !Array.isArray(v) ? k + "{" + Object.keys(v).slice(0, 10).join(",") + "}" : k;
+    });
+    var sig = parts.join(",");
+    if (GEN.undatedKeys.indexOf(sig) < 0) GEN.undatedKeys.push(sig);
   }
 
   function genAdd(item, source) {
@@ -1434,11 +1670,23 @@
         for (var i = 0; i < n.length && i < 500; i++) {
           if (n[i] && typeof n[i] === "object") objects++;
           var it = genItem(n[i]);
-          if (it) items.push(it);
+          if (it) {
+            items.push(it);
+            if (!it.watchedAt) genNoteUndated(n[i]);
+          }
         }
         if (items.length && items.length * 2 >= objects) {
           items.forEach(function (it) { if (genAdd(it, source)) added++; });
           return;
+        }
+        // Diagnostics: the *key names* of objects a tray holds when none read as items.
+        if (objects && !items.length && GEN.shapes.length < 6) {
+          var first = null;
+          for (var f = 0; f < n.length && !first; f++) if (n[f] && typeof n[f] === "object" && !Array.isArray(n[f])) first = n[f];
+          if (first) {
+            var sig = genKeySketch(first, 0);
+            if (GEN.shapes.indexOf(sig) < 0) GEN.shapes.push(sig);
+          }
         }
         for (var j = 0; j < n.length && j < 500; j++) walk(n[j], depth + 1);
         return;
@@ -1535,7 +1783,8 @@
     try {
       if (window.store && typeof window.store.getState === "function") found += genFindTrays(window.store.getState(), "page state");
     } catch (_) {}
-    document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__').forEach(function (el) {
+    // Prime Video ships page state as JSON inside <script type="text/template">.
+    document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__, script[type="text/template"]').forEach(function (el) {
       found += genConsiderText((el.textContent || "").trim(), "page state");
     });
     // Inline "window.__INITIAL_STATE__ = {…};" assignments that never became readable globals.
@@ -1617,14 +1866,20 @@
     var by = Object.keys(GEN.sources).map(function (k) { return k + " " + GEN.sources[k]; }).join(", ");
     var paths = Object.keys(GEN.paths).slice(0, 12).map(function (k) { return k + (GEN.paths[k] > 1 ? " x" + GEN.paths[k] : ""); }).join(", ");
     var headings = Array.prototype.filter.call(document.querySelectorAll("h1,h2,h3,h4,[role=heading]"), function (el) { return isVisible(el); }).length;
+    var all = GEN.items.length;
+    var dated = GEN.items.filter(function (it) { return !!it.watchedAt; }).length;
     return [
       "page: " + location.pathname.replace(/\/\d{3,}(?=\/|$)/g, "/#").slice(0, 60),
-      "state/app entries: " + GEN.items.length + (by ? " (" + by + ")" : ""),
+      "state/app entries: " + all + (by ? " (" + by + ")" : "") + (all ? ", " + dated + " dated" : ""),
+      "date headings: " + PRIME.datedHeadings + (CONFIG.sinceMs ? ", delta since " + new Date(CONFIG.sinceMs).toISOString().slice(0, 10) : ""),
+      "unread tray item shapes: " + (GEN.shapes.join(" | ").slice(0, 900) || "none"),
+      "skipped without progress/date: " + GEN.noSignal,
       "trays found: " + GEN.trays,
       "json responses: " + GEN.responses + (paths ? " (" + paths + ")" : ""),
       "rendered cards: " + domCount,
       "visible headings: " + headings + ", images: " + document.images.length,
-      "sign-in prompt: " + (hasSignInCta() ? "yes" : "no") + ", profile picker: " + (onGenericProfileGate() ? "yes" : "no"),
+      "sign-in prompt: " + (hasSignInCta() ? "yes" : "no") + ", profile picker: " + (onGenericProfileGate() ? "yes" : "no") + (GEN.gate ? " (" + GEN.gate + ")" : ""),
+      "undated item fields: " + (GEN.undatedKeys.join(" | ") || "none"),
     ];
   }
 
@@ -1632,6 +1887,29 @@
     var scraper = CONFIG.scraper === "primevideo_history" ? scrapePrimeHistory : scrapeContinueWatching;
     var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 30000);
     var lastCount = -1, stableRounds = 0, scrolls = 0;
+    // Delta sync: only the newest part of a history list is needed.
+    var maxScrolls = CONFIG.sinceMs ? 3 : 12;
+    function olderThanSince(items) {
+      return !!CONFIG.sinceMs && items.some(function (it) { return it.watchedAt && Date.parse(it.watchedAt) < CONFIG.sinceMs; });
+    }
+
+    /**
+     * "Who's watching?" in the hidden window: pick the linked profile by name, or the only one.
+     * With several profiles and no name on the link, stop: never guess someone else's profile.
+     */
+    var gateTries = 0;
+    function passGate() {
+      if (IS_NETFLIX || !onGenericProfileGate()) return "clear";
+      var tiles = gateTiles();
+      var want = String(CONFIG.expectedOttProfileName || "").toLowerCase();
+      var pick = want ? tiles.filter(function (t) { return t.name.toLowerCase() === want; })[0] : null;
+      if (!pick && !want && tiles.length === 1) pick = tiles[0];
+      GEN.gate = pick ? (want ? "picked the linked profile" : "picked the only profile") : tiles.length ? tiles.length + " profiles, none matched" : "no profile tiles";
+      if (!pick) return "stuck";
+      if (++gateTries > 3) return "stuck";
+      try { pick.el.click(); } catch (_) {}
+      return "picked";
+    }
 
     /** Page state + captured JSON first (exact numbers and progress), then rendered cards. */
     function collect() {
@@ -1640,12 +1918,22 @@
       try { dom = scraper(); } catch (_) {}
       var merged = GEN.items.slice();
       var have = {};
-      merged.forEach(function (it) { have[it.title.toLowerCase()] = true; });
-      dom.forEach(function (it) { if (!have[it.title.toLowerCase()]) merged.push(it); });
+      merged.forEach(function (it) { have[it.title.toLowerCase()] = it; });
+      dom.forEach(function (it) {
+        var known = have[it.title.toLowerCase()];
+        if (!known) merged.push(it);
+        else if (!known.watchedAt && it.watchedAt) known.watchedAt = it.watchedAt;
+      });
       return { items: merged, dom: dom.length };
     }
 
     function tick() {
+      var gate = passGate();
+      if (gate === "picked") return setTimeout(tick, 3500);
+      if (gate === "stuck" && (Date.now() > deadline - 5000 || GEN.gate !== "no profile tiles")) {
+        return submitHistory([], CONFIG.providerName + " asks who's watching and Omnia can't tell which profile is yours. Re-link it in Connect Accounts and pick your profile.", genNotes(0));
+      }
+      if (gate === "stuck") return setTimeout(tick, 1500);
       var r = collect();
       var items = r.items;
       if (items.length > 0 && items.length === lastCount) stableRounds++;
@@ -1653,7 +1941,7 @@
       lastCount = items.length;
 
       // Lazy-loaded lists / trays: scroll to the bottom a few times to load more entries.
-      if (scrolls < 12 && document.body) {
+      if (scrolls < maxScrolls && !olderThanSince(items) && document.body) {
         scrolls++;
         window.scrollTo(0, document.body.scrollHeight);
       }
@@ -1973,9 +2261,30 @@
     });
   }
 
-  /** Every entry Netflix counts (vhSize) has been read. */
+  /** Every entry Netflix counts (vhSize) has been read, or (delta sync) everything since the last sync. */
   function nfxHaveAll() {
-    return NFX.total > 0 && NFX.items.length >= NFX.total;
+    return (NFX.total > 0 && NFX.items.length >= NFX.total) || nfxReachedSince();
+  }
+
+  /** Delta sync: activity is newest-first, so one entry older than the last sync means done. */
+  var nfxSinceCheckedAt = 0, nfxSinceDom = false;
+  function nfxReachedSince() {
+    var since = CONFIG.sinceMs;
+    if (!since) return false;
+    for (var i = NFX.items.length - 1; i >= 0; i--) {
+      var at = NFX.items[i].watchedAt ? Date.parse(NFX.items[i].watchedAt) : NaN;
+      if (at < since) return true;
+    }
+    // Rendered rows ("Show more"): their last date, checked at most every 2 s.
+    if (Date.now() - nfxSinceCheckedAt > 2000 && /viewingactivity|settings\/viewed/i.test(location.pathname)) {
+      nfxSinceCheckedAt = Date.now();
+      try {
+        var rows = scrapeNetflixActivityDom();
+        var last = rows.length ? rows[rows.length - 1] : null;
+        nfxSinceDom = !!(last && last.watchedAt && Date.parse(last.watchedAt) < since);
+      } catch (_) {}
+    }
+    return nfxSinceDom;
   }
 
   /**
@@ -2328,7 +2637,6 @@
   }
 
   /** Strategy 4: rows rendered on the page — title links plus the nearest date, no class names. */
-  var NFX_NUMERIC_DATE = /^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/;
 
   /**
    * Netflix prints activity dates in the account's locale: 14/11/25 (India, UK…) or 11/14/25
@@ -2577,6 +2885,7 @@
     }
     watchProfileGate();
     if (CONFIG.mode === "connect") {
+      rememberGateClicks();
       pollProfile();
       setInterval(pollProfile, 1500);
       return;

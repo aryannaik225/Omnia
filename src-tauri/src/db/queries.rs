@@ -1307,11 +1307,18 @@ pub struct HistoryImport {
     /// Any SQLite-parsable time string (ISO-8601 with optional `Z`/offset). Defaults to now.
     #[serde(default)]
     pub watched_at: Option<String>,
+    /// Used only when the row is created and `watched_at` is missing (keeps a source's order).
+    #[serde(default)]
+    pub fallback_watched_at: Option<String>,
     #[serde(default)]
     pub time_of_day_bucket: Option<String>,
     /// Number of distinct viewings in the source (rewatch signal). Never lowers an existing count.
     #[serde(default)]
     pub watch_count: Option<i64>,
+    /// Fresh activity from a background delta sync (e.g. watched on a phone since the last
+    /// sync): stored as live, so it reaches Continue Watching like playback in Omnia would.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Idempotent bulk import: re-importing the same activity never duplicates rows or rolls back
@@ -1319,30 +1326,62 @@ pub struct HistoryImport {
 /// (`is_imported = 1`, "silent"): they feed the recommender and the history view but not
 /// Continue Watching. A row already played in Omnia stays live. Returns the rows processed.
 pub fn upsert_imported_history(c: &mut Connection, rows: &[HistoryImport]) -> rusqlite::Result<usize> {
+    upsert_imported_history_tracked(c, rows).map(|(processed, _)| processed)
+}
+
+/// [`upsert_imported_history`], also counting rows that are new or whose date, progress,
+/// completion or live state actually changed (a background sync's "new activity").
+pub fn upsert_imported_history_tracked(c: &mut Connection, rows: &[HistoryImport]) -> rusqlite::Result<(usize, usize)> {
     let tx = c.transaction()?;
+    let mut changed = 0usize;
     {
+        type Snap = (String, f64, bool, bool);
+        let mut probe = tx.prepare(
+            "SELECT last_watched_at, progress_seconds, is_completed, is_imported FROM watch_history
+             WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3 AND season_number = ?4 AND episode_number = ?5",
+        )?;
+        let mut snap = |row: &HistoryImport| -> rusqlite::Result<Option<Snap>> {
+            probe
+                .query_row(params![row.app_profile_id, row.tmdb_id, row.media_type, row.season_number, row.episode_number], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()
+        };
         let mut stmt = tx.prepare(
             "INSERT INTO watch_history (app_profile_id, tmdb_id, media_type, season_number, episode_number,
                 episode_title, provider_name, direct_url, progress_seconds, duration_seconds, is_completed,
                 watch_count, abandoned, last_watched_at, time_of_day_bucket, is_imported)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, MAX(1, COALESCE(?14, 1)), 0,
-                     COALESCE(datetime(?12), datetime('now')), ?13, 1)
+                     COALESCE(datetime(?12), datetime(?16), datetime('now')), ?13, CASE WHEN ?15 THEN 0 ELSE 1 END)
              ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
                 episode_title = COALESCE(watch_history.episode_title, excluded.episode_title),
                 provider_name = COALESCE(watch_history.provider_name, excluded.provider_name),
                 direct_url = COALESCE(watch_history.direct_url, excluded.direct_url),
-                progress_seconds = CASE WHEN excluded.last_watched_at > watch_history.last_watched_at
-                                        THEN excluded.progress_seconds
-                                        ELSE watch_history.progress_seconds END,
+                -- An entry without a date (a Continue Watching tile) counts as new activity only
+                -- when its progress moved; then it is stamped now, otherwise its date is kept.
+                is_imported = CASE
+                    WHEN ?15 AND (
+                        (?12 IS NOT NULL AND excluded.last_watched_at > watch_history.last_watched_at)
+                        OR (?12 IS NULL AND ABS(excluded.progress_seconds - watch_history.progress_seconds) > 30))
+                    THEN 0 ELSE watch_history.is_imported END,
+                progress_seconds = CASE
+                    WHEN ?12 IS NULL THEN CASE WHEN ABS(excluded.progress_seconds - watch_history.progress_seconds) > 30
+                                               THEN excluded.progress_seconds ELSE watch_history.progress_seconds END
+                    WHEN excluded.last_watched_at > watch_history.last_watched_at THEN excluded.progress_seconds
+                    ELSE watch_history.progress_seconds END,
                 duration_seconds = CASE WHEN watch_history.duration_seconds <= 1
                                         THEN excluded.duration_seconds
                                         ELSE watch_history.duration_seconds END,
                 is_completed = MAX(watch_history.is_completed, excluded.is_completed),
                 watch_count = MAX(watch_history.watch_count, excluded.watch_count),
-                last_watched_at = MAX(watch_history.last_watched_at, excluded.last_watched_at),
+                last_watched_at = CASE
+                    WHEN ?12 IS NULL THEN CASE WHEN ?15 AND ABS(excluded.progress_seconds - watch_history.progress_seconds) > 30
+                                               THEN datetime('now') ELSE watch_history.last_watched_at END
+                    ELSE MAX(watch_history.last_watched_at, excluded.last_watched_at) END,
                 time_of_day_bucket = COALESCE(watch_history.time_of_day_bucket, excluded.time_of_day_bucket)",
         )?;
         for row in rows {
+            let before = snap(row)?;
             let duration = if row.duration_seconds.is_finite() && row.duration_seconds > 1.0 {
                 row.duration_seconds
             } else {
@@ -1366,11 +1405,20 @@ pub fn upsert_imported_history(c: &mut Connection, rows: &[HistoryImport]) -> ru
                 row.watched_at,
                 row.time_of_day_bucket,
                 row.watch_count,
+                row.live,
+                row.fallback_watched_at,
             ])?;
+            let after = snap(row)?;
+            let moved = match (&before, &after) {
+                (None, Some(_)) => true,
+                (Some(b), Some(a)) => b.0 != a.0 || (b.1 - a.1).abs() > 1.0 || b.2 != a.2 || b.3 != a.3,
+                _ => false,
+            };
+            changed += usize::from(moved);
         }
     }
     tx.commit()?;
-    Ok(rows.len())
+    Ok((rows.len(), changed))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2212,6 +2260,83 @@ pub fn record_airing_check(c: &Connection, app_profile_id: i64, tmdb_id: i64, ne
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Background delta sync state
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OttSyncState {
+    pub app_profile_id: i64,
+    pub provider_id: i64,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_new_rows: i64,
+}
+
+pub fn get_sync_state(c: &Connection, app_profile_id: i64, provider_id: i64) -> rusqlite::Result<Option<OttSyncState>> {
+    c.query_row(
+        "SELECT app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows
+         FROM ott_sync_state WHERE app_profile_id = ?1 AND provider_id = ?2",
+        params![app_profile_id, provider_id],
+        map_sync_state,
+    )
+    .optional()
+}
+
+pub fn list_sync_states(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<OttSyncState>> {
+    collect_rows(
+        c,
+        "SELECT app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows
+         FROM ott_sync_state WHERE app_profile_id = ?1",
+        [app_profile_id],
+        map_sync_state,
+    )
+}
+
+fn map_sync_state(r: &Row<'_>) -> rusqlite::Result<OttSyncState> {
+    Ok(OttSyncState {
+        app_profile_id: r.get(0)?,
+        provider_id: r.get(1)?,
+        last_attempt_at: r.get(2)?,
+        last_success_at: r.get(3)?,
+        last_error: r.get(4)?,
+        last_new_rows: r.get(5)?,
+    })
+}
+
+/// Records a sync attempt. `Ok(new_rows)` also moves `last_success_at` to `started_at` (the
+/// moment reading began, so activity during the sync is picked up next time).
+pub fn record_sync_result(c: &Connection, app_profile_id: i64, provider_id: i64, started_at: &str, result: Result<usize, &str>) -> rusqlite::Result<()> {
+    let (ok, rows, error) = match result {
+        Ok(n) => (true, n as i64, None),
+        Err(e) => (false, 0, Some(e.chars().take(300).collect::<String>())),
+    };
+    c.execute(
+        "INSERT INTO ott_sync_state (app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows)
+         VALUES (?1, ?2, datetime('now'), CASE WHEN ?3 THEN datetime(?4) END, ?5, ?6)
+         ON CONFLICT(app_profile_id, provider_id) DO UPDATE SET
+            last_attempt_at = excluded.last_attempt_at,
+            last_success_at = CASE WHEN ?3 THEN datetime(?4) ELSE ott_sync_state.last_success_at END,
+            last_error = excluded.last_error,
+            last_new_rows = CASE WHEN ?3 THEN excluded.last_new_rows ELSE ott_sync_state.last_new_rows END",
+        params![app_profile_id, provider_id, ok, started_at, error, rows],
+    )?;
+    Ok(())
+}
+
+/// Newest watch date stored for these provider names (accounts imported before sync state existed).
+pub fn latest_provider_activity(c: &Connection, app_profile_id: i64, provider_names: &[String]) -> rusqlite::Result<Option<String>> {
+    let names = serde_json::to_string(provider_names).unwrap_or_else(|_| "[]".into());
+    c.query_row(
+        "SELECT MAX(last_watched_at) FROM watch_history
+         WHERE app_profile_id = ?1 AND provider_name IN (SELECT value FROM json_each(?2))",
+        params![app_profile_id, names],
+        |r| r.get(0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2473,8 +2598,10 @@ mod tests {
             duration_seconds: 3480.0,
             is_completed: true,
             watched_at: Some("2025-01-10T21:30:00Z".into()),
+            fallback_watched_at: None,
             time_of_day_bucket: Some("PrimeTime".into()),
             watch_count: Some(2),
+            live: false,
         };
         upsert_imported_history(&mut c, &[row.clone(), row]).unwrap();
         let rows = get_title_history(&c, 1, 1396, "tv").unwrap();
@@ -2501,8 +2628,10 @@ mod tests {
             duration_seconds: 2700.0,
             is_completed: false,
             watched_at: Some("2019-03-04T22:15:00Z".into()),
+            fallback_watched_at: None,
             time_of_day_bucket: None,
             watch_count: None,
+            live: false,
         };
         let movie = HistoryImport { tmdb_id: 603, media_type: "movie".into(), season_number: 0, episode_number: 0, ..episode.clone() };
         upsert_imported_history(&mut c, &[episode.clone(), movie]).unwrap();
@@ -2544,8 +2673,10 @@ mod tests {
             duration_seconds: 1.0,
             is_completed: true,
             watched_at: Some("2022-05-28T20:00:00Z".into()),
+            fallback_watched_at: None,
             time_of_day_bucket: None,
             watch_count: None,
+            live: false,
         };
         // 500 newer episodes of another show must not push the older series off the list.
         let mut rows: Vec<HistoryImport> = (1..=500)
@@ -2647,8 +2778,10 @@ mod tests {
             duration_seconds: 3000.0,
             is_completed: true,
             watched_at: Some((chrono::Utc::now() - chrono::Duration::days(40)).format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            fallback_watched_at: None,
             time_of_day_bucket: None,
             watch_count: None,
+            live: false,
         };
         upsert_imported_history(&mut c, &[finale]).unwrap();
         assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
@@ -2668,5 +2801,63 @@ mod tests {
         // Nothing new any more: it leaves again.
         record_airing_check(&c, 1, 94997, None).unwrap();
         assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delta_sync_surfaces_new_activity_and_keeps_undated_dates() {
+        let mut c = test_db();
+        let base = HistoryImport {
+            app_profile_id: 1,
+            tmdb_id: 1396,
+            media_type: "tv".into(),
+            season_number: 1,
+            episode_number: 2,
+            episode_title: None,
+            provider_name: Some("JioHotstar".into()),
+            direct_url: None,
+            progress_seconds: 600.0,
+            duration_seconds: 2700.0,
+            is_completed: false,
+            watched_at: None,
+            fallback_watched_at: None,
+            time_of_day_bucket: None,
+            watch_count: None,
+            live: false,
+        };
+        // First (full) import of an undated tile: silent.
+        upsert_imported_history(&mut c, &[base.clone()]).unwrap();
+        let first = get_title_history(&c, 1, 1396, "tv").unwrap()[0].clone();
+        c.execute("UPDATE watch_history SET last_watched_at = '2025-01-01 10:00:00'", []).unwrap();
+        assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+
+        // A background sync sees the same tile unchanged: nothing moves (and nothing counts as new).
+        assert_eq!(upsert_imported_history_tracked(&mut c, &[HistoryImport { live: true, ..base.clone() }]).unwrap(), (1, 0));
+        let row = get_title_history(&c, 1, 1396, "tv").unwrap()[0].clone();
+        assert_eq!(row.last_watched_at, "2025-01-01 10:00:00");
+        assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+        assert_eq!(row.id, first.id);
+
+        // Watched further on a phone: progress moved, so it is new activity (now, live).
+        assert_eq!(upsert_imported_history_tracked(&mut c, &[HistoryImport { live: true, progress_seconds: 1800.0, ..base.clone() }]).unwrap(), (1, 1));
+        let row = get_title_history(&c, 1, 1396, "tv").unwrap()[0].clone();
+        assert!(row.last_watched_at.as_str() > "2025-01-02");
+        assert_eq!(continue_watching(&c, 1, 20).unwrap().len(), 1);
+
+        // A dated entry newer than what we have is live too.
+        let dated = HistoryImport { tmdb_id: 603, media_type: "movie".into(), season_number: 0, episode_number: 0, watched_at: Some("2026-11-15T20:00:00Z".into()), live: true, ..base.clone() };
+        upsert_imported_history(&mut c, &[dated]).unwrap();
+        assert_eq!(continue_watching(&c, 1, 20).unwrap().len(), 2);
+
+        // Sync state bookkeeping.
+        record_sync_result(&c, 1, 122, "2026-11-16 08:00:00", Ok(2)).unwrap();
+        record_sync_result(&c, 1, 122, "2026-11-16 09:00:00", Err("signed out")).unwrap();
+        let st = get_sync_state(&c, 1, 122).unwrap().unwrap();
+        assert_eq!(st.last_success_at.as_deref(), Some("2026-11-16 08:00:00"));
+        assert_eq!(st.last_error.as_deref(), Some("signed out"));
+        assert_eq!(st.last_new_rows, 2);
+        // Newest stored activity for the service (the phone-watched row was stamped now).
+        let latest = latest_provider_activity(&c, 1, &["JioHotstar".into()]).unwrap().unwrap();
+        assert!(latest.as_str() >= "2026-11-15 20:00:00", "{latest}");
+        assert!(latest_provider_activity(&c, 1, &["Netflix".into()]).unwrap().is_none());
     }
 }

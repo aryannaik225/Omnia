@@ -8,10 +8,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useAsync } from "../../lib/hooks";
 import { groupByFamily, providerFamily } from "../../lib/providers";
 import { img, regionProviders, type WatchProviderOption } from "../../services/tmdbClient";
-import { history, ottMappings } from "../../services/tauriBridge";
+import { history, ottMappings, syncStatus } from "../../services/tauriBridge";
+import { relativeTime } from "../../lib/format";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore, type ImportState } from "../../store/usePlayerStore";
-import { CheckIcon, CloseIcon, DownloadIcon, LinkIcon, TrashIcon, UploadIcon } from "../common/Icons";
+import { CheckIcon, CloseIcon, DownloadIcon, LinkIcon, RefreshIcon, TrashIcon, UploadIcon } from "../common/Icons";
 
 /** Providers the handshake + history importer support (mirrors `OttProvider` in Rust; others import from file only). */
 const SUPPORTED = /netflix|prime video|amazon|hotstar|jiocinema|zee5|sony ?liv|apple tv|disney|hbo|^max\b|hulu|peacock|paramount|crunchyroll/i;
@@ -89,6 +90,33 @@ export function AccountSyncModal() {
     open && !!profile,
   );
   const rowsFor = (providerId: number) => counts.data?.find((c) => c.providerId === providerId)?.rows ?? 0;
+  const syncs = useAsync(() => syncStatus.list(profile!.profileId), [profile?.profileId, countsNonce, importsDone], open && !!profile);
+  const [syncing, setSyncing] = useState(false);
+  const syncNow = async () => {
+    if (!profile) return;
+    setSyncing(true);
+    try {
+      const n = await syncStatus.syncNow(profile.profileId);
+      if (n === null) toast({ kind: "info", title: "A sync is already running", body: "It will finish in the background." });
+      else if (n === 0) toast({ kind: "info", title: "Everything is up to date", body: "No new viewing on your linked accounts since the last sync." });
+      else {
+        toast({ kind: "success", title: "Synced", body: `${n} new or updated ${n === 1 ? "entry" : "entries"} from your other devices.` });
+        void refreshContinueWatching();
+        void loadRecommendations(true);
+      }
+    } catch (e) {
+      toast({ kind: "error", title: "Sync failed", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSyncing(false);
+      setCountsNonce((n) => n + 1);
+    }
+  };
+  const syncLabel = (providerId: number) => {
+    const st = syncs.data?.find((s) => s.providerId === providerId);
+    if (!st) return null;
+    if (st.lastError && (!st.lastSuccessAt || (st.lastAttemptAt ?? "") > st.lastSuccessAt)) return { text: "Last sync failed: open Connect to sign in again", error: true };
+    return st.lastSuccessAt ? { text: `Synced ${relativeTime(st.lastSuccessAt)}`, error: false } : null;
+  };
 
   const clearProvider = async (providerId: number, providerName: string) => {
     if (!profile) return;
@@ -160,7 +188,19 @@ export function AccountSyncModal() {
             <button className="icon-button absolute right-5 top-5" onClick={() => setOpen(false)} aria-label="Close">
               <CloseIcon size={18} />
             </button>
-            <h2 className="text-[28px] font-bold tracking-tight">Connect Accounts</h2>
+            <div className="flex flex-wrap items-center gap-4 pr-12">
+              <h2 className="text-[28px] font-bold tracking-tight">Connect Accounts</h2>
+              {mappings.length > 0 && (
+                <button
+                  className="glass-button !px-4 !py-2"
+                  disabled={syncing || anyImportRunning}
+                  onClick={() => void syncNow()}
+                  title="Check every linked account for new viewing (from your phone, TV…) right now"
+                >
+                  <RefreshIcon size={15} className={syncing ? "animate-spin motion-reduce:animate-none" : undefined} /> {syncing ? "Syncing…" : "Sync now"}
+                </button>
+              )}
+            </div>
             <p className="mt-1 max-w-[620px] text-label-secondary">
               Sign in inside Omnia's player and pick <em>your</em> profile. Omnia links it to <strong className="text-label-primary">{profile.profileName}</strong> and imports
               its history. Cookies never leave this device and are only sent to the service itself.
@@ -187,6 +227,11 @@ export function AccountSyncModal() {
                             "Not linked"
                           )}
                           {rowsFor(p.providerId) > 0 && <span>· {rowsFor(p.providerId).toLocaleString()} history entries</span>}
+                          {mapping && syncLabel(p.providerId) && (
+                            <span className={syncLabel(p.providerId)!.error ? "text-[#ff9f0a]" : undefined} title={syncs.data?.find((s) => s.providerId === p.providerId)?.lastError ?? undefined}>
+                              · {syncLabel(p.providerId)!.text}
+                            </span>
+                          )}
                         </p>
                       </div>
                       <button className="glass-button !px-4 !py-2" onClick={() => void connect(p.providerId, p.providerName)}>

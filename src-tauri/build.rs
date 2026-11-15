@@ -50,6 +50,8 @@ const COMMANDS: &[&str] = &[
     "get_title_collections",
     "check_airing_shows",
     "fetch_avatar_image",
+    "get_sync_states",
+    "sync_accounts_now",
     "identify_title",
     "import_watch_history",
     "export_watch_history",

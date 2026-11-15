@@ -216,6 +216,7 @@ export const OmniaEvents = {
   ottProfileConnected: "omnia://ott-profile-connected",
   historyImportProgress: "omnia://history-import-progress",
   historyImportFinished: "omnia://history-import-finished",
+  backgroundSync: "omnia://background-sync",
 } as const;
 
 export const BACK_TO_HUB_EVENT = OmniaEvents.backToHub;
@@ -586,7 +587,28 @@ export const events = {
   onOttProfileConnected: on<OttProfileConnectedEvent>(OmniaEvents.ottProfileConnected),
   onHistoryImportProgress: on<ImportProgressEvent>(OmniaEvents.historyImportProgress),
   onHistoryImportFinished: on<ImportFinishedEvent>(OmniaEvents.historyImportFinished),
+  /** A quiet background delta sync stored new activity (e.g. watched on another device). */
+  onBackgroundSync: on<{ appProfileId: number; providerName: string; updated: number }>(OmniaEvents.backgroundSync),
 };
+
+/** Background delta sync status of one linked account (mirrors `queries::OttSyncState`). */
+export interface OttSyncState {
+  appProfileId: number;
+  providerId: number;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastError: string | null;
+  lastNewRows: number;
+}
+
+export const syncStatus = {
+  list: (appProfileId: number) => invoke<OttSyncState[]>("get_sync_states", { appProfileId }),
+  /** Delta-sync every linked account of the profile now. `null` when a sync is already running. */
+  syncNow: (appProfileId: number) => invoke<number | null>("sync_accounts_now", { appProfileId }),
+};
+
+/** `app_settings` key: background sync on startup / tray wake ("false" turns it off). */
+export const BACKGROUND_SYNC_SETTING = "background_sync";
 
 // ---------------------------------------------------------------------------------------------
 // Recommendations (mirror src-tauri/src/ml/recommender.rs)

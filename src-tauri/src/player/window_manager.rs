@@ -175,6 +175,26 @@ impl OttProvider {
         })
     }
 
+    /// The family name the catalog uses for this service (matches Connect Accounts).
+    pub fn display_name(self) -> &'static str {
+        use OttProvider::*;
+        match self {
+            Netflix => "Netflix",
+            PrimeVideo => "Prime Video",
+            Hotstar => "JioHotstar",
+            Zee5 => "ZEE5",
+            SonyLiv => "Sony LIV",
+            AppleTv => "Apple TV",
+            DisneyPlus => "Disney+",
+            HboMax => "HBO Max",
+            Hulu => "Hulu",
+            Peacock => "Peacock",
+            ParamountPlus => "Paramount+",
+            Crunchyroll => "Crunchyroll",
+            Generic => "Provider",
+        }
+    }
+
     /// Landing page for the "Connect account" handshake (login + "Who's watching?").
     pub fn home_url(self, region: &str) -> Option<String> {
         use OttProvider::*;
@@ -1133,6 +1153,11 @@ async fn execute_ops(db: &Database, ops: Vec<DbOp>) -> AppResult<()> {
 }
 
 /// Brings the catalog window to the front.
+/// Is a player window session active (background work waits for it)?
+pub fn player_is_open(app: &AppHandle) -> bool {
+    app.state::<AppState>().player.lock().is_some()
+}
+
 pub fn focus_main_window(app: &AppHandle) {
     if let Some(main) = app.get_webview_window(MAIN_LABEL) {
         let _ = main.unminimize();
