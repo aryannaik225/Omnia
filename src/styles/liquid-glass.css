@@ -316,8 +316,21 @@
 
   /* ---- Hero ----------------------------------------------------------------------------- */
   .hero-mask {
-    /* Soft top edge (the hero starts below the floating header) and the long bottom fade. */
-    mask-image: linear-gradient(to bottom, transparent 0, #000 40px, #000 55%, transparent 100%);
+    /* Feathered on every side so the artwork melts into the background: a short top fade (the
+       hero sits under the floating header), a long bottom fade, and soft left/right edges. */
+    -webkit-mask-image:
+      linear-gradient(to bottom, transparent 0, #000 28px, #000 58%, transparent 100%),
+      linear-gradient(to right, transparent 0, #000 7%, #000 93%, transparent 100%);
+    mask-image:
+      linear-gradient(to bottom, transparent 0, #000 28px, #000 58%, transparent 100%),
+      linear-gradient(to right, transparent 0, #000 7%, #000 93%, transparent 100%);
+    -webkit-mask-composite: source-in;
+    mask-composite: intersect;
+  }
+  .hero-art {
+    /* Backdrops are framed for faces near the top: crop from the bottom, never the heads. */
+    object-fit: cover;
+    object-position: center top;
   }
   .hero-scrim {
     background:

@@ -139,7 +139,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
           key={current.backdropPath}
           src={img(current.backdropPath, "w1280") ?? undefined}
           alt=""
-          className="hero-mask absolute inset-0 h-full w-full object-cover"
+          className="hero-mask hero-art absolute inset-0 h-full w-full"
           initial={{ opacity: 0, scale: 1.04 }}
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0 }}

@@ -155,12 +155,9 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         if (!d.title) return;
         // Strict type: anything with season / episode data is a series, never a film (and the
         // other type is never tried as a fallback). Rust matches exact titles + release year.
-        const mediaType: MediaType =
-          d.mediaType === "tv" || d.mediaType === "movie"
-            ? d.mediaType
-            : d.seasonNumber != null || d.episodeNumber != null || !!d.episodeTitle
-              ? "tv"
-              : "movie";
+        // Season / episode numbers always win over a reported type (the same rule Rust applies).
+        const hasEpisode = (d.seasonNumber ?? 0) > 0 || (d.episodeNumber ?? 0) > 0 || !!d.episodeTitle;
+        const mediaType: MediaType = hasEpisode ? "tv" : d.mediaType === "tv" || d.mediaType === "movie" ? d.mediaType : "movie";
         try {
           const match = await player.identify(d.title, mediaType, d.releaseYear ?? null);
           if (!match) {

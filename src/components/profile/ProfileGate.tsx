@@ -3,7 +3,7 @@ import { AnimatePresence, m } from "framer-motion";
 import { useState } from "react";
 import type { AppProfile } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
-import { Avatar, AVATAR_PALETTES, avatarKeys, defaultAvatarFor } from "../common/Avatar";
+import { Avatar, AvatarPicker, defaultAvatarFor } from "../common/Avatar";
 import { PencilIcon, PlusIcon, TrashIcon } from "../common/Icons";
 
 function ProfileEditor({ profile, onClose }: { profile: AppProfile | null; onClose: () => void }) {
@@ -45,20 +45,8 @@ function ProfileEditor({ profile, onClose }: { profile: AppProfile | null; onClo
           <Avatar name={name || "?"} avatar={avatar} size={112} kids={kids} />
         </div>
         <input autoFocus className="glass-input text-center text-[16px]" placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} maxLength={32} />
-        <div className="mt-4 flex justify-center gap-2.5">
-          {avatarKeys.map((k) => {
-            const [a, b] = AVATAR_PALETTES[k]!;
-            return (
-              <button
-                type="button"
-                key={k}
-                aria-label={`Avatar ${k}`}
-                onClick={() => setAvatar(k)}
-                className={`h-8 w-8 rounded-full transition-transform hover:scale-110 ${avatar === k ? "ring-2 ring-white" : ""}`}
-                style={{ background: `linear-gradient(135deg, ${a}, ${b})` }}
-              />
-            );
-          })}
+        <div className="mt-5">
+          <AvatarPicker value={avatar} onChange={setAvatar} centered />
         </div>
         <label className="mt-6 flex items-center justify-between rounded-pill bg-white/[0.05] px-4 py-3 text-left">
           <span>

@@ -9,7 +9,7 @@ import wordmark from "../../assets/omnia-wordmark.png";
 import { flag } from "../../lib/format";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { Avatar } from "../common/Avatar";
+import { Avatar, defaultAvatarFor } from "../common/Avatar";
 import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, SidebarIcon, TvIcon } from "../common/Icons";
 
 export const SIDEBAR_EXPANDED = 248;
@@ -139,7 +139,7 @@ export function LiquidSidebar() {
 
       {profile && (
         <button onClick={openGate} className="flex items-center gap-3 rounded-pill px-1.5 py-1.5 text-left hover:bg-white/[0.07]" title="Switch profile">
-          <Avatar name={profile.profileName} avatar={profile.avatarAsset} size={40} />
+          <Avatar name={profile.profileName} avatar={profile.avatarAsset ?? defaultAvatarFor(profile.profileId)} size={40} />
           <m.span animate={{ opacity: collapsed ? 0 : 1 }} className="min-w-0 whitespace-nowrap">
             <span className="block truncate text-[14px] font-semibold">{profile.profileName}</span>
             <span className="block text-[12px] text-label-tertiary">

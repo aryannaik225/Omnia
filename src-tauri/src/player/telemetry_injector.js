@@ -209,9 +209,82 @@
     return null;
   }
 
+  // Signed-in detection for every provider other than Netflix. Profiles aren't exposed the same
+  // way anywhere (Apple TV has none on the web), so a session counts as signed in when:
+  //   - the page isn't a sign-in / sign-up / OTP page, nor a "Who's watching?" picker,
+  //   - no visible "Sign in" / "Log in" call to action is left on the page, and
+  //   - an account / profile / avatar control (or a stored auth session) is present.
+  // The profile id comes from the page's storage when the provider keeps one; otherwise the
+  // link is account-level ("account"), which Rust scopes to this Omnia profile — safe because
+  // each Omnia profile has its own isolated browser session.
+  var AUTH_PATH = /\/(login|log-in|signin|sign-in|sign_in|signup|sign-up|register|join|auth|authenticate|activate|verify|otp|mylogin|ap\/signin|ap\/register|ap\/cvf|subscribe\/login)(\/|$|\?)|\/onboarding\/(?!profile)/i;
+  var GATE_PATH = /\/(profiles?|profile-?select|select-?profile|choose-?profile|who-?s-?watching|switch-?profile|onboarding\/profile)(\/|$|\?)/i;
+  var SIGN_IN_CTA = /^(sign in|sign-in|log in|log-in|login|sign up|sign in to watch|log in to watch|sign in or sign up|join now|already a member\?? sign in)$/i;
+  var SIGNED_IN_HINTS = [
+    'a[href*="logout" i]', 'a[href*="signout" i]', 'a[href*="sign-out" i]', 'a[href*="log-out" i]',
+    'a[href*="/account" i]', 'a[href*="/myaccount" i]', 'a[href*="/my-account" i]', 'a[href*="/settings" i]',
+    'a[href*="/profiles" i]', 'a[href*="/mystuff" i]', 'a[href*="/watchlist" i]',
+    '[aria-label*="account" i]', '[aria-label*="profile" i]', '[aria-label*="my space" i]',
+    '[data-testid*="avatar" i]', '[data-testid*="profile" i]', '[data-testid*="account" i]',
+    '[class*="avatar" i]', 'img[alt*="profile" i]', 'img[alt*="avatar" i]',
+  ].join(",");
+
+  function isVisible(el) {
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return false;
+      var cs = getComputedStyle(el);
+      return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function hasSignInCta() {
+    return Array.prototype.some.call(document.querySelectorAll("a, button, [role=button]"), function (el) {
+      var t = clean(el.textContent || el.getAttribute("aria-label") || "");
+      return t.length <= 40 && SIGN_IN_CTA.test(t) && isVisible(el);
+    });
+  }
+
+  function onGenericProfileGate() {
+    if (GATE_PATH.test(location.pathname)) return true;
+    var text = document.body ? clean(String(document.body.innerText || "").slice(0, 2500)) : "";
+    return /who.?s watching\??|choose (your |a )?profile|select (your |a )?profile|switch profiles?/i.test(text) &&
+      document.querySelectorAll('[class*="profile" i] img, [data-testid*="profile" i], [aria-label*="profile" i]').length > 1;
+  }
+
+  function hasStoredSession() {
+    var stores = [];
+    try { stores.push(window.localStorage); } catch (_) {}
+    try { stores.push(window.sessionStorage); } catch (_) {}
+    return stores.some(function (store) {
+      if (!store) return false;
+      for (var i = 0; i < store.length; i++) {
+        var key = store.key(i) || "";
+        if (/^omnia-/.test(key) || !/(access.?token|auth.?token|id.?token|user.?token|session.?token|usertoken|bearer|jwt)/i.test(key)) continue;
+        var v = store.getItem(key) || "";
+        if (v.length >= 20) return true;
+      }
+      return false;
+    });
+  }
+
+  /** Signed-in identity for non-Netflix providers, or null while signed out / choosing. */
+  function detectSignedInIdentity() {
+    if (document.readyState === "loading" || !document.body) return null;
+    if (AUTH_PATH.test(location.pathname)) return null;
+    if (onGenericProfileGate()) return null;
+    if (hasSignInCta()) return null;
+    var stored = detectGenericProfile();
+    if (stored) return stored;
+    if (document.querySelector(SIGNED_IN_HINTS) || hasStoredSession()) return { id: "account", name: null };
+    return null;
+  }
+
   function detectOttProfile() {
     if (IS_NETFLIX) return onProfileGate() ? null : detectNetflixProfile();
-    return detectGenericProfile();
+    return detectSignedInIdentity();
   }
 
   function onProfileGate() {
@@ -971,31 +1044,61 @@
   var linked = false;
   var currentProfile = null;
 
+  // Connect mode links automatically once the same signed-in identity has been seen for a few
+  // polls in a row (the page has settled past sign-in and any "Who's watching?" step); the
+  // window then closes and the history import starts. The button links immediately.
+  var AUTO_LINK_POLLS = 3;
+  var stablePolls = 0;
+  var lastSeenId = null;
+
+  // Auto-linking needs evidence the user chose: this window saw them signed out or on the
+  // "Who's watching?" picker first. Already signed in on arrival (a remembered profile) →
+  // they confirm with the button instead, so nobody's profile is linked silently.
+  var ACTED_KEY = "omnia-connect-acted-" + TOKEN_KEY;
+
+  /** A real signed-out page or a profile picker (not just a page that hasn't rendered yet). */
+  function sawSignInOrPicker() {
+    if (!document.body || document.readyState === "loading") return false;
+    if (/\/(login|signin|sign-in)(\/|$|\?)/i.test(location.pathname)) return true;
+    if (IS_NETFLIX) return onProfileGate();
+    return AUTH_PATH.test(location.pathname) || onGenericProfileGate() || hasSignInCta();
+  }
+
   function pollProfile() {
     if (CONFIG.mode !== "connect" || linked) return;
     var p = detectOttProfile();
     currentProfile = p;
+    stablePolls = p && p.id === lastSeenId ? stablePolls + 1 : p ? 1 : 0;
+    lastSeenId = p ? p.id : null;
+    if (!p && sawSignInOrPicker()) session(ACTED_KEY, "1");
+    var auto = session(ACTED_KEY) === "1";
     if (ui.panel) {
       if (p) {
-        showPanel("", "Link this profile");
+        showPanel("", auto ? "Link now" : "Link this profile");
         ui.msg.textContent = "";
+        var who = p.name || (p.id === "account" ? "your account" : "profile " + p.id.slice(0, 6));
         ui.msg.append(
           "Signed in to " + CONFIG.providerName + " as ",
-          Object.assign(document.createElement("strong"), { textContent: p.name || "profile " + p.id.slice(0, 6) }),
-          ". Link it to " + CONFIG.appProfileName + "?",
+          Object.assign(document.createElement("strong"), { textContent: who }),
+          auto ? ". Linking to " + CONFIG.appProfileName + "…" : ". Link it to " + CONFIG.appProfileName + "?",
         );
       } else {
         showPanel("Sign in to " + CONFIG.providerName + " and choose who's watching.", null);
       }
     }
+    if (p && auto && stablePolls >= AUTO_LINK_POLLS) linkProfile();
   }
+
+  var linking = false;
 
   function linkProfile() {
     var p = CONFIG.mode === "connect" ? currentProfile : detectOttProfile();
-    if (!p || linked) return;
+    if (!p || linked || linking) return;
+    linking = true;
     var original = ui.link.textContent;
     ui.link.textContent = "Linking…";
     invoke("report_ott_profile", { token: CONFIG.token, profile: p }).then(function (res) {
+      linking = false;
       if (res && res.linked) {
         linked = true;
         if (CONFIG.mode === "connect") {
@@ -1824,35 +1927,87 @@
   }
 
   /** Strategy 4: rows rendered on the page — title links plus the nearest date, no class names. */
+  var NFX_NUMERIC_DATE = /^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/;
+
+  /**
+   * Netflix prints activity dates in the account's locale: 14/11/25 (India, UK…) or 11/14/25
+   * (US). `new Date()` only reads month-first, so day-first dates were rejected (and fell back
+   * to "now") or swapped (5/11 → May 11). The order is decided from the dates themselves — any
+   * first number above 12 means day-first, any second above 12 means month-first — then from
+   * the page language.
+   */
+  function nfxDateOrder(texts) {
+    var dmy = false, mdy = false;
+    texts.forEach(function (t) {
+      var m = NFX_NUMERIC_DATE.exec(t);
+      if (!m) return;
+      if (+m[1] > 12) dmy = true;
+      if (+m[2] > 12) mdy = true;
+    });
+    if (dmy !== mdy) return dmy ? "dmy" : "mdy";
+    var lang = String(document.documentElement.lang || navigator.language || "").toLowerCase();
+    return /^en(-(us|ph|ca))?$/.test(lang) ? "mdy" : "dmy";
+  }
+
+  /** A row's calendar date as an ISO string at 12:00 UTC (so no time zone shifts its day). */
+  function nfxRowDate(text, order) {
+    var t = clean(text);
+    var m = NFX_NUMERIC_DATE.exec(t);
+    var y, mo, d;
+    if (m) {
+      d = +(order === "dmy" ? m[1] : m[2]);
+      mo = +(order === "dmy" ? m[2] : m[1]);
+      y = +m[3];
+      if (y < 100) y += y > (new Date().getFullYear() % 100) + 1 ? 1900 : 2000;
+    } else {
+      // Month names ("14 Nov 2025", "Nov 14, 2025") are unambiguous.
+      if (!/[a-z]{3}/i.test(t) || !/\d{4}/.test(t)) return null;
+      var parsed = new Date(t);
+      if (isNaN(parsed.getTime())) return null;
+      y = parsed.getFullYear();
+      mo = parsed.getMonth() + 1;
+      d = parsed.getDate();
+    }
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 1990 || y > 2100) return null;
+    return new Date(Date.UTC(y, mo - 1, d, 12)).toISOString();
+  }
+
+  function nfxLooksLikeDate(text) {
+    var t = clean(text);
+    return !!t && t.length <= 24 && (NFX_NUMERIC_DATE.test(t) || (/\d{4}/.test(t) && /[a-z]{3}/i.test(t) && !isNaN(new Date(t).getTime())));
+  }
+
   function scrapeNetflixActivityDom() {
-    var items = [];
-    var seen = {};
+    var rows = [];
     nfxRowLinks().forEach(function (link) {
       var title = clean(link.textContent);
       if (!title) return;
       var row = link;
-      var watchedAt = null;
-      for (var up = 0; up < 5 && !watchedAt; up++) {
+      var dateText = null;
+      for (var up = 0; up < 5 && !dateText; up++) {
         row = row.parentElement;
         if (!row) break;
         Array.prototype.some.call(row.querySelectorAll("*"), function (el) {
           if (el.childElementCount !== 0 || el === link || link.contains(el)) return false;
-          watchedAt = parseDateText(el.textContent);
-          return !!watchedAt;
+          if (nfxLooksLikeDate(el.textContent)) dateText = clean(el.textContent);
+          return !!dateText;
         });
       }
-      // The page shows a calendar date: keep that date in UTC (midday), so it doesn't shift a
-      // day when converted (local midnight in UTC+5:30 is the previous day in UTC).
-      if (watchedAt) {
-        var local = new Date(watchedAt);
-        watchedAt = new Date(Date.UTC(local.getFullYear(), local.getMonth(), local.getDate(), 12)).toISOString();
-      }
-      var key = title + "|" + (watchedAt || "");
+      var id = (String(link.getAttribute("href") || "").match(/\/title\/(\d{3,12})/) || [])[1] || null;
+      rows.push({ title: title, dateText: dateText, id: id });
+    });
+    var order = nfxDateOrder(rows.map(function (r) { return r.dateText || ""; }));
+    var items = [];
+    var seen = {};
+    rows.forEach(function (r) {
+      var watchedAt = r.dateText ? nfxRowDate(r.dateText, order) : null;
+      var key = r.title + "|" + (watchedAt || "");
       if (seen[key]) return;
       seen[key] = true;
-      var id = (String(link.getAttribute("href") || "").match(/\/title\/(\d{3,12})/) || [])[1] || null;
-      items.push({ title: title, isTv: false, seasonNumber: null, episodeNumber: null, episodeTitle: null, progressRatio: null, watchedAt: watchedAt, ottVideoId: id });
+      items.push({ title: r.title, isTv: false, seasonNumber: null, episodeNumber: null, episodeTitle: null, progressRatio: null, watchedAt: watchedAt, ottVideoId: r.id });
     });
+    NFX.dateOrder = order;
+    NFX.undatedRows = rows.filter(function (r) { return !r.dateText; }).length;
     return items;
   }
 
@@ -1879,7 +2034,9 @@
       var text = lower(row.title);
       var near = d == null ? byDay[null] || [] : [].concat(byDay[d - 1] || [], byDay[d] || [], byDay[d + 1] || []);
       var dup = near.some(function (it) {
-        if (row.ottVideoId && it.ottVideoId) return row.ottVideoId === it.ottVideoId;
+        // Same id is certain. Different ids aren't proof of a different viewing: a row links to
+        // the series page while the data carries the episode's id — so compare titles too.
+        if (row.ottVideoId && it.ottVideoId && row.ottVideoId === it.ottVideoId) return true;
         return !!it.title && text.indexOf(lower(it.title)) >= 0 && (!it.episodeTitle || text.indexOf(lower(it.episodeTitle)) >= 0);
       });
       if (dup) return;
@@ -1985,7 +2142,7 @@
           var added = nfxMergeDomRows(rows);
           notes.push("show more button " + (NFX.buttonSeen ? "clicked " + NFX.clicks + "x" : "not found"));
           notes.push("captured entries: " + captured + (NFX.total ? "/" + NFX.total : ""));
-          notes.push("rendered rows: " + rows.length + " (" + added + " not in captured data)");
+          notes.push("rendered rows: " + rows.length + " (" + added + " not in captured data; dates read as " + (NFX.dateOrder || "?") + ", " + (NFX.undatedRows || 0) + " undated)");
           notes.push(NFX.responses + " page responses; " + nfxResponseSummary());
           submitHistory(NFX.items.slice(), "No readable Netflix viewing activity (" + notes.join("; ") + ").", notes);
         });

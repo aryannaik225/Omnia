@@ -219,6 +219,22 @@ impl OttProvider {
     }
 }
 
+/// Identity the injected script reports for providers that have no profiles on the web (Apple
+/// TV) or don't expose one: the signed-in account of this Omnia profile's own browser session.
+pub const ACCOUNT_SCOPE: &str = "account";
+
+/// Stored / compared form of a reported OTT identity. Account-level links are scoped to the
+/// Omnia profile (each profile has its own isolated WebView2 session), so two family members
+/// with separate Apple TV accounts never collide.
+pub fn scoped_ott_id(reported: &str, app_profile_id: i64) -> String {
+    let id = reported.trim();
+    if id == ACCOUNT_SCOPE {
+        format!("{ACCOUNT_SCOPE}:{app_profile_id}")
+    } else {
+        id.to_string()
+    }
+}
+
 /// Netflix identities are stored as `guid::profile name`; the guid part drives `SwitchProfile`.
 pub fn netflix_guid(native_profile_id: &str) -> &str {
     native_profile_id.split("::").next().unwrap_or_default().trim()
@@ -830,7 +846,14 @@ impl PlayerSession {
             return false;
         };
         let detected_title = d.title.as_deref().unwrap_or_default();
-        let same_title = item.titles.iter().any(|t| titles_match(t, detected_title));
+        // Same name but the wrong type ("Friends" the 1971 film vs the series): anything with a
+        // season / episode, or that the provider calls a series, is re-identified as TV only.
+        let detected_tv = d.media_type.as_deref() == Some("tv")
+            || d.season_number.is_some_and(|s| s > 0)
+            || d.episode_number.is_some_and(|e| e > 0);
+        let detected_movie = d.media_type.as_deref() == Some("movie") && !detected_tv;
+        let wrong_type = (item.media_type == "movie" && detected_tv) || (item.media_type == "tv" && detected_movie);
+        let same_title = item.titles.iter().any(|t| titles_match(t, detected_title)) && !wrong_type;
 
         if !same_title {
             if item.ratio() >= HOP_COMPLETION_RATIO {
@@ -1393,7 +1416,16 @@ pub async fn player_rebind_title(app: AppHandle, state: State<'_, AppState>, req
             .as_mut()
             .filter(|s| s.mode == PlayerMode::Play)
             .ok_or_else(|| AppError::Message("no active player".into()))?;
-        let pending = session.pending_title_change.take().unwrap_or_default();
+        let pending = session.pending_title_change.clone().unwrap_or_default();
+        let pending_is_episode = pending.media_type.as_deref() == Some("tv")
+            || pending.season_number.is_some_and(|s| s > 0)
+            || pending.episode_number.is_some_and(|e| e > 0);
+        if request.media_type == "movie" && pending_is_episode {
+            return Err(AppError::Message(
+                "the player is showing a series episode; it can only be matched to a TV series".into(),
+            ));
+        }
+        session.pending_title_change = None;
         let mut titles = vec![request.title.clone()];
         titles.extend(request.original_title.clone());
         titles.extend(pending.title.clone());
@@ -1436,7 +1468,7 @@ pub async fn sync_playback_telemetry(
     state: State<'_, AppState>,
     mut payload: TelemetryPayload,
 ) -> AppResult<TelemetryAck> {
-    let (provider_id, lookup) = {
+    let (provider_id, app_profile_id, lookup) = {
         let mut guard = state.player.lock();
         let s = guard
             .as_mut()
@@ -1455,7 +1487,7 @@ pub async fn sync_playback_telemetry(
                 }
             }
         }
-        (s.provider_id, lookup)
+        (s.provider_id, s.app_profile_id, lookup)
     };
 
     // The player only showed the episode's name: place it with TMDB's season data.
@@ -1476,7 +1508,7 @@ pub async fn sync_playback_telemetry(
     let observed = payload
         .ott_profile
         .as_ref()
-        .map(|p| p.id.trim().to_string())
+        .map(|p| scoped_ott_id(&p.id, app_profile_id))
         .filter(|id| !id.is_empty());
     let owner = match observed.clone() {
         Some(id) => state.db.run(move |c| queries::find_app_profile_for_ott(c, provider_id, &id)).await?,
@@ -1585,7 +1617,7 @@ pub async fn report_ott_profile(
             .ok_or_else(unauthorized)?;
         (s.app_profile_id, s.provider_id, s.provider_name.clone(), s.mode)
     };
-    let ott_id = payload.profile.id.trim().to_string();
+    let ott_id = scoped_ott_id(&payload.profile.id, app_profile_id);
     if ott_id.is_empty() || ott_id.len() > 256 {
         return Ok(ReportProfileResult { linked: false, message: Some("No profile detected yet.".into()) });
     }
@@ -1867,6 +1899,15 @@ mod tests {
         }
         let ops = s.finalize_ops();
         assert!(ops.iter().any(|o| matches!(o, DbOp::Event { event_type: "binge_session", .. })));
+    }
+
+    #[test]
+    fn episode_on_a_movie_binding_is_reidentified_as_tv() {
+        // Bound to "Stranger Things" as a film (the wrong type); the page shows S2 E5.
+        let mut s = session("movie", 0, 0);
+        let plan = s.apply(&sample(TelemetryKind::Metadata, 5.0, 1500.0, Some(det("Stranger Things", 2, 5))), REC);
+        assert!(plan.emits.iter().any(|(e, _)| *e == EVT_TITLE_CHANGED), "same name, wrong type must re-identify");
+        assert!(!plan.ops.iter().any(|o| matches!(o, DbOp::Progress(_))), "nothing recorded against the film");
     }
 
     #[test]

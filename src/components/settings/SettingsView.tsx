@@ -11,7 +11,7 @@ import { envTmdbKey, img, regionProviders } from "../../services/tmdbClient";
 import { recommendations, type Affinity, type SubscribedProvider } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { Avatar, AVATAR_PALETTES, avatarKeys } from "../common/Avatar";
+import { Avatar, AvatarPicker, defaultAvatarFor } from "../common/Avatar";
 import { CheckIcon, LinkIcon, RefreshIcon } from "../common/Icons";
 import { RegionSwitcher } from "../layout/TopFilterBar";
 import { PageHeader } from "../views/BrowseViews";
@@ -44,11 +44,11 @@ function ProfileSection() {
   const openGate = useAppStore((s) => s.openProfileGate);
   const toast = useAppStore((s) => s.toast);
   const [name, setName] = useState(profile.profileName);
-  const [avatar, setAvatar] = useState(profile.avatarAsset ?? avatarKeys[0]!);
+  const [avatar, setAvatar] = useState(profile.avatarAsset ?? defaultAvatarFor(profile.profileId));
   const [kids, setKids] = useState(profile.isKidsProfile);
   useEffect(() => {
     setName(profile.profileName);
-    setAvatar(profile.avatarAsset ?? avatarKeys[0]!);
+    setAvatar(profile.avatarAsset ?? defaultAvatarFor(profile.profileId));
     setKids(profile.isKidsProfile);
   }, [profile]);
   const dirty = name.trim() !== profile.profileName || avatar !== profile.avatarAsset || kids !== profile.isKidsProfile;
@@ -59,16 +59,8 @@ function ProfileSection() {
         <Avatar name={name || "?"} avatar={avatar} size={88} kids={kids} />
         <div className="flex-1">
           <input className="glass-input max-w-sm" value={name} onChange={(e) => setName(e.target.value)} aria-label="Profile name" />
-          <div className="mt-3 flex flex-wrap gap-2">
-            {Object.entries(AVATAR_PALETTES).map(([key, [a, b]]) => (
-              <button
-                key={key}
-                aria-label={`Avatar ${key}`}
-                onClick={() => setAvatar(key)}
-                className={`h-8 w-8 rounded-full transition-transform hover:scale-110 ${avatar === key ? "ring-2 ring-white ring-offset-2 ring-offset-transparent" : ""}`}
-                style={{ background: `linear-gradient(135deg, ${a}, ${b})` }}
-              />
-            ))}
+          <div className="mt-4">
+            <AvatarPicker value={avatar} onChange={setAvatar} />
           </div>
           <div className="max-w-sm">
             <Toggle on={kids} onChange={setKids} label="Kids profile" hint="Only family-safe titles, hubs and recommendations" />

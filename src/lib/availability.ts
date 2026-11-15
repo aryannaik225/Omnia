@@ -1,7 +1,12 @@
 /**
- * "My Subscriptions" filtering for rows that weren't fetched under the current filter: backend
- * recommendation rows computed before a toggle, Continue Watching, the hero's personal picks.
- * Rows already filtered at the source are marked `trusted` and pass through untouched.
+ * "My Subscriptions" filtering: a strict intersection of each title's streaming providers
+ * (flatrate / free / ads in the active region) with the user's saved providers.
+ *
+ * Every title is verified, including rows already filtered at the source (`trusted`): TMDB's
+ * discover filter checks "has one of your providers" and "is streaming somewhere" separately,
+ * so a title you could only rent on a subscribed service can slip through. Trusted titles stay
+ * visible while their check runs (no empty rows on first paint) and drop out if it fails;
+ * untrusted titles only appear once confirmed. A failed lookup hides the title.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { streamingFamilies } from "../services/catalog";
@@ -14,7 +19,7 @@ export interface AvailabilityTarget {
   mediaType: MediaType;
   /** Known provider for this item (e.g. where it was last watched): decides without a lookup. */
   providerName?: string | null;
-  /** Already filtered at the source under the current filter state. */
+  /** Already filtered at the source under the current filter state: shown while verified. */
   trusted?: boolean;
 }
 
@@ -54,14 +59,15 @@ export function useSubscriptionFilter<T>(items: T[], target: (item: T) => Availa
 
   /** Synchronous verdict when possible, `undefined` while a lookup is pending. */
   const decide = (t: AvailabilityTarget): boolean | undefined => {
-    if (t.trusted) return true;
     if (t.providerName) return families.has(providerFamily(-1, t.providerName).key);
-    return verdicts[verdictKey(t)];
+    const v = verdicts[verdictKey(t)];
+    if (v !== undefined) return v;
+    return t.trusted ? true : undefined;
   };
 
   const pendingIds = active
     ? targets
-        .filter((t) => decide(t) === undefined)
+        .filter((t) => !t.providerName && verdicts[verdictKey(t)] === undefined)
         .map((t) => `${t.mediaType}:${t.id}`)
         .join(",")
     : "";
@@ -74,8 +80,9 @@ export function useSubscriptionFilter<T>(items: T[], target: (item: T) => Availa
       const key = `${scope}|${ref}`;
       void streamingFamilies(mt, Number(id), region).then((streaming) => {
         if (!alive) return;
-        // Unknown (lookup failed) stays visible rather than blanking rows on a network hiccup.
-        const ok = streaming === null || [...streaming].some((f) => families.has(f));
+        // Strict: a title is shown only when one of its streaming providers is yours. A failed
+        // lookup can't prove that, so it's hidden.
+        const ok = streaming !== null && [...streaming].some((f) => families.has(f));
         setVerdicts((v) => (key in v ? v : { ...v, [key]: ok }));
       });
     }
