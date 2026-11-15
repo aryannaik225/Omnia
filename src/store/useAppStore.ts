@@ -28,7 +28,7 @@ import {
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
 import { providerFamily } from "../lib/providers";
 
-export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "settings";
+export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings";
 
 export type ModalEntry =
   | { kind: "title"; id: number; mediaType: MediaType; seed?: MediaSummary; autoplay?: boolean }

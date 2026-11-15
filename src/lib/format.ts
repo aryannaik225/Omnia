@@ -14,8 +14,9 @@ export const formatTimeLeft = (progressSeconds: number, durationSeconds: number)
   return `${Math.floor(mins / 60)}h ${mins % 60}m left`;
 };
 
+/** "S2 E5"; "S4" for an imported episode kept under its season without an episode number. */
 export const episodeLabel = (season: number, episode: number) =>
-  season > 0 && episode > 0 ? `S${season} E${episode}` : episode > 0 ? `E${episode}` : null;
+  season > 0 && episode > 0 ? `S${season} E${episode}` : episode > 0 ? `E${episode}` : season > 0 ? `S${season}` : null;
 
 export const ratingLabel = (vote: number | null | undefined) => (vote ? vote.toFixed(1) : null);
 

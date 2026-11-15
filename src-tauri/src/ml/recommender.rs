@@ -47,6 +47,8 @@ pub const BINGE_MULTIPLIER: f64 = 1.8;
 pub const BINGE_EPISODES: usize = 3;
 pub const ABANDONMENT_PENALTY: f64 = -0.8;
 pub const COMFORT_BONUS: f64 = 2.0;
+/// "Love": an explicit favorite is the strongest positive signal (above a rewatch).
+pub const FAVORITE_BONUS: f64 = 3.0;
 const PARTIAL_WEIGHT: f64 = 0.4;
 const WATCHLIST_BONUS: f64 = 0.4;
 const ENGAGEMENT_WEIGHT: f64 = 0.15;
@@ -117,6 +119,8 @@ pub struct TitleSignals {
     pub max_watch_count: i64,
     pub binge: bool,
     pub watchlisted: bool,
+    /// Loved by the user (favorites table).
+    pub favorited: bool,
     pub active_seconds: f64,
     pub seek_forward_seconds: f64,
     pub runtime_seconds: f64,
@@ -152,6 +156,21 @@ fn has_binge_window(times: &mut [DateTime<Utc>]) -> bool {
 }
 
 /// Folds one profile's raw activity into per-title signals.
+/// Marks favorites on the signals, adding titles that have no other interaction.
+pub fn apply_favorites(map: &mut HashMap<TitleKey, TitleSignals>, favorites: &[WatchlistItem]) {
+    for f in favorites {
+        let s = map.entry((f.tmdb_id, f.media_type.clone())).or_insert_with(|| TitleSignals {
+            tmdb_id: f.tmdb_id,
+            media_type: f.media_type.clone(),
+            ..Default::default()
+        });
+        s.favorited = true;
+        if s.last_activity.is_none() {
+            s.last_activity = parse_db_time(&f.added_at);
+        }
+    }
+}
+
 pub fn collect_signals(
     history: &[WatchHistoryEntry],
     events: &[PlaybackEvent],
@@ -259,6 +278,7 @@ pub struct Affinity {
     pub partial: f64,
     pub comfort: f64,
     pub watchlist: f64,
+    pub favorite: f64,
     pub engagement: f64,
     pub binge_multiplier: f64,
     pub abandonment: f64,
@@ -278,6 +298,7 @@ pub fn compute_affinity(s: &TitleSignals, now: DateTime<Utc>) -> Affinity {
     let partial = if completion == 0.0 && !s.abandoned { PARTIAL_WEIGHT * s.max_ratio } else { 0.0 };
     let comfort = if s.max_watch_count > 1 { COMFORT_BONUS } else { 0.0 };
     let watchlist = if s.watchlisted { WATCHLIST_BONUS } else { 0.0 };
+    let favorite = if s.favorited { FAVORITE_BONUS } else { 0.0 };
     let engagement = ENGAGEMENT_WEIGHT * (1.0 + s.active_seconds / 3600.0).ln();
     let binge_multiplier = if s.binge { BINGE_MULTIPLIER } else { 1.0 };
     let abandonment = if s.abandoned { ABANDONMENT_PENALTY } else { 0.0 };
@@ -290,12 +311,15 @@ pub fn compute_affinity(s: &TitleSignals, now: DateTime<Utc>) -> Affinity {
         .last_activity
         .map(|t| (now - t).num_seconds().max(0) as f64 / 86_400.0)
         .unwrap_or(365.0);
-    let floor = if comfort > 0.0 { 0.5 } else { 0.15 };
+    // Loved and rewatched titles stay part of the taste profile even years later.
+    let floor = if favorite > 0.0 { 0.7 } else if comfort > 0.0 { 0.5 } else { 0.15 };
     let recency = 0.5f64.powf(age_days / RECENCY_HALF_LIFE_DAYS).max(floor);
 
-    let positive = completion + partial + comfort + watchlist + engagement;
+    let positive = completion + partial + comfort + watchlist + favorite + engagement;
+    // A favorite overrides an old abandonment: the user said they love it.
+    let abandonment = if favorite > 0.0 { 0.0 } else { abandonment };
     let weight = (positive * binge_multiplier + abandonment + skimming) * recency;
-    Affinity { weight, completion, partial, comfort, watchlist, engagement, binge_multiplier, abandonment, skimming, recency }
+    Affinity { weight, completion, partial, comfort, watchlist, favorite, engagement, binge_multiplier, abandonment, skimming, recency }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -518,6 +542,7 @@ struct Snapshot {
     history: Vec<WatchHistoryEntry>,
     events: Vec<PlaybackEvent>,
     watchlist: Vec<WatchlistItem>,
+    favorites: Vec<WatchlistItem>,
     catalog: HashMap<TitleKey, MediaCatalogEntry>,
     region: String,
     subscriptions_only: bool,
@@ -546,6 +571,7 @@ fn load_snapshot(c: &rusqlite::Connection, app_profile_id: i64) -> rusqlite::Res
         history: queries::list_history(c, app_profile_id, 1_000_000, 0)?,
         events: queries::list_playback_events(c, app_profile_id, None, 100_000)?,
         watchlist: queries::list_watchlist(c, app_profile_id)?,
+        favorites: queries::list_favorites(c, app_profile_id)?,
         subscriptions_only: settings.get(queries::keys::SUBSCRIPTIONS_ONLY).map(String::as_str) == Some("true"),
         stored_model_id: settings.get(queries::keys::EMBEDDING_MODEL_ID).cloned(),
         catalog,
@@ -1058,7 +1084,8 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
     let context = bucket_for_hour(Local::now().hour());
 
     // 1-2. Signals & affinities.
-    let signals = collect_signals(&snap.history, &snap.events, &snap.watchlist);
+    let mut signals = collect_signals(&snap.history, &snap.events, &snap.watchlist);
+    apply_favorites(&mut signals, &snap.favorites);
     let affinities: HashMap<TitleKey, Affinity> = signals.iter().map(|(k, s)| (k.clone(), compute_affinity(s, now))).collect();
 
     // Embedding backend (and invalidate stored vectors if the model changed).
@@ -1341,7 +1368,8 @@ pub async fn get_taste_summary(state: State<'_, AppState>, app_profile_id: i64, 
         .await?
         .ok_or_else(|| AppError::Message(format!("profile {app_profile_id} not found")))?;
     let now = Utc::now();
-    let signals = collect_signals(&snap.history, &snap.events, &snap.watchlist);
+    let mut signals = collect_signals(&snap.history, &snap.events, &snap.watchlist);
+    apply_favorites(&mut signals, &snap.favorites);
     let mut titles: Vec<TasteTitle> = signals
         .iter()
         .map(|(k, s)| TasteTitle {

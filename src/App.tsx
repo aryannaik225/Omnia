@@ -21,6 +21,7 @@ import wordmark from "./assets/omnia-wordmark.png";
 
 // Secondary screens load on demand to keep the startup bundle small.
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
+const CollectionsView = lazy(() => import("./components/views/CollectionsView").then((mod) => ({ default: mod.CollectionsView })));
 const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
 const AccountSyncModal = lazy(() => import("./components/modals/AccountSyncModal").then((mod) => ({ default: mod.AccountSyncModal })));
 
@@ -38,6 +39,8 @@ function CurrentView({ view }: { view: View }) {
       return <HubsView />;
     case "watchlist":
       return <WatchlistView />;
+    case "collections":
+      return <CollectionsView />;
     case "settings":
       return <SettingsView />;
   }

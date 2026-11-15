@@ -11,6 +11,7 @@ pub mod player {
 }
 
 pub mod sync {
+    pub mod airing;
     pub mod history_importer;
 }
 
@@ -110,6 +111,106 @@ async fn list_profiles(state: State<'_, AppState>) -> AppResult<Vec<AppProfile>>
     state.db.run(|c| queries::list_profiles(c)).await
 }
 
+/// Largest image accepted from a pasted avatar URL.
+const MAX_AVATAR_DOWNLOAD: usize = 10 * 1024 * 1024;
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Public web hosts only: a pasted avatar URL must not reach into the local network.
+fn is_public_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d.contains('.') && d != "localhost" && !d.ends_with(".localhost") && !d.ends_with(".local") && !d.ends_with(".internal")
+        }
+        Some(url::Host::Ipv4(ip)) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()),
+        Some(url::Host::Ipv6(ip)) => !(ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80),
+        None => false,
+    }
+}
+
+/// "Paste an image URL" for a profile picture: downloads the image once (no cookies, nothing
+/// about the profile is sent) and returns it as a data URL; the UI crops it to 256 px and stores
+/// it locally, so the picture never loads from that site again.
+#[tauri::command]
+async fn fetch_avatar_image(url: String) -> AppResult<String> {
+    let parsed = url::Url::parse(url.trim()).map_err(|_| invalid("That doesn't look like a web address."))?;
+    if !matches!(parsed.scheme(), "https" | "http") || !is_public_host(&parsed) {
+        return Err(invalid("Use an http(s) link to an image on the web."));
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("Omnia/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || !is_public_host(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()?;
+    let mut resp = client.get(parsed).header("Accept", "image/*").send().await?;
+    if !resp.status().is_success() {
+        return Err(invalid(format!("The image couldn't be downloaded (HTTP {}).", resp.status().as_u16())));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif" | "image/avif" | "image/bmp") {
+        return Err(invalid("That link isn't a PNG, JPEG, WebP or GIF image. Copy the image address itself (right-click → Copy image address)."));
+    }
+    if resp.content_length().is_some_and(|n| n as usize > MAX_AVATAR_DOWNLOAD) {
+        return Err(invalid("That image is larger than 10 MB."));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_AVATAR_DOWNLOAD {
+            return Err(invalid("That image is larger than 10 MB."));
+        }
+    }
+    let mime = if mime == "image/jpg" { "image/jpeg".to_string() } else { mime };
+    Ok(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// `avatar_asset`: a short id (`char:fox`, a palette), a TMDB image URL, or an uploaded image as
+/// a small `data:image/(png|jpeg|webp);base64,…` URL (center-cropped to 256 px in the UI).
+fn validate_avatar(avatar: Option<String>) -> AppResult<Option<String>> {
+    let Some(a) = avatar.map(|a| a.trim().to_string()).filter(|a| !a.is_empty()) else {
+        return Ok(None);
+    };
+    let ok = if let Some(rest) = a.strip_prefix("data:") {
+        a.len() <= 400_000
+            && ["image/png;base64,", "image/jpeg;base64,", "image/webp;base64,"]
+                .iter()
+                .any(|p| rest.strip_prefix(p).is_some_and(|b64| b64.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))))
+    } else if a.starts_with("https://") {
+        a.starts_with("https://image.tmdb.org/t/p/") && a.len() <= 200
+    } else {
+        a.len() <= 64
+    };
+    if ok {
+        Ok(Some(a))
+    } else {
+        Err(invalid("unsupported avatar image"))
+    }
+}
+
 #[tauri::command]
 async fn create_profile(
     state: State<'_, AppState>,
@@ -121,6 +222,7 @@ async fn create_profile(
     if name.is_empty() {
         return Err(invalid("profile name cannot be empty"));
     }
+    let avatar_asset = validate_avatar(avatar_asset)?;
     state
         .db
         .run(move |c| queries::create_profile(c, &name, avatar_asset.as_deref(), is_kids_profile))
@@ -139,6 +241,7 @@ async fn update_profile(
     if name.is_empty() {
         return Err(invalid("profile name cannot be empty"));
     }
+    let avatar_asset = validate_avatar(avatar_asset)?;
     state
         .db
         .run(move |c| queries::update_profile(c, profile_id, &name, avatar_asset.as_deref(), is_kids_profile))
@@ -486,6 +589,244 @@ async fn delete_watch_history_entry(state: State<'_, AppState>, app_profile_id: 
         .db
         .run(move |c| queries::delete_history_entry(c, app_profile_id, id))
         .await
+}
+
+/// "Recently watched": one row per title (latest entry + episode count), paged by title.
+#[tauri::command]
+async fn get_history_titles(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    provider_id: Option<i64>,
+) -> AppResult<Vec<queries::HistoryTitle>> {
+    state
+        .db
+        .run(move |c| {
+            // Platform filter: one provider family, or 0 = "Offline / Manual" (no / unknown provider).
+            let filter = match provider_id {
+                None => None,
+                Some(wanted) => {
+                    let mut f = queries::HistoryProviderFilter { names: Vec::new(), include_unattributed: wanted == 0 };
+                    for (name, _) in queries::history_provider_names(c, app_profile_id)? {
+                        if !name.is_empty() && window_manager::canonical_provider_id(0, &name).max(0) == wanted.max(0) {
+                            f.names.push(name);
+                        }
+                    }
+                    Some(f)
+                }
+            };
+            queries::list_history_titles_filtered(c, app_profile_id, limit.unwrap_or(60), offset.unwrap_or(0), filter.as_ref())
+        })
+        .await
+}
+
+/// Removes a whole title (every episode) from one profile's history.
+#[tauri::command]
+async fn delete_title_history(state: State<'_, AppState>, app_profile_id: i64, tmdb_id: i64, media_type: String) -> AppResult<usize> {
+    check_media_type(&media_type)?;
+    let removed = state
+        .db
+        .run(move |c| queries::delete_title_history(c, app_profile_id, tmdb_id, &media_type))
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    Ok(removed)
+}
+
+/// History rows per provider family (canonical provider id), for "Clear by provider".
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderHistoryCount {
+    provider_id: i64,
+    rows: i64,
+}
+
+#[tauri::command]
+async fn get_history_provider_counts(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<Vec<ProviderHistoryCount>> {
+    let names = state.db.run(move |c| queries::history_provider_names(c, app_profile_id)).await?;
+    let mut by_id: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    for (name, rows) in names {
+        // Rows without a recognised provider (Mark as Watched, file imports) are reported as 0:
+        // "Offline / Manual" in the Watch History filter (never offered for "Clear by provider").
+        let id = if name.is_empty() { 0 } else { window_manager::canonical_provider_id(0, &name).max(0) };
+        *by_id.entry(id).or_default() += rows;
+    }
+    Ok(by_id.into_iter().map(|(provider_id, rows)| ProviderHistoryCount { provider_id, rows }).collect())
+}
+
+/// "Clear by provider": deletes only the profile's history recorded on one provider family
+/// (e.g. a wrongly imported Prime Video history), keeping every other service's rows.
+#[tauri::command]
+async fn clear_provider_history(app: tauri::AppHandle, state: State<'_, AppState>, app_profile_id: i64, provider_id: i64) -> AppResult<usize> {
+    if state.importer.has_running_for(app_profile_id) {
+        return Err(AppError::Message("A history import is running for this profile. Wait for it to finish, then clear.".into()));
+    }
+    window_manager::close_player_for_profile(&app, app_profile_id).await;
+    let canonical = window_manager::canonical_provider_id(provider_id, "");
+    if canonical <= 0 {
+        return Err(AppError::Message("Unknown provider.".into()));
+    }
+    let removed = state
+        .db
+        .run(move |c| {
+            let names: Vec<String> = queries::history_provider_names(c, app_profile_id)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| window_manager::canonical_provider_id(0, name) == canonical)
+                .collect();
+            queries::clear_provider_history(c, app_profile_id, &names)
+        })
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    log::info!("cleared provider {canonical} history of profile {app_profile_id}: {removed} rows");
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Manual tracking, favorites, collections, airing shows
+// ---------------------------------------------------------------------------------------------
+
+/// "Mark as Watched" (cinema, a local file, another device): a completed history row with no
+/// provider. It shows in Watch History and on Continue Watching, and feeds the recommender.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn mark_watched(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    episode_title: Option<String>,
+    duration_seconds: Option<f64>,
+) -> AppResult<queries::WatchHistoryEntry> {
+    check_media_type(&media_type)?;
+    let (s, e) = (season_number.unwrap_or(0), episode_number.unwrap_or(0));
+    if media_type == "tv" && (s <= 0 || e <= 0) {
+        return Err(AppError::Message("Pick an episode to mark as watched.".into()));
+    }
+    let row = state
+        .db
+        .run(move |c| queries::mark_watched_manually(c, app_profile_id, tmdb_id, &media_type, s, e, episode_title.as_deref(), duration_seconds))
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    Ok(row)
+}
+
+#[tauri::command]
+async fn unmark_watched(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: String,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+) -> AppResult<bool> {
+    check_media_type(&media_type)?;
+    let (s, e) = (season_number.unwrap_or(0), episode_number.unwrap_or(0));
+    let changed = state
+        .db
+        .run(move |c| queries::unmark_watched_manually(c, app_profile_id, tmdb_id, &media_type, s, e))
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    Ok(changed)
+}
+
+/// "Love" toggle; returns the new state.
+#[tauri::command]
+async fn set_favorite(state: State<'_, AppState>, app_profile_id: i64, tmdb_id: i64, media_type: String, favorite: bool) -> AppResult<bool> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| {
+            if favorite {
+                queries::add_favorite(c, app_profile_id, tmdb_id, &media_type)?;
+            } else {
+                queries::remove_favorite(c, app_profile_id, tmdb_id, &media_type)?;
+            }
+            Ok(())
+        })
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    Ok(favorite)
+}
+
+#[tauri::command]
+async fn is_favorite(state: State<'_, AppState>, app_profile_id: i64, tmdb_id: i64, media_type: String) -> AppResult<bool> {
+    state.db.run(move |c| queries::is_favorite(c, app_profile_id, tmdb_id, &media_type)).await
+}
+
+#[tauri::command]
+async fn get_favorites(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<Vec<queries::WatchlistItem>> {
+    state.db.run(move |c| queries::list_favorites(c, app_profile_id)).await
+}
+
+#[tauri::command]
+async fn get_collections(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<Vec<queries::Collection>> {
+    state.db.run(move |c| queries::list_collections(c, app_profile_id)).await
+}
+
+#[tauri::command]
+async fn create_collection(state: State<'_, AppState>, app_profile_id: i64, name: String) -> AppResult<queries::Collection> {
+    state
+        .db
+        .run(move |c| queries::create_collection(c, app_profile_id, &name))
+        .await?
+        .ok_or_else(|| AppError::Message("Give the collection a name.".into()))
+}
+
+#[tauri::command]
+async fn rename_collection(state: State<'_, AppState>, app_profile_id: i64, collection_id: i64, name: String) -> AppResult<()> {
+    let ok = state
+        .db
+        .run(move |c| queries::rename_collection(c, app_profile_id, collection_id, &name))
+        .await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Message("That name is empty or already used by another collection.".into()))
+    }
+}
+
+#[tauri::command]
+async fn delete_collection(state: State<'_, AppState>, app_profile_id: i64, collection_id: i64) -> AppResult<bool> {
+    state.db.run(move |c| queries::delete_collection(c, app_profile_id, collection_id)).await
+}
+
+#[tauri::command]
+async fn add_to_collection(state: State<'_, AppState>, app_profile_id: i64, collection_id: i64, tmdb_id: i64, media_type: String) -> AppResult<bool> {
+    check_media_type(&media_type)?;
+    state
+        .db
+        .run(move |c| queries::add_to_collection(c, app_profile_id, collection_id, tmdb_id, &media_type))
+        .await
+}
+
+#[tauri::command]
+async fn remove_from_collection(state: State<'_, AppState>, app_profile_id: i64, collection_id: i64, tmdb_id: i64, media_type: String) -> AppResult<bool> {
+    state
+        .db
+        .run(move |c| queries::remove_from_collection(c, app_profile_id, collection_id, tmdb_id, &media_type))
+        .await
+}
+
+#[tauri::command]
+async fn get_collection_items(state: State<'_, AppState>, app_profile_id: i64, collection_id: i64) -> AppResult<Vec<queries::WatchlistItem>> {
+    state.db.run(move |c| queries::list_collection_items(c, app_profile_id, collection_id)).await
+}
+
+#[tauri::command]
+async fn get_title_collections(state: State<'_, AppState>, app_profile_id: i64, tmdb_id: i64, media_type: String) -> AppResult<Vec<i64>> {
+    state
+        .db
+        .run(move |c| queries::collections_with_title(c, app_profile_id, tmdb_id, &media_type))
+        .await
+}
+
+/// Home load: brings caught-up airing series with a new episode back to Continue Watching.
+#[tauri::command]
+async fn check_airing_shows(state: State<'_, AppState>, app_profile_id: i64) -> AppResult<usize> {
+    sync::airing::check_airing_shows(&state, app_profile_id).await
 }
 
 /// "Clear Watch History" (Settings → Connect Accounts): wipes the profile's watch history and
@@ -925,6 +1266,25 @@ pub fn run() {
             get_title_progress,
             delete_watch_history_entry,
             clear_watch_history,
+            get_history_titles,
+            delete_title_history,
+            get_history_provider_counts,
+            clear_provider_history,
+            mark_watched,
+            unmark_watched,
+            set_favorite,
+            is_favorite,
+            get_favorites,
+            get_collections,
+            create_collection,
+            rename_collection,
+            delete_collection,
+            add_to_collection,
+            remove_from_collection,
+            get_collection_items,
+            get_title_collections,
+            check_airing_shows,
+            fetch_avatar_image,
             identify_title,
             import_watch_history,
             export_watch_history,
@@ -963,4 +1323,25 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Omnia");
+}
+
+#[cfg(test)]
+mod avatar_url_tests {
+    use super::*;
+
+    #[test]
+    fn avatar_urls_are_public_only_and_base64_is_standard() {
+        let ok = |u: &str| is_public_host(&url::Url::parse(u).unwrap());
+        assert!(ok("https://i.redd.it/abc.png"));
+        assert!(!ok("http://localhost:8080/x.png"));
+        assert!(!ok("http://192.168.1.10/x.png"));
+        assert!(!ok("http://127.0.0.1/x.png"));
+        assert!(!ok("http://[::1]/x.png"));
+        assert!(!ok("http://printer.local/x.png"));
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert!(validate_avatar(Some(format!("data:image/png;base64,{}", base64_encode(b"png")))).is_ok());
+        assert!(validate_avatar(Some("https://evil.example/x.png".into())).is_err());
+    }
 }

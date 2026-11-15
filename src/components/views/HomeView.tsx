@@ -4,7 +4,7 @@ import { useSubscriptionFilter } from "../../lib/availability";
 import { useAsync } from "../../lib/hooks";
 import { groupByFamily } from "../../lib/providers";
 import { discover, isKidsSafe, trending, type MediaSummary } from "../../services/tmdbClient";
-import { recommendations, type RecommendationRow } from "../../services/tauriBridge";
+import { history, recommendations, type RecommendationRow } from "../../services/tauriBridge";
 import { availabilityKey, useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { MatchBadge, SkeletonCard } from "../common/Cards";
 import { RefreshIcon } from "../common/Icons";
@@ -92,7 +92,28 @@ function RecommendationRows() {
   );
 }
 
+/** Profiles whose airing shows were checked this session (Rust also throttles per series). */
+const airingChecked = new Set<number>();
+
+/** Brings caught-up airing series with a new episode back to Continue Watching. */
+function useAiringShowsCheck() {
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  const tmdbReady = useAppStore((s) => s.tmdbReady);
+  const refresh = useAppStore((s) => s.refreshContinueWatching);
+  useEffect(() => {
+    if (!profileId || !tmdbReady || airingChecked.has(profileId)) return;
+    airingChecked.add(profileId);
+    history
+      .checkAiringShows(profileId)
+      .then((n) => {
+        if (n > 0) void refresh();
+      })
+      .catch(() => airingChecked.delete(profileId));
+  }, [profileId, tmdbReady, refresh]);
+}
+
 export function HomeView() {
+  useAiringShowsCheck();
   const catalogKey = useCatalogKey();
   const ctx = useAppStore((s) => s.catalogContext)();
   const kids = useAppStore((s) => s.isKids());

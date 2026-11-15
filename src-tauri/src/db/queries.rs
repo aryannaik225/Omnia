@@ -638,7 +638,9 @@ pub fn list_interacted_media(
              WHERE EXISTS (SELECT 1 FROM watch_history wh WHERE wh.app_profile_id = ?1
                              AND wh.tmdb_id = mc.tmdb_id AND wh.media_type = mc.media_type)
                 OR EXISTS (SELECT 1 FROM watchlist wl WHERE wl.app_profile_id = ?1
-                             AND wl.tmdb_id = mc.tmdb_id AND wl.media_type = mc.media_type)"
+                             AND wl.tmdb_id = mc.tmdb_id AND wl.media_type = mc.media_type)
+                OR EXISTS (SELECT 1 FROM favorites f WHERE f.app_profile_id = ?1
+                             AND f.tmdb_id = mc.tmdb_id AND f.media_type = mc.media_type)"
         ),
         [app_profile_id],
         map_media,
@@ -1010,6 +1012,120 @@ pub fn list_history_with_media(
     )
 }
 
+/// One "Recently watched" card: the title's most recent history row plus how many rows it has.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTitle {
+    #[serde(flatten)]
+    pub latest: HistoryWithMedia,
+    pub entry_count: i64,
+}
+
+/// Recently watched titles, grouped in SQL (one row per title, newest first) so a lifetime
+/// import of thousands of episodes pages by *title* instead of hiding older shows behind the
+/// newest few hundred episode rows. Rows kept without an episode number are included.
+/// Watch History platform filter: rows stored under these provider names, plus (optionally)
+/// rows with no provider at all ("Offline / Manual": Mark as Watched, file imports).
+#[derive(Debug, Clone, Default)]
+pub struct HistoryProviderFilter {
+    pub names: Vec<String>,
+    pub include_unattributed: bool,
+}
+
+pub fn list_history_titles(
+    c: &Connection,
+    app_profile_id: i64,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<Vec<HistoryTitle>> {
+    list_history_titles_filtered(c, app_profile_id, limit, offset, None)
+}
+
+pub fn list_history_titles_filtered(
+    c: &Connection,
+    app_profile_id: i64,
+    limit: i64,
+    offset: i64,
+    filter: Option<&HistoryProviderFilter>,
+) -> rusqlite::Result<Vec<HistoryTitle>> {
+    let names_json = filter.map(|f| serde_json::to_string(&f.names).unwrap_or_else(|_| "[]".into()));
+    let unattributed = filter.is_some_and(|f| f.include_unattributed);
+    let cols = WATCH_COLS
+        .split(", ")
+        .map(|col| format!("wh.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    collect_rows(
+        c,
+        &format!(
+            "WITH ranked AS (
+                 SELECT *,
+                        ROW_NUMBER() OVER (PARTITION BY tmdb_id, media_type ORDER BY last_watched_at DESC, id DESC) AS rn,
+                        COUNT(*) OVER (PARTITION BY tmdb_id, media_type) AS entry_count
+                 FROM watch_history WHERE app_profile_id = ?1
+                   AND (?4 IS NULL
+                        OR provider_name IN (SELECT value FROM json_each(?4))
+                        OR (?5 = 1 AND (provider_name IS NULL OR provider_name = '')))
+             )
+             SELECT {cols}, mc.title, mc.poster_path, mc.backdrop_path, mc.release_year, wh.entry_count
+             FROM ranked wh
+             LEFT JOIN media_catalog mc ON mc.tmdb_id = wh.tmdb_id AND mc.media_type = wh.media_type
+             WHERE wh.rn = 1
+             ORDER BY wh.last_watched_at DESC, wh.id DESC
+             LIMIT ?2 OFFSET ?3"
+        ),
+        params![app_profile_id, limit.clamp(1, 10_000), offset.max(0), names_json, unattributed],
+        |r| {
+            Ok(HistoryTitle {
+                latest: HistoryWithMedia {
+                    entry: map_watch(r)?,
+                    title: r.get(17)?,
+                    poster_path: r.get(18)?,
+                    backdrop_path: r.get(19)?,
+                    release_year: r.get(20)?,
+                },
+                entry_count: r.get(21)?,
+            })
+        },
+    )
+}
+
+/// Removes every history row of one title (all its episodes) for one profile.
+pub fn delete_title_history(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<usize> {
+    c.execute(
+        "DELETE FROM watch_history WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+    )
+}
+
+/// History row counts per stored provider name for one profile (rows without one are skipped).
+/// Rows without a provider (Mark as Watched, file imports) are reported under "".
+pub fn history_provider_names(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<(String, i64)>> {
+    collect_rows(
+        c,
+        "SELECT COALESCE(provider_name, ''), COUNT(*) FROM watch_history
+         WHERE app_profile_id = ?1
+         GROUP BY COALESCE(provider_name, '')",
+        params![app_profile_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+}
+
+/// "Clear by provider": deletes only this profile's history rows recorded under the given
+/// provider names (one provider family), in one transaction. Other providers are untouched.
+pub fn clear_provider_history(c: &mut Connection, app_profile_id: i64, provider_names: &[String]) -> rusqlite::Result<usize> {
+    let tx = c.transaction()?;
+    let mut removed = 0;
+    for name in provider_names {
+        removed += tx.execute(
+            "DELETE FROM watch_history WHERE app_profile_id = ?1 AND provider_name = ?2",
+            params![app_profile_id, name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
 pub fn delete_history_entry(c: &Connection, app_profile_id: i64, id: i64) -> rusqlite::Result<bool> {
     Ok(c.execute(
         "DELETE FROM watch_history WHERE id = ?1 AND app_profile_id = ?2",
@@ -1033,6 +1149,7 @@ pub fn clear_profile_history(c: &mut Connection, app_profile_id: i64) -> rusqlit
     let history_rows = tx.execute("DELETE FROM watch_history WHERE app_profile_id = ?1", params![app_profile_id])?;
     let playback_events = tx.execute("DELETE FROM playback_events WHERE app_profile_id = ?1", params![app_profile_id])?;
     tx.execute("DELETE FROM continue_watching_hidden WHERE app_profile_id = ?1", params![app_profile_id])?;
+    tx.execute("DELETE FROM airing_checks WHERE app_profile_id = ?1", params![app_profile_id])?;
     tx.execute(
         "UPDATE media_embeddings SET computed_affinity_score = 0.0 WHERE app_profile_id = ?1",
         params![app_profile_id],
@@ -1053,6 +1170,18 @@ pub struct ContinueWatchingItem {
     pub runtime_mins: Option<i64>,
     /// True when the latest episode of a series was finished: the card should offer the next episode.
     pub up_next: bool,
+    /// Recorded with "Mark as Watched" (not played in a provider).
+    pub is_manual: bool,
+    /// A caught-up airing series that has a new episode out (S/E and air date), from `airing_checks`.
+    pub new_episode: Option<NewEpisode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewEpisode {
+    pub season_number: i64,
+    pub episode_number: i64,
+    pub air_date: String,
 }
 
 /// The "Continue Watching" shelf: one card per title (the most recent episode for series),
@@ -1071,7 +1200,8 @@ pub fn continue_watching(
     collect_rows(
         c,
         &format!(
-            "SELECT {cols}, mc.title, mc.poster_path, mc.backdrop_path, mc.release_year, mc.runtime_mins
+            "SELECT {cols}, mc.title, mc.poster_path, mc.backdrop_path, mc.release_year, mc.runtime_mins,
+                    w.is_manual, a.new_season, a.new_episode, a.new_air_date
              FROM (
                 SELECT wh.*, ROW_NUMBER() OVER (
                     PARTITION BY wh.tmdb_id, wh.media_type
@@ -1082,23 +1212,34 @@ pub fn continue_watching(
              LEFT JOIN media_catalog mc ON mc.tmdb_id = w.tmdb_id AND mc.media_type = w.media_type
              LEFT JOIN continue_watching_hidden h
                 ON h.app_profile_id = w.app_profile_id AND h.tmdb_id = w.tmdb_id AND h.media_type = w.media_type
+             LEFT JOIN airing_checks a
+                ON a.app_profile_id = w.app_profile_id AND a.tmdb_id = w.tmdb_id AND w.media_type = 'tv'
              WHERE w.rn = 1
-               -- Silent import: only titles whose latest activity was played in Omnia.
-               AND w.is_imported = 0
-               -- Hidden by the user, unless watched again after hiding.
-               AND (h.hidden_at IS NULL OR w.last_watched_at > h.hidden_at)
+               -- Hidden by the user, unless watched again (or a new episode aired) after hiding.
+               AND (h.hidden_at IS NULL OR w.last_watched_at > h.hidden_at OR a.new_air_date > date(h.hidden_at))
                AND (
-                (w.is_completed = 0 AND w.progress_seconds >= 30)
-                OR (w.media_type = 'tv' AND w.is_completed = 1
-                    AND w.last_watched_at >= datetime('now', '-30 days'))
+                -- Silent import: in-progress / Up Next only for titles last played in Omnia.
+                (w.is_imported = 0 AND (
+                    (w.is_completed = 0 AND w.progress_seconds >= 30)
+                    OR (w.media_type = 'tv' AND w.is_completed = 1
+                        AND w.last_watched_at >= datetime('now', '-30 days'))
+                    -- Mark as Watched: a movie stays visible for a week as a confirmation.
+                    OR (w.is_manual = 1 AND w.last_watched_at >= datetime('now', '-7 days'))))
+                -- An airing show you were caught up on has a new episode (imported or not).
+                OR (w.media_type = 'tv' AND w.is_completed = 1 AND a.new_air_date IS NOT NULL
+                    AND a.new_air_date > date(w.last_watched_at))
              )
-             ORDER BY w.last_watched_at DESC
+             ORDER BY COALESCE(MAX(a.new_air_date, date(w.last_watched_at)), w.last_watched_at) DESC, w.last_watched_at DESC
              LIMIT ?2"
         ),
         params![app_profile_id, limit.clamp(1, 200)],
         |r| {
             let entry = map_watch(r)?;
             let up_next = entry.is_completed && entry.media_type == "tv";
+            let new_episode = match (r.get::<_, Option<i64>>(23)?, r.get::<_, Option<i64>>(24)?, r.get::<_, Option<String>>(25)?) {
+                (Some(season_number), Some(episode_number), Some(air_date)) if up_next => Some(NewEpisode { season_number, episode_number, air_date }),
+                _ => None,
+            };
             Ok(ContinueWatchingItem {
                 entry,
                 title: r.get(17)?,
@@ -1107,6 +1248,8 @@ pub fn continue_watching(
                 release_year: r.get(20)?,
                 runtime_mins: r.get(21)?,
                 up_next,
+                is_manual: r.get(22)?,
+                new_episode,
             })
         },
     )
@@ -1704,6 +1847,371 @@ pub fn clear_preferred_provider(c: &Connection, app_profile_id: i64, tmdb_id: i6
 // Tests
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// Manual tracking ("Mark as Watched")
+// ---------------------------------------------------------------------------------------------
+
+/// Records a title / episode as watched by hand (cinema, a local file, another device): a
+/// completed, non-imported row without a provider. Marking again counts as a rewatch.
+#[allow(clippy::too_many_arguments)]
+pub fn mark_watched_manually(
+    c: &Connection,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+    season_number: i64,
+    episode_number: i64,
+    episode_title: Option<&str>,
+    duration_seconds: Option<f64>,
+) -> rusqlite::Result<WatchHistoryEntry> {
+    let (season, episode) = if media_type == "tv" { (season_number.max(0), episode_number.max(0)) } else { (0, 0) };
+    let duration = duration_seconds.filter(|d| d.is_finite() && *d > 1.0).unwrap_or(1.0);
+    c.execute(
+        "INSERT INTO watch_history
+            (app_profile_id, tmdb_id, media_type, season_number, episode_number, episode_title, provider_name,
+             progress_seconds, duration_seconds, is_completed, watch_count, abandoned, last_watched_at,
+             time_of_day_bucket, is_imported, is_manual)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1, 1, 0, datetime('now'), ?8, 0, 1)
+         ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
+            watch_count = watch_history.watch_count + CASE WHEN watch_history.is_completed = 1 THEN 1 ELSE 0 END,
+            duration_seconds = MAX(watch_history.duration_seconds, excluded.duration_seconds),
+            progress_seconds = MAX(watch_history.duration_seconds, excluded.duration_seconds),
+            is_completed = 1,
+            abandoned = 0,
+            episode_title = COALESCE(watch_history.episode_title, excluded.episode_title),
+            last_watched_at = datetime('now'),
+            time_of_day_bucket = excluded.time_of_day_bucket,
+            is_imported = 0,
+            is_manual = 1",
+        params![app_profile_id, tmdb_id, media_type, season, episode, episode_title, duration, current_time_of_day_bucket()],
+    )?;
+    get_history_entry(c, app_profile_id, tmdb_id, media_type, season, episode)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Undoes "Mark as Watched": a hand-made row (no provider) is deleted; a row that also came
+/// from a provider just loses its manual flag (its real progress stays).
+pub fn unmark_watched_manually(
+    c: &Connection,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+    season_number: i64,
+    episode_number: i64,
+) -> rusqlite::Result<bool> {
+    let (season, episode) = if media_type == "tv" { (season_number, episode_number) } else { (0, 0) };
+    let deleted = c.execute(
+        "DELETE FROM watch_history
+          WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3 AND season_number = ?4 AND episode_number = ?5
+            AND is_manual = 1 AND (provider_name IS NULL OR provider_name = '')",
+        params![app_profile_id, tmdb_id, media_type, season, episode],
+    )?;
+    let updated = c.execute(
+        "UPDATE watch_history SET is_manual = 0
+          WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3 AND season_number = ?4 AND episode_number = ?5
+            AND is_manual = 1",
+        params![app_profile_id, tmdb_id, media_type, season, episode],
+    )?;
+    Ok(deleted + updated > 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Favorites ("Love")
+// ---------------------------------------------------------------------------------------------
+
+pub fn add_favorite(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO favorites (app_profile_id, tmdb_id, media_type, added_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        params![app_profile_id, tmdb_id, media_type],
+    )?;
+    Ok(())
+}
+
+pub fn remove_favorite(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM favorites WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+    )? > 0)
+}
+
+pub fn is_favorite(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM favorites WHERE app_profile_id = ?1 AND tmdb_id = ?2 AND media_type = ?3)",
+        params![app_profile_id, tmdb_id, media_type],
+        |r| r.get(0),
+    )
+}
+
+/// Favorites with catalog metadata, newest first (same shape as the watchlist).
+pub fn list_favorites(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<WatchlistItem>> {
+    collect_rows(
+        c,
+        "SELECT f.app_profile_id, f.tmdb_id, f.media_type, f.added_at,
+                mc.title, mc.poster_path, mc.backdrop_path, mc.release_year, mc.vote_average
+         FROM favorites f
+         LEFT JOIN media_catalog mc ON mc.tmdb_id = f.tmdb_id AND mc.media_type = f.media_type
+         WHERE f.app_profile_id = ?1
+         ORDER BY f.added_at DESC",
+        [app_profile_id],
+        map_listed_item,
+    )
+}
+
+fn map_listed_item(r: &Row<'_>) -> rusqlite::Result<WatchlistItem> {
+    Ok(WatchlistItem {
+        app_profile_id: r.get(0)?,
+        tmdb_id: r.get(1)?,
+        media_type: r.get(2)?,
+        added_at: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        title: r.get(4)?,
+        poster_path: r.get(5)?,
+        backdrop_path: r.get(6)?,
+        release_year: r.get(7)?,
+        vote_average: r.get(8)?,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Collections (custom lists)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Collection {
+    pub collection_id: i64,
+    pub app_profile_id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub item_count: i64,
+    /// Up to four poster paths of the newest items (cover mosaic).
+    pub cover_posters: Vec<String>,
+}
+
+/// Collection names: trimmed, 1-60 characters.
+pub fn clean_collection_name(name: &str) -> Option<String> {
+    let name: String = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then(|| name.chars().take(60).collect())
+}
+
+fn collection_owned(c: &Connection, app_profile_id: i64, collection_id: i64) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collections WHERE collection_id = ?1 AND app_profile_id = ?2)",
+        params![collection_id, app_profile_id],
+        |r| r.get(0),
+    )
+}
+
+fn touch_collection(c: &Connection, collection_id: i64) -> rusqlite::Result<()> {
+    c.execute("UPDATE collections SET updated_at = datetime('now') WHERE collection_id = ?1", [collection_id])?;
+    Ok(())
+}
+
+pub fn list_collections(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<Collection>> {
+    let mut rows = collect_rows(
+        c,
+        "SELECT col.collection_id, col.app_profile_id, col.name, col.created_at, col.updated_at,
+                (SELECT COUNT(*) FROM collection_items ci WHERE ci.collection_id = col.collection_id)
+         FROM collections col
+         WHERE col.app_profile_id = ?1
+         ORDER BY col.updated_at DESC, col.collection_id DESC",
+        [app_profile_id],
+        |r| {
+            Ok(Collection {
+                collection_id: r.get(0)?,
+                app_profile_id: r.get(1)?,
+                name: r.get(2)?,
+                created_at: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                updated_at: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                item_count: r.get(5)?,
+                cover_posters: Vec::new(),
+            })
+        },
+    )?;
+    for col in &mut rows {
+        col.cover_posters = collect_rows(
+            c,
+            "SELECT mc.poster_path FROM collection_items ci
+             JOIN media_catalog mc ON mc.tmdb_id = ci.tmdb_id AND mc.media_type = ci.media_type
+             WHERE ci.collection_id = ?1 AND mc.poster_path IS NOT NULL
+             ORDER BY ci.added_at DESC LIMIT 4",
+            [col.collection_id],
+            |r| r.get(0),
+        )?;
+    }
+    Ok(rows)
+}
+
+/// Creates a collection; a name the profile already uses (case-insensitive) returns that one.
+pub fn create_collection(c: &Connection, app_profile_id: i64, name: &str) -> rusqlite::Result<Option<Collection>> {
+    let Some(name) = clean_collection_name(name) else {
+        return Ok(None);
+    };
+    c.execute(
+        "INSERT OR IGNORE INTO collections (app_profile_id, name, created_at, updated_at) VALUES (?1, ?2, datetime('now'), datetime('now'))",
+        params![app_profile_id, name],
+    )?;
+    let id: i64 = c.query_row(
+        "SELECT collection_id FROM collections WHERE app_profile_id = ?1 AND name = ?2 COLLATE NOCASE",
+        params![app_profile_id, name],
+        |r| r.get(0),
+    )?;
+    Ok(list_collections(c, app_profile_id)?.into_iter().find(|col| col.collection_id == id))
+}
+
+/// Renames a collection. `Ok(false)` when it isn't this profile's, or the name is empty / taken.
+pub fn rename_collection(c: &Connection, app_profile_id: i64, collection_id: i64, name: &str) -> rusqlite::Result<bool> {
+    let Some(name) = clean_collection_name(name) else {
+        return Ok(false);
+    };
+    let taken: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collections WHERE app_profile_id = ?1 AND name = ?2 COLLATE NOCASE AND collection_id <> ?3)",
+        params![app_profile_id, name, collection_id],
+        |r| r.get(0),
+    )?;
+    if taken {
+        return Ok(false);
+    }
+    Ok(c.execute(
+        "UPDATE collections SET name = ?3, updated_at = datetime('now') WHERE collection_id = ?1 AND app_profile_id = ?2",
+        params![collection_id, app_profile_id, name],
+    )? > 0)
+}
+
+pub fn delete_collection(c: &mut Connection, app_profile_id: i64, collection_id: i64) -> rusqlite::Result<bool> {
+    let tx = c.transaction()?;
+    if !collection_owned(&tx, app_profile_id, collection_id)? {
+        return Ok(false);
+    }
+    tx.execute("DELETE FROM collection_items WHERE collection_id = ?1", [collection_id])?;
+    tx.execute("DELETE FROM collections WHERE collection_id = ?1", [collection_id])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub fn add_to_collection(c: &Connection, app_profile_id: i64, collection_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    if !collection_owned(c, app_profile_id, collection_id)? {
+        return Ok(false);
+    }
+    let added = c.execute(
+        "INSERT OR IGNORE INTO collection_items (collection_id, tmdb_id, media_type, added_at) VALUES (?1, ?2, ?3, datetime('now'))",
+        params![collection_id, tmdb_id, media_type],
+    )? > 0;
+    touch_collection(c, collection_id)?;
+    Ok(added)
+}
+
+pub fn remove_from_collection(c: &Connection, app_profile_id: i64, collection_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<bool> {
+    if !collection_owned(c, app_profile_id, collection_id)? {
+        return Ok(false);
+    }
+    let removed = c.execute(
+        "DELETE FROM collection_items WHERE collection_id = ?1 AND tmdb_id = ?2 AND media_type = ?3",
+        params![collection_id, tmdb_id, media_type],
+    )? > 0;
+    if removed {
+        touch_collection(c, collection_id)?;
+    }
+    Ok(removed)
+}
+
+/// A collection's titles with catalog metadata, newest first (same shape as the watchlist).
+pub fn list_collection_items(c: &Connection, app_profile_id: i64, collection_id: i64) -> rusqlite::Result<Vec<WatchlistItem>> {
+    collect_rows(
+        c,
+        "SELECT col.app_profile_id, ci.tmdb_id, ci.media_type, ci.added_at,
+                mc.title, mc.poster_path, mc.backdrop_path, mc.release_year, mc.vote_average
+         FROM collection_items ci
+         JOIN collections col ON col.collection_id = ci.collection_id
+         LEFT JOIN media_catalog mc ON mc.tmdb_id = ci.tmdb_id AND mc.media_type = ci.media_type
+         WHERE ci.collection_id = ?1 AND col.app_profile_id = ?2
+         ORDER BY ci.added_at DESC",
+        params![collection_id, app_profile_id],
+        map_listed_item,
+    )
+}
+
+/// Ids of this profile's collections that contain the title (the detail view's checkmarks).
+pub fn collections_with_title(c: &Connection, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> rusqlite::Result<Vec<i64>> {
+    collect_rows(
+        c,
+        "SELECT ci.collection_id FROM collection_items ci
+         JOIN collections col ON col.collection_id = ci.collection_id
+         WHERE col.app_profile_id = ?1 AND ci.tmdb_id = ?2 AND ci.media_type = ?3",
+        params![app_profile_id, tmdb_id, media_type],
+        |r| r.get(0),
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Airing shows
+// ---------------------------------------------------------------------------------------------
+
+/// A series whose most recent activity is a finished episode (the user may be caught up).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiringCandidate {
+    pub tmdb_id: i64,
+    pub season_number: i64,
+    pub episode_number: i64,
+    /// `YYYY-MM-DD` of the last watch.
+    pub last_watched_date: String,
+}
+
+/// Series to check for new episodes: the furthest episode watched is finished, it was watched in
+/// the last `within_days`, and the series wasn't checked in the last `recheck_hours`.
+pub fn airing_candidates(
+    c: &Connection,
+    app_profile_id: i64,
+    within_days: i64,
+    recheck_hours: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<AiringCandidate>> {
+    collect_rows(
+        c,
+        "SELECT w.tmdb_id, w.season_number, w.episode_number, date(w.last_watched_at)
+         FROM (
+            SELECT wh.*, ROW_NUMBER() OVER (
+                PARTITION BY wh.tmdb_id ORDER BY wh.season_number DESC, wh.episode_number DESC, wh.last_watched_at DESC) AS rn
+            FROM watch_history wh
+            WHERE wh.app_profile_id = ?1 AND wh.media_type = 'tv' AND wh.season_number > 0 AND wh.episode_number > 0
+         ) w
+         LEFT JOIN airing_checks a ON a.app_profile_id = w.app_profile_id AND a.tmdb_id = w.tmdb_id
+         WHERE w.rn = 1
+           AND (w.is_completed = 1 OR w.completion_ratio >= 0.9)
+           AND w.last_watched_at >= datetime('now', '-' || ?2 || ' days')
+           AND (a.checked_at IS NULL OR a.checked_at < datetime('now', '-' || ?3 || ' hours'))
+         ORDER BY w.last_watched_at DESC
+         LIMIT ?4",
+        params![app_profile_id, within_days, recheck_hours, limit.clamp(1, 500)],
+        |r| {
+            Ok(AiringCandidate {
+                tmdb_id: r.get(0)?,
+                season_number: r.get(1)?,
+                episode_number: r.get(2)?,
+                last_watched_date: r.get(3)?,
+            })
+        },
+    )
+}
+
+/// Stores a check result (`new` = the first unwatched episode that aired after the last watch).
+pub fn record_airing_check(c: &Connection, app_profile_id: i64, tmdb_id: i64, new: Option<&NewEpisode>) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO airing_checks (app_profile_id, tmdb_id, checked_at, new_season, new_episode, new_air_date)
+         VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5)
+         ON CONFLICT(app_profile_id, tmdb_id) DO UPDATE SET
+            checked_at = excluded.checked_at, new_season = excluded.new_season,
+            new_episode = excluded.new_episode, new_air_date = excluded.new_air_date",
+        params![
+            app_profile_id,
+            tmdb_id,
+            new.map(|n| n.season_number),
+            new.map(|n| n.episode_number),
+            new.map(|n| n.air_date.clone())
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,5 +2526,147 @@ mod tests {
         // Re-importing older activity never silences a title played in Omnia.
         upsert_imported_history(&mut c, &[episode]).unwrap();
         assert_eq!(continue_watching(&c, 1, 20).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_titles_group_lifetime_imports_and_clear_by_provider() {
+        let mut c = test_db();
+        let base = HistoryImport {
+            app_profile_id: 1,
+            tmdb_id: 66732,
+            media_type: "tv".into(),
+            season_number: 4,
+            episode_number: 0, // kept under its season without an episode number
+            episode_title: Some("Chapter One: The Hellfire Club".into()),
+            provider_name: Some("Netflix".into()),
+            direct_url: None,
+            progress_seconds: 0.0,
+            duration_seconds: 1.0,
+            is_completed: true,
+            watched_at: Some("2022-05-28T20:00:00Z".into()),
+            time_of_day_bucket: None,
+            watch_count: None,
+        };
+        // 500 newer episodes of another show must not push the older series off the list.
+        let mut rows: Vec<HistoryImport> = (1..=500)
+            .map(|e| HistoryImport { tmdb_id: 1668, season_number: 1 + e / 30, episode_number: e % 30 + 1, watched_at: Some("2024-01-01T10:00:00Z".into()), episode_title: None, ..base.clone() })
+            .collect();
+        rows.push(base.clone());
+        rows.push(HistoryImport { tmdb_id: 603, media_type: "movie".into(), season_number: 0, provider_name: Some("Amazon Prime Video".into()), ..base.clone() });
+        upsert_imported_history(&mut c, &rows).unwrap();
+
+        let titles = list_history_titles(&c, 1, 100, 0).unwrap();
+        assert_eq!(titles.len(), 3);
+        let st = titles.iter().find(|t| t.latest.entry.tmdb_id == 66732).unwrap();
+        assert_eq!((st.latest.entry.season_number, st.latest.entry.episode_number, st.entry_count), (4, 0, 1));
+        assert!(titles.iter().any(|t| t.latest.entry.tmdb_id == 1668 && t.entry_count > 400));
+
+        let names = history_provider_names(&c, 1).unwrap();
+        assert!(names.contains(&("Amazon Prime Video".to_string(), 1)));
+        assert_eq!(clear_provider_history(&mut c, 1, &["Amazon Prime Video".to_string()]).unwrap(), 1);
+        let titles = list_history_titles(&c, 1, 100, 0).unwrap();
+        assert_eq!(titles.len(), 2);
+        assert!(titles.iter().all(|t| t.latest.entry.provider_name.as_deref() == Some("Netflix")));
+        assert_eq!(delete_title_history(&c, 1, 66732, "tv").unwrap(), 1);
+    }
+
+    #[test]
+    fn manual_tracking_shows_on_continue_watching_and_undoes_cleanly() {
+        let c = test_db();
+        // A movie seen in the cinema: in history + Continue Watching (for a week), no provider.
+        let row = mark_watched_manually(&c, 1, 603, "movie", 0, 0, None, Some(8160.0)).unwrap();
+        assert!(row.is_completed && row.provider_name.is_none());
+        let cw = continue_watching(&c, 1, 20).unwrap();
+        assert_eq!(cw.len(), 1);
+        assert!(cw[0].is_manual && !cw[0].up_next);
+        // Marking again is a rewatch (Comfort Favorite signal).
+        assert_eq!(mark_watched_manually(&c, 1, 603, "movie", 0, 0, None, None).unwrap().watch_count, 2);
+        // An episode watched elsewhere: Up Next for the series.
+        mark_watched_manually(&c, 1, 1396, "tv", 1, 1, Some("Pilot"), Some(3480.0)).unwrap();
+        let cw = continue_watching(&c, 1, 20).unwrap();
+        assert!(cw.iter().any(|i| i.entry.tmdb_id == 1396 && i.up_next));
+        // Undo deletes hand-made rows.
+        assert!(unmark_watched_manually(&c, 1, 603, "movie", 0, 0).unwrap());
+        assert!(get_title_history(&c, 1, 603, "movie").unwrap().is_empty());
+        // Watch History "Offline / Manual" filter.
+        let manual = HistoryProviderFilter { names: vec![], include_unattributed: true };
+        let rows = list_history_titles_filtered(&c, 1, 50, 0, Some(&manual)).unwrap();
+        assert_eq!(rows.len(), 1);
+        let netflix = HistoryProviderFilter { names: vec!["Netflix".into()], include_unattributed: false };
+        assert!(list_history_titles_filtered(&c, 1, 50, 0, Some(&netflix)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn favorites_and_collections_are_profile_scoped() {
+        let mut c = test_db();
+        let other = create_profile(&c, "Mom", None, false).unwrap().profile_id;
+        add_favorite(&c, 1, 603, "movie").unwrap();
+        add_favorite(&c, 1, 603, "movie").unwrap();
+        assert!(is_favorite(&c, 1, 603, "movie").unwrap());
+        assert!(!is_favorite(&c, other, 603, "movie").unwrap());
+        assert_eq!(list_favorites(&c, 1).unwrap().len(), 1);
+        assert!(remove_favorite(&c, 1, 603, "movie").unwrap());
+
+        let col = create_collection(&c, 1, "  Date   night ").unwrap().unwrap();
+        assert_eq!(col.name, "Date night");
+        // Same name (any case) returns the existing list instead of a duplicate.
+        assert_eq!(create_collection(&c, 1, "date NIGHT").unwrap().unwrap().collection_id, col.collection_id);
+        assert!(create_collection(&c, 1, "   ").unwrap().is_none());
+        assert!(add_to_collection(&c, 1, col.collection_id, 603, "movie").unwrap());
+        assert!(!add_to_collection(&c, 1, col.collection_id, 603, "movie").unwrap());
+        add_to_collection(&c, 1, col.collection_id, 1396, "tv").unwrap();
+        // Another profile can't read or change it.
+        assert!(!add_to_collection(&c, other, col.collection_id, 1, "movie").unwrap());
+        assert!(list_collection_items(&c, other, col.collection_id).unwrap().is_empty());
+        assert!(!delete_collection(&mut c, other, col.collection_id).unwrap());
+        assert_eq!(list_collection_items(&c, 1, col.collection_id).unwrap().len(), 2);
+        assert_eq!(collections_with_title(&c, 1, 603, "movie").unwrap(), vec![col.collection_id]);
+        assert_eq!(list_collections(&c, 1).unwrap()[0].item_count, 2);
+        let second = create_collection(&c, 1, "Best of 2025").unwrap().unwrap();
+        assert!(!rename_collection(&c, 1, second.collection_id, "date night").unwrap());
+        assert!(rename_collection(&c, 1, second.collection_id, "Favourites 2025").unwrap());
+        assert!(remove_from_collection(&c, 1, col.collection_id, 603, "movie").unwrap());
+        assert!(delete_collection(&mut c, 1, col.collection_id).unwrap());
+        assert_eq!(list_collections(&c, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn caught_up_airing_show_returns_with_its_new_episode() {
+        let mut c = test_db();
+        // Imported (silent) finale, watched 40 days ago: not on Continue Watching.
+        let finale = HistoryImport {
+            app_profile_id: 1,
+            tmdb_id: 94997,
+            media_type: "tv".into(),
+            season_number: 2,
+            episode_number: 8,
+            episode_title: None,
+            provider_name: Some("JioHotstar".into()),
+            direct_url: None,
+            progress_seconds: 3000.0,
+            duration_seconds: 3000.0,
+            is_completed: true,
+            watched_at: Some((chrono::Utc::now() - chrono::Duration::days(40)).format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            time_of_day_bucket: None,
+            watch_count: None,
+        };
+        upsert_imported_history(&mut c, &[finale]).unwrap();
+        assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+        let cands = airing_candidates(&c, 1, 365, 12, 50).unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!((cands[0].season_number, cands[0].episode_number), (2, 8));
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let new = NewEpisode { season_number: 3, episode_number: 1, air_date: today };
+        record_airing_check(&c, 1, 94997, Some(&new)).unwrap();
+        let cw = continue_watching(&c, 1, 20).unwrap();
+        assert_eq!(cw.len(), 1);
+        assert_eq!(cw[0].new_episode.as_ref(), Some(&new));
+        assert!(cw[0].up_next);
+        // Checked recently: not a candidate again until the throttle passes.
+        assert!(airing_candidates(&c, 1, 365, 12, 50).unwrap().is_empty());
+        // Nothing new any more: it leaves again.
+        record_airing_check(&c, 1, 94997, None).unwrap();
+        assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
     }
 }

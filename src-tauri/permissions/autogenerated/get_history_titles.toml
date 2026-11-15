@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-history-titles"
+description = "Enables the get_history_titles command without any pre-configured scope."
+commands.allow = ["get_history_titles"]
+
+[[permission]]
+identifier = "deny-get-history-titles"
+description = "Denies the get_history_titles command without any pre-configured scope."
+commands.deny = ["get_history_titles"]

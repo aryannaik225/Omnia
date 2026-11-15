@@ -563,3 +563,46 @@ export function summaryToCatalogEntry(m: MediaSummary): MediaCatalogEntry {
     voteAverage: m.voteAverage,
   };
 }
+
+// --- avatar search ---------------------------------------------------------------------------
+
+/** A face for a profile avatar: an actor, or a character (from a title's cast). */
+export interface AvatarFace {
+  key: string;
+  profilePath: string;
+  name: string;
+  /** Character name when found through a title's cast ("Steve Harrington"). */
+  character: string | null;
+  /** The title the character comes from. */
+  from: string | null;
+}
+
+/**
+ * Avatar search: people matching the query, plus, when the query names a movie or series, its
+ * cast as characters. TMDB has no character search, so "Stranger Things" finds Steve
+ * Harrington. A character named in the query ranks first.
+ */
+export async function searchAvatarFaces(query: string, region: string): Promise<AvatarFace[]> {
+  const q = query.trim();
+  if (q.length < 2) return [];
+  const [people, titles] = await Promise.all([
+    request<{ results: { id: number; name: string; profile_path: string | null }[] }>("/search/person", { query: q, include_adult: false }, 5 * 60_000).catch(() => ({ results: [] })),
+    searchMulti(q).catch(() => null),
+  ]);
+  const faces: AvatarFace[] = people.results
+    .filter((p) => p.profile_path)
+    .slice(0, 12)
+    .map((p) => ({ key: `p${p.id}`, profilePath: p.profile_path!, name: p.name, character: null, from: null }));
+  const top = titles?.results.find((t) => t.mediaType === "movie" || t.mediaType === "tv");
+  if (top) {
+    const d = await details(top.mediaType, top.id, region).catch(() => null);
+    const want = q.toLowerCase();
+    const cast = (d?.cast ?? [])
+      .filter((c) => c.profilePath)
+      .map((c) => ({ key: `c${c.id}-${c.character}`, profilePath: c.profilePath!, name: c.name, character: c.character || null, from: d!.title }));
+    faces.unshift(...cast);
+    faces.sort((a, b) => Number(!!b.character?.toLowerCase().includes(want)) - Number(!!a.character?.toLowerCase().includes(want)));
+  }
+  const seen = new Set<string>();
+  return faces.filter((f) => (seen.has(f.profilePath) ? false : (seen.add(f.profilePath), true))).slice(0, 30);
+}

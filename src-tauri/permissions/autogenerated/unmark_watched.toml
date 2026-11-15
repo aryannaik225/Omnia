@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unmark-watched"
+description = "Enables the unmark_watched command without any pre-configured scope."
+commands.allow = ["unmark_watched"]
+
+[[permission]]
+identifier = "deny-unmark-watched"
+description = "Denies the unmark_watched command without any pre-configured scope."
+commands.deny = ["unmark_watched"]

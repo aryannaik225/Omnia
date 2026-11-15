@@ -1,17 +1,17 @@
 /** Search, Watching Now (Continue Watching + history), My OTTs and Watchlist views. */
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { episodeLabel, relativeTime } from "../../lib/format";
 import { useAsync, useDebounced } from "../../lib/hooks";
-import { groupByFamily } from "../../lib/providers";
+import { groupByFamily, providerFamily } from "../../lib/providers";
 import { discover, img, isKidsSafe, searchMulti, type MediaSummary } from "../../services/tmdbClient";
-import { history, type HistoryWithMedia } from "../../services/tauriBridge";
+import { history, type HistoryTitle } from "../../services/tauriBridge";
 import { useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { LandscapeCard, PosterCard } from "../common/Cards";
 import { EmptyState } from "../common/EmptyState";
 import { DownloadIcon, TrashIcon } from "../common/Icons";
 import { MediaGrid } from "../common/MediaGrid";
-import { cwSubtitle } from "../home/ContinueWatchingRow";
+import { cwBadge, cwSubtitle } from "../home/ContinueWatchingRow";
 import { LazyTmdbRow } from "../home/MediaCarouselRow";
 
 export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: string; actions?: ReactNode }) {
@@ -52,24 +52,10 @@ export function SearchView() {
 
 // ---------------------------------------------------------------------------------------------
 
-/** One card per title: the latest entry plus how many episodes were watched. */
-interface HistoryGroup {
-  latest: HistoryWithMedia;
-  entries: HistoryWithMedia[];
-}
+/** Titles per page of "Recently watched" (grouped by title in SQL). */
+const HISTORY_PAGE = 60;
 
-function groupHistory(rows: HistoryWithMedia[]): HistoryGroup[] {
-  const groups = new Map<string, HistoryGroup>();
-  for (const row of rows) {
-    const key = `${row.mediaType}-${row.tmdbId}`;
-    const g = groups.get(key);
-    if (g) g.entries.push(row);
-    else groups.set(key, { latest: row, entries: [row] });
-  }
-  return [...groups.values()];
-}
-
-function historySubtitle(h: HistoryWithMedia, count: number) {
+function historySubtitle(h: HistoryTitle, count: number) {
   const ep = episodeLabel(h.seasonNumber, h.episodeNumber);
   const parts = h.mediaType === "tv" ? [ep, h.episodeTitle] : [h.isCompleted ? "Finished" : `${Math.round(h.completionRatio * 100)}% watched`];
   if (h.mediaType === "tv" && count > 1) parts.push(`${count} episodes`);
@@ -85,8 +71,25 @@ export function ContinueWatchingView() {
   const toast = useAppStore((s) => s.toast);
   const resume = usePlayerStore((s) => s.resumeItem);
   const [nonce, setNonce] = useState(0);
-  const recent = useAsync(() => history.list(profile!.profileId, 400), [profile?.profileId, nonce, items.length], !!profile);
-  const groups = useMemo(() => groupHistory(recent.data ?? []), [recent.data]);
+  const [pages, setPages] = useState(1);
+  /** Platform filter: a provider family's canonical id, 0 = Offline / Manual, null = all. */
+  const [platform, setPlatform] = useState<number | null>(null);
+  useEffect(() => {
+    setPages(1);
+    setPlatform(null);
+  }, [profile?.profileId]);
+  useEffect(() => setPages(1), [platform]);
+  const counts = useAsync(() => history.providerCounts(profile!.profileId), [profile?.profileId, nonce, items.length], !!profile);
+  const platformOptions = (counts.data ?? [])
+    .map((c) => ({ id: c.providerId, rows: c.rows, name: c.providerId === 0 ? "Offline / Manual" : providerFamily(c.providerId, "").name || `Provider ${c.providerId}` }))
+    .sort((a, b) => (a.id === 0 ? 1 : b.id === 0 ? -1 : b.rows - a.rows));
+  const recent = useAsync(
+    () => history.titles(profile!.profileId, HISTORY_PAGE * pages + 1, 0, platform),
+    [profile?.profileId, nonce, items.length, pages, platform],
+    !!profile,
+  );
+  const groups = (recent.data ?? []).slice(0, HISTORY_PAGE * pages);
+  const hasMore = (recent.data?.length ?? 0) > HISTORY_PAGE * pages;
 
   const exportHistory = async () => {
     if (!profile) return;
@@ -100,11 +103,11 @@ export function ContinueWatchingView() {
     toast({ kind: "success", title: "History exported", body: `${rows.length} entries (stays on this device unless you move the file).` });
   };
 
-  const removeGroup = async (g: HistoryGroup) => {
-    for (const e of g.entries) await history.remove(e.appProfileId, e.id);
+  const removeGroup = async (h: HistoryTitle) => {
+    await history.removeTitle(h.appProfileId, h.tmdbId, h.mediaType);
     setNonce((n) => n + 1);
     void refresh();
-    toast({ kind: "info", title: "Removed from history", body: g.latest.title ?? undefined });
+    toast({ kind: "info", title: "Removed from history", body: h.title ?? undefined });
   };
 
   // A profile with no activity at all (new, or history just cleared): one inviting state
@@ -139,9 +142,10 @@ export function ContinueWatchingView() {
               title={item.title ?? "Untitled"}
               imagePath={item.backdropPath ?? item.posterPath}
               subtitle={cwSubtitle(item)}
-              progress={item.upNext ? null : item.completionRatio}
+              progress={item.upNext || item.isManual ? null : item.completionRatio}
+              topLeft={cwBadge(item)}
               width={undefined}
-              onClick={() => void resume(item)}
+              onClick={() => (item.isManual && item.mediaType === "movie" ? openTitle({ id: item.tmdbId, mediaType: item.mediaType }) : void resume(item))}
             />
           ))}
         </div>
@@ -149,17 +153,36 @@ export function ContinueWatchingView() {
         <EmptyState size="row" actions={false} title="Nothing in progress" body="Start something and it'll appear here, with its exact position." />
       )}
 
-      <h2 className="section-title mb-4 mt-12">Recently watched</h2>
+      <div className="mb-4 mt-12 flex flex-wrap items-end justify-between gap-4">
+        <h2 className="section-title">Recently watched</h2>
+        {platformOptions.length > 0 && (
+          <label className="flex items-center gap-2 text-[13px] text-label-secondary">
+            <span>Platform</span>
+            <select
+              className="glass-select"
+              value={platform === null ? "" : String(platform)}
+              onChange={(e) => setPlatform(e.target.value === "" ? null : Number(e.target.value))}
+              aria-label="Filter watch history by platform"
+            >
+              <option value="">All platforms</option>
+              {platformOptions.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name} ({o.rows.toLocaleString()})
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
       {groups.length ? (
         <div className="grid gap-x-5 gap-y-7" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}>
-          {groups.map((g) => {
-            const h = g.latest;
+          {groups.map((h) => {
             return (
               <PosterCard
                 key={`${h.mediaType}-${h.tmdbId}`}
                 title={h.title ?? h.episodeTitle ?? "Untitled"}
                 posterPath={h.posterPath}
-                subtitle={historySubtitle(h, g.entries.length)}
+                subtitle={historySubtitle(h, h.entryCount)}
                 caption={[h.providerName, relativeTime(h.lastWatchedAt), h.watchCount > 1 ? `${h.watchCount}×` : null].filter(Boolean).join(" · ")}
                 progress={h.isCompleted ? 1 : h.completionRatio}
                 badge={h.abandoned ? <span className="badge !bg-black/60">Abandoned</span> : undefined}
@@ -171,12 +194,12 @@ export function ContinueWatchingView() {
                     className="flex h-7 w-7 items-center justify-center rounded-full bg-black/55 backdrop-blur-md hover:text-[#ff453a]"
                     onClick={(e) => {
                       e.stopPropagation();
-                      void removeGroup(g);
+                      void removeGroup(h);
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
                         e.stopPropagation();
-                        void removeGroup(g);
+                        void removeGroup(h);
                       }
                     }}
                   >
@@ -190,7 +213,14 @@ export function ContinueWatchingView() {
           })}
         </div>
       ) : (
-        <p className="text-label-secondary">{recent.loading ? "Loading…" : "No history yet."}</p>
+        <p className="text-label-secondary">{recent.loading ? "Loading…" : platform !== null ? "Nothing from this platform yet." : "No history yet."}</p>
+      )}
+      {hasMore && (
+        <div className="mt-8 flex justify-center">
+          <button className="glass-button" disabled={recent.loading} onClick={() => setPages((n) => n + 1)}>
+            {recent.loading ? "Loading…" : "Show more"}
+          </button>
+        </div>
       )}
         </>
       )}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-title-history"
+description = "Enables the delete_title_history command without any pre-configured scope."
+commands.allow = ["delete_title_history"]
+
+[[permission]]
+identifier = "deny-delete-title-history"
+description = "Denies the delete_title_history command without any pre-configured scope."
+commands.deny = ["delete_title_history"]

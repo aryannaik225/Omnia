@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS watch_history (
     last_watched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     time_of_day_bucket TEXT, 
     is_imported BOOLEAN NOT NULL DEFAULT 0, -- migration v4: bulk-imported ("silent") rows feed the recommender and history but not Continue Watching until played in Omnia
+    is_manual BOOLEAN NOT NULL DEFAULT 0, -- migration v5: recorded with "Mark as Watched" (cinema, local file, another device)
     UNIQUE(app_profile_id, tmdb_id, media_type, season_number, episode_number),
     FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
 );
@@ -302,6 +303,8 @@ CREATE TABLE IF NOT EXISTS continue_watching_hidden (
     FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
 );
 ```
+
+Migration v5 also adds (all isolated by profile, `ON DELETE CASCADE`): `favorites (app_profile_id, tmdb_id, media_type, added_at)` — "Love", a +3.0 recommender weight; `collections (collection_id, app_profile_id, name UNIQUE per profile NOCASE, created_at, updated_at)` and `collection_items (collection_id, tmdb_id, media_type, added_at)` — custom lists; `airing_checks (app_profile_id, tmdb_id, checked_at, new_season, new_episode, new_air_date)` — a caught-up airing series with a newly aired episode returns to Continue Watching (re-checked at most every 12 h).
 
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 

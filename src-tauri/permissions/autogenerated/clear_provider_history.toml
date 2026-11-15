@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-provider-history"
+description = "Enables the clear_provider_history command without any pre-configured scope."
+commands.allow = ["clear_provider_history"]
+
+[[permission]]
+identifier = "deny-clear-provider-history"
+description = "Denies the clear_provider_history command without any pre-configured scope."
+commands.deny = ["clear_provider_history"]

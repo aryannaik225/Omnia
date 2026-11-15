@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-airing-shows"
+description = "Enables the check_airing_shows command without any pre-configured scope."
+commands.allow = ["check_airing_shows"]
+
+[[permission]]
+identifier = "deny-check-airing-shows"
+description = "Denies the check_airing_shows command without any pre-configured scope."
+commands.deny = ["check_airing_shows"]

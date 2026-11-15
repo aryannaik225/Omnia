@@ -160,3 +160,32 @@ export const VolumeOffIcon = (p: IconProps) => (
     <path d="M4 9v6h4l5 4V5L8 9zM17 9l4 6M21 9l-4 6" />
   </Svg>
 );
+export const SpeakerIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z" />
+    <path d="M15.5 9a4.2 4.2 0 0 1 0 6M18.3 6.5a8 8 0 0 1 0 11" />
+  </Svg>
+);
+export const SpeakerMutedIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M4 9.5h3.2L12 5.5v13l-4.8-4H4z" />
+    <path d="m16 9.5 5 5M21 9.5l-5 5" />
+  </Svg>
+);
+export const HeartIcon = ({ filled = false, ...p }: IconProps & { filled?: boolean }) => (
+  <Svg {...p} fill={filled ? "currentColor" : "none"}>
+    <path d="M12 20.5s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.6a4.3 4.3 0 0 1 7.5 2.7c0 5.6-7.5 10.2-7.5 10.2z" />
+  </Svg>
+);
+export const StackIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="4" y="8" width="16" height="12" rx="2.5" />
+    <path d="M7 5h10M9.5 2.5h5" />
+  </Svg>
+);
+export const EyeCheckIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />
+    <path d="m9.2 12 2 2 3.8-4" />
+  </Svg>
+);

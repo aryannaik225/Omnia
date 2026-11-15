@@ -908,6 +908,48 @@
     return true;
   }
 
+  /**
+   * Info page "play S2 E5" on Netflix: the deep link opens the series page (/title/<id>). Look
+   * the episode up in Netflix's own metadata (same-origin, like its web client) and jump to
+   * /watch/<episodeId>. Runs once per player session; falls back to the series page.
+   */
+  function jumpToNetflixEpisode() {
+    if (CONFIG.mode !== "play" || !IS_NETFLIX || !CONFIG.targetSeason || !CONFIG.targetEpisode) return false;
+    var KEY = "omnia-episode-jump-" + TOKEN_KEY;
+    if (session(KEY)) return false;
+    var m = location.pathname.match(/\/title\/(\d+)/);
+    if (!m) return false;
+    session(KEY, "1");
+    var seriesId = m[1];
+    function findEpisode() {
+      for (var id in NFX_VIDEOS) {
+        var v = NFX_VIDEOS[id];
+        if (v.mediaType === "tv" && v.seasonNumber === CONFIG.targetSeason && v.episodeNumber === CONFIG.targetEpisode) return id;
+      }
+      return null;
+    }
+    discoverNetflixBuilds();
+    var bases = [];
+    NFX_BUILDS.forEach(function (b) {
+      bases.push("/nq/website/memberapi/" + b + "/metadata");
+      bases.push("/api/shakti/" + b + "/metadata");
+    });
+    bases.push("/nq/website/memberapi/release/metadata", "/api/shakti/mre/metadata");
+    (function attempt(i) {
+      var hit = findEpisode();
+      if (hit) return location.replace("/watch/" + hit);
+      if (i >= bases.length) return; // stay on the series page; the user picks the episode
+      fetch(bases[i] + "?movieid=" + encodeURIComponent(seriesId) + "&imageFormat=webp&withSize=true&materialize=true", { credentials: "include" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (json) {
+          if (json) indexNetflixVideos(json);
+          attempt(i + 1);
+        })
+        .catch(function () { attempt(i + 1); });
+    })(0);
+    return true;
+  }
+
   // -------------------------------------------------------------------------------------------
   // Liquid Glass overlay pill (closed shadow DOM so page CSS can't touch it)
   // -------------------------------------------------------------------------------------------
@@ -1180,12 +1222,22 @@
         if (container && container.querySelectorAll("a[href] img").length >= 1) break;
       }
       if (!container) return;
-      container.querySelectorAll("a[href]").forEach(function (a) {
-        if (seen[a.href] || !a.querySelector("img")) return;
-        seen[a.href] = true;
+      var cards = Array.prototype.filter.call(container.querySelectorAll("a[href]"), function (a) { return !!a.querySelector("img"); });
+      if (!cards.length) {
+        // Tiles that are clickable <div>s (no link): anything focusable / labelled holding an image.
+        cards = Array.prototype.filter.call(
+          container.querySelectorAll('[role=button],[role=link],[tabindex],[aria-label],[data-testid*="tile" i],[data-testid*="card" i],li,article'),
+          function (el) { return !!el.querySelector("img") && el.querySelectorAll("img").length <= 3; },
+        );
+      }
+      cards.forEach(function (a) {
+        var label = cardTitle(a);
+        var key = a.href || label;
+        if (!label || seen[key]) return;
+        seen[key] = true;
         var card = a.closest("li,article,[role=listitem]") || a;
-        var item = itemFromText(cardTitle(a), { progressRatio: progressWithin(card) });
-        if (item) items.push(item);
+        var item = itemFromText(label, { progressRatio: progressWithin(card) });
+        if (item && !GEN_TRAY_TEXT.test(item.title)) items.push(item);
       });
     });
     return items;
@@ -1239,26 +1291,375 @@
     });
   }
 
+  // -------------------------------------------------------------------------------------------
+  // Generic import: the provider's own JSON (embedded app state + the app's API responses)
+  //
+  // Hotstar, Disney+, Apple TV and most React/Redux OTT apps render "Continue Watching" from
+  // state that is already on the page (window.__INITIAL_STATE__, __NEXT_DATA__, Apollo / Redux
+  // stores) or that their app fetches as JSON. Reading that is far more reliable than the DOM:
+  // a tray is found by its heading ("Continue Watching", "Watch History"…) or key name, then its
+  // items are read by shape (a title plus show / season / episode / progress fields).
+  // -------------------------------------------------------------------------------------------
+  var GEN = { items: [], keys: {}, sources: {}, responses: 0, trays: 0, paths: {} };
+  var GEN_TRAY_TEXT = /\b(continue|resume|keep) watching\b|\bwatch(ing)? history\b|\brecently watched\b|\bwatched recently\b/i;
+  var GEN_TRAY_KEY = /^(continue_?watching|cw|cw_?tray|cw_?widget|watch_?history|recently_?watched|resume_?watching|keep_?watching)$/i;
+  var GEN_TITLE = ["title", "name", "displayTitle", "display_title", "contentTitle", "content_title", "episodeTitle", "episodeName", "heading"];
+  var GEN_SUBTITLE = ["subTitle", "sub_title", "subtitle", "description_label", "episodeLabel", "episode_label"];
+  var GEN_SHOW = ["showName", "showTitle", "seriesName", "seriesTitle", "parentTitle", "showDisplayTitle", "series_name", "show_name", "seriesDisplayName"];
+  var GEN_SEASON = ["seasonNo", "seasonNumber", "season_no", "season_number", "seasonNum", "season"];
+  var GEN_EPISODE = ["episodeNo", "episodeNumber", "episode_no", "episode_number", "episodeNum", "episode"];
+  var GEN_RATIO = ["watchedRatio", "watched_ratio", "progressRatio", "progress_ratio", "completionRatio", "percentWatched", "watchedPercentage", "progressPercent", "progress_percentage", "watchProgress", "progress", "percentage"];
+  var GEN_POS = ["watchedDuration", "watched_duration", "resumeAt", "resume_at", "resumePoint", "resumePosition", "bookmark", "playbackPosition", "offsetSeconds", "watchedSeconds", "position"];
+  var GEN_DUR = ["duration", "contentDuration", "durationSeconds", "duration_seconds", "runtime", "totalDuration", "durationInSeconds"];
+  var GEN_DATE = ["lastWatched", "lastWatchedAt", "last_watched", "watchedAt", "watched_at", "updatedAt", "lastPlayed", "lastViewed", "timestamp"];
+  var GEN_TYPE = ["contentType", "content_type", "assetType", "asset_type", "type", "entityType", "mediaType"];
+  var GEN_LABEL_KEYS = ["title", "name", "header", "heading", "trayTitle", "widgetName"];
+
+  function genPick(o, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var v;
+      try { v = o[keys[i]]; } catch (_) { continue; }
+      if (v !== undefined && v !== null && v !== "") return v;
+    }
+    return null;
+  }
+  function genStr(v) {
+    if (typeof v === "string") return clean(v);
+    // Localised text objects: { text: "…" } / { value: "…" } / { en: "…" }.
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      var inner = v.text || v.value || v.en || v["default"] || null;
+      return typeof inner === "string" ? clean(inner) : "";
+    }
+    return "";
+  }
+  function genNum(v) {
+    if (typeof v === "string" && /^\s*\d+(\.\d+)?\s*$/.test(v)) v = parseFloat(v);
+    if (v && typeof v === "object") v = v.number != null ? v.number : v.value;
+    return typeof v === "number" && isFinite(v) ? v : null;
+  }
+  function genDate(v) {
+    var n = genNum(v);
+    if (n !== null) {
+      if (n > 1e9 && n < 1e11) n *= 1000; // epoch seconds
+      else if (n < 1e11) return null;
+      var d = new Date(n);
+      return d.getFullYear() > 2000 && d.getTime() <= Date.now() + 864e5 ? d.toISOString() : null;
+    }
+    if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v)) {
+      var t = new Date(v);
+      return isNaN(t.getTime()) ? null : t.toISOString();
+    }
+    return null;
+  }
+
+  /** One watched item from a tray entry, or null when it isn't shaped like one. */
+  function genItem(o) {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+    // Many apps wrap the payload: { content: {...} }, { data: {...} }, { item: {...} }.
+    var src = o;
+    for (var w = 0; w < 3; w++) {
+      if (genStr(genPick(src, GEN_TITLE))) break;
+      var inner = src.content || src.data || src.item || src.asset || src.contentInfo || src.widget || src.playable_content || src.playableContent || src.tile || null;
+      if (!inner || typeof inner !== "object" || Array.isArray(inner)) break;
+      src = inner;
+    }
+    var title = genStr(genPick(src, GEN_TITLE));
+    var show = genStr(genPick(src, GEN_SHOW)) || genStr(genPick(o, GEN_SHOW));
+    if (!title && !show) return null;
+    if (title && (title.length > 160 || BRAND_ONLY.test(title) || GEN_TRAY_TEXT.test(title))) return null;
+    var season = genNum(genPick(src, GEN_SEASON));
+    var episode = genNum(genPick(src, GEN_EPISODE));
+    var type = String(genPick(src, GEN_TYPE) || "").toLowerCase();
+    var isTv = !!(show && show !== title) || episode !== null || /episode|show|series|tv/.test(type);
+    var ratio = genNum(genPick(src, GEN_RATIO));
+    if (ratio !== null) ratio = ratio > 1 ? Math.min(100, ratio) / 100 : Math.max(0, ratio);
+    var pos = genNum(genPick(src, GEN_POS));
+    var dur = genNum(genPick(src, GEN_DUR));
+    // Milliseconds (anything longer than a day) → seconds.
+    if (dur !== null && dur > 86400) { dur /= 1000; if (pos !== null) pos /= 1000; }
+    if (pos !== null && dur && ratio === null) ratio = Math.max(0, Math.min(1, pos / dur));
+    var series = show && show !== title ? show : title;
+    var epTitle = show && show !== title ? title : null;
+    // "S2 E4 · Title" subtitles (Hotstar tiles): numbers from the subtitle, series from the title.
+    var sub = genStr(genPick(src, GEN_SUBTITLE));
+    var ps = sub ? parseSE(sub) : null;
+    if (ps && !show) {
+      season = season || ps.season;
+      episode = episode || ps.episode;
+      isTv = true;
+      if (ps.rest && ps.rest !== title) epTitle = ps.rest;
+    }
+    var p = !show && !ps && title ? parseSE(title) : null;
+    if (p) {
+      series = clean(title.split(SE_PATTERNS[0])[0] || title.split(EP_ONLY)[0] || title).replace(/[\s:,\-|·]+$/, "") || title;
+      season = season || p.season;
+      episode = episode || p.episode;
+      epTitle = p.rest;
+      isTv = true;
+    }
+    series = stripProviderSuffix(series);
+    if (!series) return null;
+    return {
+      title: series,
+      seasonNumber: season && season > 0 && season < 200 ? Math.round(season) : null,
+      episodeNumber: episode && episode > 0 && episode < 5000 ? Math.round(episode) : null,
+      episodeTitle: epTitle,
+      isTv: isTv,
+      progressRatio: ratio,
+      progressSeconds: pos !== null && dur ? pos : null,
+      durationSeconds: pos !== null && dur ? dur : null,
+      watchedAt: genDate(genPick(src, GEN_DATE)) || genDate(genPick(o, GEN_DATE)),
+    };
+  }
+
+  function genAdd(item, source) {
+    var key = [item.title.toLowerCase(), item.seasonNumber || "", item.episodeNumber || "", (item.episodeTitle || "").toLowerCase()].join("|");
+    if (GEN.keys[key]) return false;
+    GEN.keys[key] = true;
+    GEN.items.push(item);
+    GEN.sources[source] = (GEN.sources[source] || 0) + 1;
+    return true;
+  }
+
+  /** Item arrays anywhere under a tray node. */
+  function genHarvestTray(node, source) {
+    var added = 0;
+    var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+    (function walk(n, depth) {
+      if (!n || typeof n !== "object" || depth > 7) return;
+      if (seen) { if (seen.has(n)) return; seen.add(n); }
+      if (Array.isArray(n)) {
+        var items = [];
+        var objects = 0;
+        for (var i = 0; i < n.length && i < 500; i++) {
+          if (n[i] && typeof n[i] === "object") objects++;
+          var it = genItem(n[i]);
+          if (it) items.push(it);
+        }
+        if (items.length && items.length * 2 >= objects) {
+          items.forEach(function (it) { if (genAdd(it, source)) added++; });
+          return;
+        }
+        for (var j = 0; j < n.length && j < 500; j++) walk(n[j], depth + 1);
+        return;
+      }
+      var keys;
+      try { keys = Object.keys(n); } catch (_) { return; }
+      for (var k = 0; k < keys.length && k < 300; k++) {
+        var c;
+        try { c = n[keys[k]]; } catch (_) { continue; }
+        if (c && typeof c === "object") walk(c, depth + 1);
+      }
+    })(node, 0);
+    return added;
+  }
+
+  /** Finds Continue-Watching / history trays (by heading text or key name) in any JSON value. */
+  function genFindTrays(root, source) {
+    var added = 0;
+    var seen = typeof WeakSet === "function" ? new WeakSet() : null;
+    var budget = 300000;
+    var stack = [];
+    (function walk(n, depth, viaKey) {
+      if (!n || typeof n !== "object" || depth > 16 || --budget < 0) return;
+      if (seen) { if (seen.has(n)) return; seen.add(n); }
+      stack.push(n);
+      try { visit(n, depth, viaKey); } finally { stack.pop(); }
+    })(root, 0, null);
+    return added;
+
+    function walk(n, depth, viaKey) {
+      if (!n || typeof n !== "object" || depth > 16 || --budget < 0) return;
+      if (seen) { if (seen.has(n)) return; seen.add(n); }
+      stack.push(n);
+      try { visit(n, depth, viaKey); } finally { stack.pop(); }
+    }
+
+    function visit(n, depth, viaKey) {
+      var isTray = !!viaKey && GEN_TRAY_KEY.test(String(viaKey).replace(/[\s-]/g, "_"));
+      if (!isTray && !Array.isArray(n)) {
+        var kind = n.template || n.widgetType || n.widget_type || n.trayType || n.tray_type || n.layout || n.__typename || n.type;
+        if (typeof kind === "string" && kind.length < 80 && /continue.?watch|cw.?tray|watch.?history|recently.?watched/i.test(kind)) isTray = true;
+      }
+      if (!isTray && !Array.isArray(n)) {
+        for (var h = 0; h < GEN_LABEL_KEYS.length && !isTray; h++) {
+          var label = genStr(n[GEN_LABEL_KEYS[h]]);
+          if (label && label.length < 60 && GEN_TRAY_TEXT.test(label)) isTray = true;
+        }
+      }
+      if (isTray) {
+        GEN.trays++;
+        // The heading's own node first, then up to three ancestors (header -> data -> widget).
+        for (var up = stack.length - 1, got = 0; up >= 0 && up >= stack.length - 4 && !got; up--) {
+          got = genHarvestTray(stack[up], source);
+          added += got;
+        }
+        return;
+      }
+      if (Array.isArray(n)) {
+        for (var i = 0; i < n.length && i < 2000; i++) walk(n[i], depth + 1, null);
+        return;
+      }
+      var keys;
+      try { keys = Object.keys(n); } catch (_) { return; }
+      for (var k = 0; k < keys.length && k < 1000; k++) {
+        var c;
+        try { c = n[keys[k]]; } catch (_) { continue; }
+        if (c && typeof c === "object") walk(c, depth + 1, keys[k]);
+        else if (typeof c === "string" && c.length > 50 && c.length < 4e6 && (c.charAt(0) === "{" || c.charAt(0) === "[") && /watch/i.test(c)) {
+          // Serialised state ("__INITIAL_STATE__": "{…}").
+          try { walk(JSON.parse(c), depth + 1, keys[k]); } catch (_) {}
+        }
+      }
+    }
+  }
+
+  function genConsiderText(text, source) {
+    if (typeof text !== "string" || text.length < 2 || text.length > 8e6 || !/watch/i.test(text)) return 0;
+    var first = text.charAt(0);
+    if (first !== "{" && first !== "[") return 0;
+    try { return genFindTrays(JSON.parse(text), source); } catch (_) { return 0; }
+  }
+
+  var GEN_GLOBALS = ["__INITIAL_STATE__", "__PRELOADED_STATE__", "__REDUX_STATE__", "__APOLLO_STATE__", "__NEXT_DATA__", "__NUXT__", "__APP_STATE__", "__STATE__", "__DATA__", "INITIAL_STATE"];
+
+  /** Embedded app state: well-known globals, a Redux store, and inline JSON scripts. */
+  function genScanState() {
+    var found = 0;
+    GEN_GLOBALS.forEach(function (k) {
+      var v;
+      try { v = window[k]; } catch (_) { return; }
+      if (v && typeof v === "object") found += genFindTrays(v, "page state");
+      else if (typeof v === "string") found += genConsiderText(v.trim(), "page state");
+    });
+    try {
+      if (window.store && typeof window.store.getState === "function") found += genFindTrays(window.store.getState(), "page state");
+    } catch (_) {}
+    document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__').forEach(function (el) {
+      found += genConsiderText((el.textContent || "").trim(), "page state");
+    });
+    // Inline "window.__INITIAL_STATE__ = {…};" assignments that never became readable globals.
+    document.querySelectorAll("script:not([src])").forEach(function (el) {
+      var t = el.textContent || "";
+      if (t.length > 4e6 || !/__\w*STATE__/.test(t)) return;
+      var m = t.match(/__\w*STATE__\s*=\s*(\{[\s\S]*\})\s*;?\s*$/);
+      if (m) found += genConsiderText(m[1], "page state");
+    });
+    return found;
+  }
+
+  function genSameSite(url) {
+    try {
+      var site = function (h) { return h.split(".").slice(-2).join("."); };
+      return site(new URL(url, location.href).hostname) === site(location.hostname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** The app's own JSON responses (read-only; requests are untouched). Installed at document start. */
+  function installGenericCapture() {
+    if (typeof window.fetch === "function") {
+      var origFetch = window.fetch;
+      window.fetch = function (input) {
+        var p = origFetch.apply(window, arguments);
+        try {
+          var url = typeof input === "string" ? input : (input && input.url) || String(input || "");
+          if (genSameSite(url)) {
+            p.then(function (r) {
+              var type = (r.headers && r.headers.get("content-type")) || "";
+              if (!r.ok || type.indexOf("json") < 0) return;
+              GEN.responses++;
+              genNotePath(url);
+              r.clone().text().then(function (t) { genConsiderText(t, "app requests"); }).catch(function () {});
+            }).catch(function () {});
+          }
+        } catch (_) {}
+        return p;
+      };
+    }
+    var X = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (!X) return;
+    var origOpen = X.open;
+    var origSend = X.send;
+    X.open = function (method, url) {
+      try { this.__omniaGenUrl = String(url); } catch (_) {}
+      return origOpen.apply(this, arguments);
+    };
+    X.send = function () {
+      var xhr = this;
+      if (genSameSite(xhr.__omniaGenUrl || "")) {
+        xhr.addEventListener("load", function () {
+          try {
+            if (xhr.status < 200 || xhr.status >= 300) return;
+            GEN.responses++;
+            genNotePath(xhr.__omniaGenUrl);
+            if (xhr.responseType === "json") genFindTrays(xhr.response, "app requests");
+            else if (!xhr.responseType || xhr.responseType === "text") genConsiderText(xhr.responseText, "app requests");
+          } catch (_) {}
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  /** Endpoint paths (no query strings: they can carry ids) for the diagnostics line. */
+  function genNotePath(url) {
+    try {
+      var u = new URL(url, location.href);
+      var path = (u.hostname.replace(/^www\./, "") + u.pathname.replace(/\/\d{3,}(?=\/|$)/g, "/#")).slice(0, 70);
+      GEN.paths[path] = (GEN.paths[path] || 0) + 1;
+    } catch (_) {}
+  }
+
+  /** Diagnostics for the local log: counts, page path and endpoint paths only, never titles. */
+  function genNotes(domCount) {
+    var by = Object.keys(GEN.sources).map(function (k) { return k + " " + GEN.sources[k]; }).join(", ");
+    var paths = Object.keys(GEN.paths).slice(0, 12).map(function (k) { return k + (GEN.paths[k] > 1 ? " x" + GEN.paths[k] : ""); }).join(", ");
+    var headings = Array.prototype.filter.call(document.querySelectorAll("h1,h2,h3,h4,[role=heading]"), function (el) { return isVisible(el); }).length;
+    return [
+      "page: " + location.pathname.replace(/\/\d{3,}(?=\/|$)/g, "/#").slice(0, 60),
+      "state/app entries: " + GEN.items.length + (by ? " (" + by + ")" : ""),
+      "trays found: " + GEN.trays,
+      "json responses: " + GEN.responses + (paths ? " (" + paths + ")" : ""),
+      "rendered cards: " + domCount,
+      "visible headings: " + headings + ", images: " + document.images.length,
+      "sign-in prompt: " + (hasSignInCta() ? "yes" : "no") + ", profile picker: " + (onGenericProfileGate() ? "yes" : "no"),
+    ];
+  }
+
   function runGenericImport() {
     var scraper = CONFIG.scraper === "primevideo_history" ? scrapePrimeHistory : scrapeContinueWatching;
     var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 30000);
     var lastCount = -1, stableRounds = 0, scrolls = 0;
 
+    /** Page state + captured JSON first (exact numbers and progress), then rendered cards. */
+    function collect() {
+      try { genScanState(); } catch (_) {}
+      var dom = [];
+      try { dom = scraper(); } catch (_) {}
+      var merged = GEN.items.slice();
+      var have = {};
+      merged.forEach(function (it) { have[it.title.toLowerCase()] = true; });
+      dom.forEach(function (it) { if (!have[it.title.toLowerCase()]) merged.push(it); });
+      return { items: merged, dom: dom.length };
+    }
+
     function tick() {
-      var items = [];
-      try { items = scraper(); } catch (_) {}
+      var r = collect();
+      var items = r.items;
       if (items.length > 0 && items.length === lastCount) stableRounds++;
       else stableRounds = 0;
       lastCount = items.length;
 
-      // Lazy-loaded lists: scroll to the bottom a few times to load more entries.
+      // Lazy-loaded lists / trays: scroll to the bottom a few times to load more entries.
       if (scrolls < 12 && document.body) {
         scrolls++;
         window.scrollTo(0, document.body.scrollHeight);
       }
 
       if ((items.length > 0 && stableRounds >= 2) || Date.now() > deadline) {
-        submitHistory(items, "No history entries were found on " + location.hostname);
+        submitHistory(items, "No history entries were found on " + location.hostname, genNotes(r.dom));
         return;
       }
       setTimeout(tick, 1500);
@@ -2151,6 +2552,7 @@
 
   // Capture must be live before Netflix's own scripts issue their first request.
   if (CONFIG.mode === "import" && CONFIG.scraper === "netflix_history") installNetflixCapture();
+  else if (CONFIG.mode === "import") installGenericCapture();
   // A hidden window is a background page: Chromium may throttle or freeze it. A held Web Lock
   // keeps it running for the length of the import (WebView2 has no throttling switch).
   if (CONFIG.mode === "import") {
@@ -2180,6 +2582,7 @@
       return;
     }
     if (handleProfileSwitchThenTarget()) return;
+    jumpToNetflixEpisode();
 
     // Video discovery: cheap, throttled scan on DOM mutations plus a 1s safety poll.
     var scanQueued = false;

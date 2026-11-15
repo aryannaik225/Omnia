@@ -344,6 +344,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     if (!profile) return;
     set({ launching: `${item.mediaType}:${item.tmdbId}` });
     try {
+      if (item.newEpisode) {
+        // A new episode of a caught-up show: play exactly that episode (Netflix jumps to it).
+        const d = await tmdbDetails("tv", item.tmdbId, s.region);
+        await get().playTitle(d, { seasonNumber: item.newEpisode.seasonNumber, episodeNumber: item.newEpisode.episodeNumber });
+        return;
+      }
       const isNetflix = /netflix/i.test(item.providerName ?? "");
       // The episode's own player URL, captured by live telemetry or the Netflix importer.
       const episodeUrl = isNetflix ? netflixPlayerUrl(item.directUrl) : null;

@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useAsync } from "../../lib/hooks";
 import { groupByFamily, providerFamily } from "../../lib/providers";
 import { img, regionProviders, type WatchProviderOption } from "../../services/tmdbClient";
-import { ottMappings } from "../../services/tauriBridge";
+import { history, ottMappings } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore, type ImportState } from "../../store/usePlayerStore";
 import { CheckIcon, CloseIcon, DownloadIcon, LinkIcon, TrashIcon, UploadIcon } from "../common/Icons";
@@ -73,6 +73,39 @@ export function AccountSyncModal() {
   const [dragging, setDragging] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
+  /** Provider (canonical id) whose "Clear history" is awaiting confirmation / running. */
+  const [confirmProvider, setConfirmProvider] = useState<number | null>(null);
+  const [clearingProvider, setClearingProvider] = useState<number | null>(null);
+  const [countsNonce, setCountsNonce] = useState(0);
+  const refreshContinueWatching = useAppStore((s) => s.refreshContinueWatching);
+  const loadRecommendations = useAppStore((s) => s.loadRecommendations);
+  const toast = useAppStore((s) => s.toast);
+  const importsDone = profile
+    ? Object.entries(imports).filter(([k, v]) => k.startsWith(`${profile.profileId}:`) && v.stage === "done").length
+    : 0;
+  const counts = useAsync(
+    () => history.providerCounts(profile!.profileId),
+    [profile?.profileId, countsNonce, importsDone],
+    open && !!profile,
+  );
+  const rowsFor = (providerId: number) => counts.data?.find((c) => c.providerId === providerId)?.rows ?? 0;
+
+  const clearProvider = async (providerId: number, providerName: string) => {
+    if (!profile) return;
+    setClearingProvider(providerId);
+    try {
+      const removed = await history.clearProvider(profile.profileId, providerId);
+      toast({ kind: "success", title: `${providerName} history cleared`, body: `Removed ${removed.toLocaleString()} entries from ${profile.profileName}. Other services are untouched.` });
+      void refreshContinueWatching();
+      void loadRecommendations(true);
+    } catch (e) {
+      toast({ kind: "error", title: "Couldn't clear history", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setClearingProvider(null);
+      setConfirmProvider(null);
+      setCountsNonce((n) => n + 1);
+    }
+  };
   const anyImportRunning = profile
     ? Object.entries(imports).some(([k, v]) => k.startsWith(`${profile.profileId}:`) && !["done", "error"].includes(v.stage))
     : false;
@@ -81,6 +114,7 @@ export function AccountSyncModal() {
   useEffect(() => {
     if (open) void refreshMappings();
     setConfirmClear(false);
+    setConfirmProvider(null);
   }, [open, refreshMappings, profile?.profileId]);
 
   // One row per provider family, keyed by the canonical id Rust stores links under.
@@ -95,13 +129,14 @@ export function AccountSyncModal() {
       logoPath: members.find((m) => m.logoPath)?.logoPath ?? null,
       priority: members[0]!.priority,
     }));
-    for (const mp of mappings) {
-      if (!rows.some((r) => r.providerId === mp.providerId)) {
-        rows.push({ providerId: mp.providerId, providerName: providerFamily(mp.providerId, "").name || `Provider ${mp.providerId}`, logoPath: null, priority: 999 });
+    // Linked accounts and services with stored history always get a row (to unlink / clear).
+    for (const providerId of [...mappings.map((mp) => mp.providerId), ...(counts.data ?? []).filter((c) => c.providerId > 0).map((c) => c.providerId)]) {
+      if (!rows.some((r) => r.providerId === providerId)) {
+        rows.push({ providerId, providerName: providerFamily(providerId, "").name || `Provider ${providerId}`, logoPath: null, priority: 999 });
       }
     }
-    return rows.slice(0, 16);
-  }, [subs, regional.data, mappings]);
+    return rows.slice(0, 20);
+  }, [subs, regional.data, mappings, counts.data]);
 
   const onFiles = (files: FileList | null) => {
     for (const f of Array.from(files ?? [])) void importFile(f);
@@ -143,7 +178,7 @@ export function AccountSyncModal() {
                       {logo ? <img src={logo} alt="" className="h-11 w-11 rounded-[11px]" /> : <span className="flex h-11 w-11 items-center justify-center rounded-[11px] bg-white/10 font-bold">{p.providerName[0]}</span>}
                       <div className="min-w-0 flex-1">
                         <p className="font-semibold">{p.providerName}</p>
-                        <p className="text-[12px] text-label-tertiary">
+                        <p className="flex flex-wrap items-center gap-x-2 text-[12px] text-label-tertiary">
                           {mapping ? (
                             <span className="inline-flex items-center gap-1 text-[#30d158]">
                               <CheckIcon size={13} /> Linked to {mapping.ottNativeProfileName ?? "profile"}
@@ -151,6 +186,7 @@ export function AccountSyncModal() {
                           ) : (
                             "Not linked"
                           )}
+                          {rowsFor(p.providerId) > 0 && <span>· {rowsFor(p.providerId).toLocaleString()} history entries</span>}
                         </p>
                       </div>
                       <button className="glass-button !px-4 !py-2" onClick={() => void connect(p.providerId, p.providerName)}>
@@ -161,6 +197,30 @@ export function AccountSyncModal() {
                           <DownloadIcon size={15} /> {busy ? "Importing…" : "Import history"}
                         </button>
                       )}
+                      {rowsFor(p.providerId) > 0 &&
+                        (confirmProvider === p.providerId ? (
+                          <span className="flex items-center gap-1.5">
+                            <button className="glass-button !px-3 !py-2" disabled={clearingProvider === p.providerId} onClick={() => setConfirmProvider(null)}>
+                              Cancel
+                            </button>
+                            <button
+                              className="glass-button !bg-[#ff453a]/80 !px-3 !py-2 !text-white hover:!bg-[#ff453a]"
+                              disabled={clearingProvider === p.providerId || anyImportRunning}
+                              onClick={() => void clearProvider(p.providerId, p.providerName)}
+                            >
+                              <TrashIcon size={14} /> {clearingProvider === p.providerId ? "Clearing…" : `Delete ${rowsFor(p.providerId).toLocaleString()}`}
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            className="glass-button !px-3 !py-2 text-[#ff6961]"
+                            disabled={anyImportRunning || busy}
+                            title={anyImportRunning ? "Wait for the running import to finish" : `Delete only ${profile.profileName}'s ${p.providerName} history`}
+                            onClick={() => setConfirmProvider(p.providerId)}
+                          >
+                            Clear history
+                          </button>
+                        ))}
                       {mapping && (
                         <button
                           className="icon-button !h-9 !w-9 text-label-tertiary hover:text-[#ff453a]"
@@ -231,6 +291,7 @@ export function AccountSyncModal() {
                         setClearing(true);
                         const ok = await clearWatchHistory();
                         setClearing(false);
+                        setCountsNonce((n) => n + 1);
                         if (ok) setConfirmClear(false);
                       }}
                     >

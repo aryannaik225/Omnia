@@ -15,8 +15,20 @@ export const HOME_CONTINUE_WATCHING_DAYS = 60;
 
 export function cwSubtitle(item: ContinueWatchingItem) {
   const ep = episodeLabel(item.seasonNumber, item.episodeNumber);
+  if (item.newEpisode) {
+    const n = item.newEpisode;
+    return ["New episode", episodeLabel(n.seasonNumber, n.episodeNumber), item.providerName].filter(Boolean).join(" · ");
+  }
+  if (item.isManual && item.mediaType === "movie") return "Marked as watched";
   if (item.upNext) return ["Up Next", ep ? `after ${ep}` : null, item.providerName].filter(Boolean).join(" · ");
   return [ep, formatTimeLeft(item.progressSeconds, item.durationSeconds), item.providerName].filter(Boolean).join(" · ");
+}
+
+export function cwBadge(item: ContinueWatchingItem) {
+  if (item.newEpisode) return <span className="badge !bg-[#30d158]/80 !text-black">New Episode</span>;
+  if (item.isManual && item.mediaType === "movie") return <span className="badge !bg-white/25">Watched</span>;
+  if (item.upNext) return <span className="badge !bg-[#0a84ff]/70">Up Next</span>;
+  return undefined;
 }
 
 export function ContinueWatchingRow() {
@@ -65,8 +77,8 @@ export function ContinueWatchingRow() {
             title={item.title ?? "Untitled"}
             imagePath={item.backdropPath ?? item.posterPath}
             subtitle={launching === `${item.mediaType}:${item.tmdbId}` ? "Opening…" : cwSubtitle(item)}
-            progress={item.upNext ? null : item.completionRatio}
-            topLeft={item.upNext ? <span className="badge !bg-[#0a84ff]/70">Up Next</span> : undefined}
+            progress={item.upNext || item.isManual ? null : item.completionRatio}
+            topLeft={cwBadge(item)}
             topRight={
               <span
                 role="button"
@@ -87,7 +99,7 @@ export function ContinueWatchingRow() {
                 i
               </span>
             }
-            onClick={() => void resume(item)}
+            onClick={() => (item.isManual && item.mediaType === "movie" ? openTitle({ id: item.tmdbId, mediaType: item.mediaType }) : void resume(item))}
           />
         ))}
       </div>

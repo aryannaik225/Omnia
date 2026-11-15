@@ -259,7 +259,10 @@ async fn import_ott_history_inner(
         other => scrape_provider_history(app, other, provider_name, &mapping, &region).await?,
     };
 
-    resolve_and_store(app, &state.db, &tmdb, app_profile_id, provider_name, Some(mapping.ott_native_profile_id), raw).await
+    // Netflix's own titles are unambiguous enough (and its imports large); other services get
+    // the regional-availability tie-break.
+    let availability = (provider != OttProvider::Netflix).then(|| Availability { region: region.clone(), provider_id });
+    resolve_and_store(app, &state.db, &tmdb, app_profile_id, provider_name, Some(mapping.ott_native_profile_id), raw, availability).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -321,7 +324,7 @@ pub async fn import_history_file(
     let provider_name = provider_name.unwrap_or_else(|| "Netflix".into());
     let raw = parse_viewing_activity_csv(text)?;
     let tmdb = TmdbClient::from_settings(&state).await?;
-    let report = resolve_and_store(&app, &state.db, &tmdb, app_profile_id, &provider_name, None, raw).await?;
+    let report = resolve_and_store(&app, &state.db, &tmdb, app_profile_id, &provider_name, None, raw, None).await?;
     let _ = app.emit_to(wm::MAIN_LABEL, EVT_IMPORT_FINISHED, json!({ "ok": true, "report": report }));
     Ok(report)
 }
@@ -554,15 +557,32 @@ async fn scrape_provider_history(
     mapping: &OttProfileMapping,
     region: &str,
 ) -> AppResult<Vec<RawItem>> {
-    let (url, scraper, history_page) = match provider {
-        OttProvider::PrimeVideo => ("https://www.primevideo.com/settings/watch-history/".to_string(), "primevideo_history", true),
+    let (urls, scraper, history_page) = match provider {
+        OttProvider::PrimeVideo => (vec!["https://www.primevideo.com/settings/watch-history/".to_string()], "primevideo_history", true),
+        // JioHotstar has no history page: Continue Watching is a tray on Home and on "My Space".
+        OttProvider::Hotstar => {
+            let r = region.to_ascii_lowercase();
+            (vec![format!("https://www.hotstar.com/{r}/home"), format!("https://www.hotstar.com/{r}/mypage")], "continue_watching", false)
+        }
         other => (
-            other.home_url(region).ok_or_else(|| msg(format!("No importer for {provider_name}.")))?,
+            vec![other.home_url(region).ok_or_else(|| msg(format!("No importer for {provider_name}.")))?],
             "continue_watching",
             false,
         ),
     };
-    let payload = scrape_with_hidden_window(app, mapping.app_profile_id, provider, provider_name, &url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
+    let mut payload = None;
+    for url in &urls {
+        let p = scrape_with_hidden_window(app, mapping.app_profile_id, provider, provider_name, url, scraper, Some(&mapping.ott_native_profile_id), SCRAPE_TIMEOUT).await?;
+        if let Some(notes) = p.notes.as_deref() {
+            log::info!("{provider_name} history read: {} entries ({notes})", p.items.len());
+        }
+        let found = !p.items.is_empty();
+        payload = Some(p);
+        if found {
+            break;
+        }
+    }
+    let payload = payload.ok_or_else(|| msg(format!("No importer for {provider_name}.")))?;
 
     let state = app.state::<AppState>();
     let provider_id = mapping.provider_id;
@@ -975,6 +995,14 @@ struct TmdbHit {
     vote_count: i64,
 }
 
+/// Where the history came from: used to break ties between same-name titles ("The Traitors"
+/// US vs India) by checking which one the provider actually carries in the user's region.
+#[derive(Debug, Clone)]
+pub(crate) struct Availability {
+    pub(crate) region: String,
+    pub(crate) provider_id: i64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Matched {
     pub(crate) tmdb_id: i64,
@@ -1120,6 +1148,20 @@ impl TmdbClient {
             .collect())
     }
 
+    /// Whether TMDB lists the title on `avail.provider_id` (any monetization) in its region.
+    async fn is_available_on(&self, media_type: &str, id: i64, avail: &Availability) -> AppResult<bool> {
+        let body = self.get(&format!("/{media_type}/{id}/watch/providers"), &[]).await?;
+        let region = &body["results"][avail.region.to_ascii_uppercase().as_str()];
+        Ok(["flatrate", "free", "ads", "rent", "buy"].iter().any(|kind| {
+            region[*kind].as_array().is_some_and(|list| {
+                list.iter().any(|p| {
+                    let pid = p["provider_id"].as_i64().unwrap_or(0);
+                    canonical_provider_id(pid, p["provider_name"].as_str().unwrap_or("")) == avail.provider_id
+                })
+            })
+        }))
+    }
+
     pub(crate) async fn season_episodes(&self, tv_id: i64, season: i64) -> AppResult<Vec<EpisodeInfo>> {
         let body = self.get(&format!("/tv/{tv_id}/season/{season}"), &[]).await?;
         Ok(body["episodes"]
@@ -1230,6 +1272,7 @@ pub(crate) type HitRank = (i32, i32, i64);
 /// * `soft_year` (a release year the provider reported) ranks closer years first.
 /// * `released_by` (the earliest year the user watched it) rejects anything released later:
 ///   you can't have watched a 2024 remake in 2019.
+#[cfg(test)]
 fn pick_hit(
     hits: &[TmdbHit],
     wanted: &str,
@@ -1237,12 +1280,56 @@ fn pick_hit(
     soft_year: Option<i64>,
     released_by: Option<i64>,
 ) -> Option<(HitRank, TmdbHit)> {
+    rank_hits(hits, wanted, year_hint, soft_year, released_by).into_iter().next()
+}
+
+/// "the family plan" -> "family plan": a leading article never decides a match.
+fn strip_article(normalized: &str) -> &str {
+    for article in ["the ", "a ", "an "] {
+        if let Some(rest) = normalized.strip_prefix(article) {
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    normalized
+}
+
+/// Character-level similarity in 0..=1 (1 - Levenshtein / longer length).
+fn similarity(a: &str, b: &str) -> f64 {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let longest = a.len().max(b.len());
+    if longest == 0 {
+        return 1.0;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    1.0 - prev[b.len()] as f64 / longest as f64
+}
+
+/// Every acceptable hit, best first (see [`pick_hit`] for the rules). Scores: 100 exact title,
+/// 90 equal ignoring a leading article, 60 main title before a subtitle (top 3 only), 50 a
+/// near-identical spelling (>= 90% similar, top 3 only: "Spiderman" / "Spider-Man").
+fn rank_hits(
+    hits: &[TmdbHit],
+    wanted: &str,
+    year_hint: Option<i64>,
+    soft_year: Option<i64>,
+    released_by: Option<i64>,
+) -> Vec<(HitRank, TmdbHit)> {
     let w = normalize_title(wanted);
     if w.is_empty() {
-        return None;
+        return Vec::new();
     }
     let w_main = main_title(wanted);
-    hits.iter()
+    let w_bare = strip_article(&w).to_string();
+    let mut ranked: Vec<(HitRank, TmdbHit)> = hits.iter()
         .enumerate()
         .filter_map(|(idx, h)| {
             if let (Some(by), Some(year)) = (released_by, h.year) {
@@ -1256,10 +1343,15 @@ fn pick_hit(
                 if n.is_empty() {
                     continue;
                 }
+                let n_bare = strip_article(&n);
                 if n == w {
                     score = score.max(100);
+                } else if n_bare == w_bare {
+                    score = score.max(90);
                 } else if idx < 3 && (w_main.as_deref() == Some(n.as_str()) || main_title(raw).as_deref() == Some(w.as_str())) {
                     score = score.max(60);
+                } else if idx < 3 && w_bare.chars().count() >= 6 && similarity(n_bare, &w_bare) >= 0.9 {
+                    score = score.max(50);
                 }
             }
             if score == 0 {
@@ -1276,7 +1368,9 @@ fn pick_hit(
             let popularity = (h.popularity.max(0.0) * 1000.0) as i64 + h.vote_count.max(0);
             Some(((score, year_rank, popularity), h.clone()))
         })
-        .max_by_key(|(rank, _)| *rank)
+        .collect();
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+    ranked
 }
 
 /// Resolves a provider title to a TMDB id.
@@ -1292,11 +1386,113 @@ pub(crate) async fn resolve_title(
     is_tv: Option<bool>,
     released_by: Option<i64>,
     release_year: Option<i64>,
+    availability: Option<&Availability>,
 ) -> AppResult<Option<Matched>> {
-    let cleaned = clean_search_title(title);
-    if cleaned.is_empty() {
-        return Ok(None);
+    // Provider card labels carry noise ("Severance, Season 2, Episode 3", "Ted Lasso – Apple
+    // TV+"): try the label as-is first, then progressively cleaner variants. Each variant is
+    // still matched strictly (exact title / main title), so leniency never means fuzziness.
+    for candidate in search_title_variants(title) {
+        if let Some(m) = resolve_title_exact(db, tmdb, title, &candidate, is_tv, released_by, release_year, availability).await? {
+            return Ok(Some(m));
+        }
     }
+    Ok(None)
+}
+
+/// Provider brands that card labels prepend or append ("Apple TV+", "An Apple Original").
+const PROVIDER_BRANDS: &[&str] = &[
+    "an apple original film", "an apple original", "apple original films", "apple original", "apple tv+", "apple tv plus", "apple tv",
+    "jiohotstar", "disney+ hotstar", "hotstar specials", "hotstar", "amazon original", "prime video", "amazon", "netflix original", "netflix",
+    "disney+", "hbo max", "hbo original", "peacock", "paramount+", "hulu original", "hulu", "zee5", "sonyliv", "sony liv", "originals", "original",
+];
+
+/// Button / card verbs some providers put in front of the title in accessibility labels.
+const LABEL_VERBS: &[&str] = &["continue watching", "keep watching", "resume watching", "now playing", "up next", "play", "resume", "watch", "continue"];
+
+fn strip_brands(title: &str) -> String {
+    let mut t = title.trim().to_string();
+    for verb in LABEL_VERBS {
+        let lower = t.to_lowercase();
+        if let Some(rest) = lower.strip_prefix(verb) {
+            if rest.starts_with([' ', ':', '-', '\u{2013}', ',']) && rest.trim().chars().count() >= 2 {
+                t = t[verb.len()..].trim_start_matches([' ', ':', '-', '\u{2013}', ',']).to_string();
+                break;
+            }
+        }
+    }
+    loop {
+        let lower = t.to_lowercase();
+        let before = t.len();
+        for brand in PROVIDER_BRANDS {
+            let sep = |c: char| c.is_whitespace() || matches!(c, ':' | '-' | '–' | '—' | '|' | '·' | ',' | '.');
+            if lower.starts_with(brand) && lower[brand.len()..].starts_with(sep) {
+                t = t[brand.len()..].trim_start_matches(sep).to_string();
+                break;
+            }
+            // A bare "Original(s)" is only noise in front ("The Originals" is a real show).
+            if lower.ends_with(brand) && !brand.starts_with("original") {
+                let head = &t[..t.len() - brand.len()];
+                if head.ends_with(sep) {
+                    t = head.trim_end_matches(sep).to_string();
+                    break;
+                }
+            }
+        }
+        if t.len() == before || t.is_empty() {
+            return t.trim().to_string();
+        }
+    }
+}
+
+/// Search candidates for a provider label, most specific first, deduplicated.
+pub(crate) fn search_title_variants(title: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn add(out: &mut Vec<String>, t: String) {
+        let t = t.trim().trim_matches(|c: char| matches!(c, ',' | ':' | '-' | '|' | '·')).trim().to_string();
+        if t.chars().any(char::is_alphanumeric) && !out.iter().any(|o| normalize_title(o) == normalize_title(&t)) {
+            out.push(t);
+        }
+    }
+    let cleaned = clean_search_title(title);
+    add(&mut out, cleaned.clone());
+    let unbranded = strip_brands(&cleaned);
+    add(&mut out, unbranded.clone());
+    // "Severance, Season 2, Episode 3" / "Ted Lasso · S3 E1" / "Silo | Apple TV": the head.
+    for sep in [", ", " · ", " | ", " – ", " — ", " - "] {
+        if let Some(idx) = unbranded.find(sep) {
+            let head = clean_search_title(&unbranded[..idx]);
+            if head.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                add(&mut out, strip_brands(&head));
+            }
+        }
+    }
+    // A trailing season/episode marker left on the head ("Slow Horses Season 4").
+    if let Some(last) = out.last().cloned() {
+        let words: Vec<&str> = last.split_whitespace().collect();
+        if let Some(pos) = words.iter().position(|w| {
+            let w = w.to_lowercase();
+            SEASON_WORDS.contains(&w.as_str()) || EPISODE_WORDS.contains(&w.as_str()) || compact_se(&w).is_some()
+        }) {
+            if pos >= 1 {
+                add(&mut out, words[..pos].join(" "));
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_title_exact(
+    db: &Database,
+    tmdb: &TmdbClient,
+    title: &str,
+    cleaned: &str,
+    is_tv: Option<bool>,
+    released_by: Option<i64>,
+    release_year: Option<i64>,
+    availability: Option<&Availability>,
+) -> AppResult<Option<Matched>> {
+    let cleaned = cleaned.to_string();
     let year_hint = title_year_hint(title);
     let release_year = release_year.filter(|y| (1880..=2100).contains(y));
     // The local cache is only trusted when the media type is known: an exact-title row of the
@@ -1315,7 +1511,13 @@ pub(crate) async fn resolve_title(
                 }
                 None => year_hint.is_none(),
             };
-            if year_ok {
+            // A cached same-name title on another service ("The Traitors" US, cached from an
+            // earlier import) must not shadow the provider's own version: search instead.
+            let carried = match availability {
+                Some(av) => tmdb.is_available_on(tf, local.tmdb_id, av).await.unwrap_or(true),
+                None => true,
+            };
+            if year_ok && carried {
                 return Ok(Some(Matched {
                     tmdb_id: local.tmdb_id,
                     media_type: local.media_type,
@@ -1331,20 +1533,32 @@ pub(crate) async fn resolve_title(
         Some(false) => &["movie"],
         None => &["tv", "movie"],
     };
-    let mut best: Option<(HitRank, TmdbHit)> = None;
+    let mut ranked: Vec<(HitRank, TmdbHit)> = Vec::new();
     for &media_type in types {
-        let mut candidate = None;
+        let mut candidates = Vec::new();
         if let Some(year) = release_year.or(year_hint) {
             let hits = tmdb.search(media_type, &cleaned, Some(year)).await?;
-            candidate = pick_hit(&hits, &cleaned, year_hint, release_year, released_by).filter(|(rank, _)| rank.0 == 100);
+            candidates = rank_hits(&hits, &cleaned, year_hint, release_year, released_by);
+            candidates.retain(|(rank, _)| rank.0 == 100);
         }
-        if candidate.is_none() {
+        if candidates.is_empty() {
             let hits = tmdb.search(media_type, &cleaned, None).await?;
-            candidate = pick_hit(&hits, &cleaned, year_hint, release_year, released_by);
+            candidates = rank_hits(&hits, &cleaned, year_hint, release_year, released_by);
         }
-        if let Some(candidate) = candidate {
-            if best.as_ref().is_none_or(|(rank, _)| candidate.0 > *rank) {
-                best = Some(candidate);
+        ranked.extend(candidates);
+    }
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut best = ranked.first().cloned();
+    // Same-name titles (remakes, regional versions): prefer the one the provider carries in
+    // the user's region. Only equally strong title matches compete; popularity no longer decides.
+    if let (Some(av), Some((top, _))) = (availability, ranked.first()) {
+        let contenders: Vec<&(HitRank, TmdbHit)> = ranked.iter().filter(|(r, _)| r.0 == top.0).take(4).collect();
+        if contenders.len() > 1 {
+            for (rank, hit) in contenders {
+                if tmdb.is_available_on(hit.media_type, hit.id, av).await.unwrap_or(false) {
+                    best = Some((*rank, hit.clone()));
+                    break;
+                }
             }
         }
     }
@@ -1388,7 +1602,7 @@ pub struct IdentifiedTitle {
 /// provider's release year is passed to TMDB; the matched entry is cached locally.
 pub async fn identify_title(state: &AppState, title: &str, is_tv: bool, release_year: Option<i64>) -> AppResult<Option<IdentifiedTitle>> {
     let tmdb = TmdbClient::from_settings(state).await?;
-    let Some(m) = resolve_title(&state.db, &tmdb, title, Some(is_tv), None, release_year).await? else {
+    let Some(m) = resolve_title(&state.db, &tmdb, title, Some(is_tv), None, release_year, None).await? else {
         return Ok(None);
     };
     let (tmdb_id, mt) = (m.tmdb_id, m.media_type.clone());
@@ -1409,6 +1623,7 @@ pub async fn identify_title(state: &AppState, title: &str, is_tv: bool, release_
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_and_store(
     app: &AppHandle,
     db: &Database,
@@ -1417,6 +1632,7 @@ async fn resolve_and_store(
     provider_name: &str,
     ott_profile_id: Option<String>,
     raw: Vec<RawItem>,
+    availability: Option<Availability>,
 ) -> AppResult<ImportReport> {
     let fetched = raw.len();
     let mut report = ImportReport {
@@ -1457,10 +1673,10 @@ async fn resolve_and_store(
     let sem = Arc::new(Semaphore::new(TMDB_CONCURRENCY));
     let mut set = JoinSet::new();
     for (gi, (title, is_tv, released_by)) in groups.iter().cloned().enumerate() {
-        let (db, tmdb, sem) = (db.clone(), tmdb.clone(), sem.clone());
+        let (db, tmdb, sem, availability) = (db.clone(), tmdb.clone(), sem.clone(), availability.clone());
         set.spawn(async move {
             let _permit = sem.acquire_owned().await;
-            (gi, resolve_title(&db, &tmdb, &title, is_tv, released_by, None).await)
+            (gi, resolve_title(&db, &tmdb, &title, is_tv, released_by, None, availability.as_ref()).await)
         });
     }
     let mut matches: Vec<Option<Matched>> = vec![None; total];
@@ -1733,6 +1949,46 @@ mod tests {
             episode,
             episode_title: title.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn lenient_matching_ignores_articles_and_tiny_spelling_differences() {
+        let hit = |id: i64, title: &str, pop: f64| TmdbHit {
+            id,
+            media_type: "movie",
+            title: title.into(),
+            original_title: None,
+            year: Some(2023),
+            poster_path: None,
+            backdrop_path: None,
+            overview: None,
+            vote_average: None,
+            genre_ids: Value::Null,
+            popularity: pop,
+            vote_count: 0,
+        };
+        let hits = vec![hit(1, "The Family Plan", 50.0), hit(2, "Family", 90.0)];
+        assert_eq!(pick_hit(&hits, "Family Plan", None, None, None).unwrap().1.id, 1);
+        let hits = vec![hit(3, "Spider-Man: Homecoming", 10.0)];
+        assert_eq!(pick_hit(&hits, "Spiderman Homecoming", None, None, None).unwrap().1.id, 3);
+        // Still no substring matches.
+        let hits = vec![hit(4, "Friends with Benefits", 99.0)];
+        assert!(pick_hit(&hits, "Friends", None, None, None).is_none());
+        assert!(search_title_variants("Play The Family Plan").contains(&"The Family Plan".to_string()));
+    }
+
+    #[test]
+    fn provider_labels_yield_clean_search_variants() {
+        let v = search_title_variants("Severance, Season 2, Episode 3");
+        assert!(v.contains(&"Severance".to_string()), "{v:?}");
+        let v = search_title_variants("Ted Lasso – Apple TV+");
+        assert!(v.contains(&"Ted Lasso".to_string()), "{v:?}");
+        let v = search_title_variants("Apple TV+ Original: Slow Horses Season 4");
+        assert!(v.contains(&"Slow Horses".to_string()), "{v:?}");
+        assert_eq!(search_title_variants("Dune (2021)"), vec!["Dune".to_string()]);
+        assert_eq!(search_title_variants("The Originals"), vec!["The Originals".to_string()]);
+        // A title that legitimately contains a dash is tried whole first.
+        assert_eq!(search_title_variants("Spider-Man: No Way Home")[0], "Spider-Man: No Way Home");
     }
 
     #[test]

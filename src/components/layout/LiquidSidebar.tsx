@@ -10,7 +10,7 @@ import { flag } from "../../lib/format";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { Avatar, defaultAvatarFor } from "../common/Avatar";
-import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, SidebarIcon, TvIcon } from "../common/Icons";
+import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, SidebarIcon, TvIcon, StackIcon } from "../common/Icons";
 
 export const SIDEBAR_EXPANDED = 248;
 export const SIDEBAR_COLLAPSED = 76;
@@ -25,6 +25,7 @@ const NAV: { view: View; label: string; icon: ComponentType<{ size?: number }> }
   { view: "myotts", label: "My OTTs", icon: TvIcon },
   { view: "hubs", label: "Franchises & Hubs", icon: GridIcon },
   { view: "watchlist", label: "Watchlist", icon: BookmarkIcon },
+  { view: "collections", label: "Collections", icon: StackIcon },
   { view: "settings", label: "Settings", icon: GearIcon },
 ];
 

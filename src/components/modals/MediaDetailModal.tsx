@@ -23,6 +23,7 @@ import { useAppStore, type ModalEntry } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { PosterCard } from "../common/Cards";
 import { HorizontalScroller } from "../common/HorizontalScroller";
+import { CollectionMenu, EpisodeWatchedToggle, FavoriteButton, MarkWatchedButton } from "../common/LibraryActions";
 import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon, StarIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
 import { fromSummary, MediaCarouselRow } from "../home/MediaCarouselRow";
@@ -127,17 +128,67 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
 // Seasons & episodes
 // ---------------------------------------------------------------------------------------------
 
-function Episodes({ d, progress, onPlay }: { d: MediaDetails; progress: WatchHistoryEntry[]; onPlay: (season: number, episode: number, title: string) => void }) {
+function Episodes({
+  d,
+  progress,
+  onPlay,
+  onChanged,
+}: {
+  d: MediaDetails;
+  progress: WatchHistoryEntry[];
+  onPlay: (season: number, episode: number, title: string) => void;
+  onChanged: () => void;
+}) {
+  const profile = useAppStore((s) => s.activeProfile);
+  const toast = useAppStore((s) => s.toast);
+  const refreshContinueWatching = useAppStore((s) => s.refreshContinueWatching);
+  const markRecsStale = useAppStore((s) => s.markRecsStale);
+  const [markingSeason, setMarkingSeason] = useState(false);
   const latest = useMemo(() => [...progress].filter((p) => p.episodeNumber > 0).sort((a, b) => b.lastWatchedAt.localeCompare(a.lastWatchedAt))[0], [progress]);
   const [seasonNo, setSeasonNo] = useState<number>(latest?.seasonNumber ?? d.seasons[0]?.seasonNumber ?? 1);
   const episodes = useAsync(() => tmdbSeason(d.id, seasonNo), [d.id, seasonNo]);
   const byKey = useMemo(() => new Map(progress.map((p) => [`${p.seasonNumber}-${p.episodeNumber}`, p])), [progress]);
 
+  /** Marks every aired, not-yet-finished episode of the open season (watched elsewhere). */
+  const markSeason = async () => {
+    if (!profile || !episodes.data) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const todo = episodes.data.filter((ep) => !byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`)?.isCompleted && (!ep.airDate || ep.airDate <= today));
+    if (!todo.length) return;
+    setMarkingSeason(true);
+    try {
+      for (const ep of todo) {
+        await history.markWatched(profile.profileId, d.id, "tv", {
+          seasonNumber: ep.seasonNumber,
+          episodeNumber: ep.episodeNumber,
+          episodeTitle: ep.name,
+          durationSeconds: ep.runtimeMins ? ep.runtimeMins * 60 : null,
+        });
+      }
+      toast({ kind: "success", title: "Season marked as watched", body: `${todo.length} episode${todo.length > 1 ? "s" : ""} of ${d.title}` });
+      onChanged();
+      void refreshContinueWatching();
+      markRecsStale();
+    } catch (e) {
+      toast({ kind: "error", title: "Couldn't update history", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setMarkingSeason(false);
+    }
+  };
+  const seasonDone = !!episodes.data?.length && episodes.data.every((ep) => byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`)?.isCompleted);
+
   if (!d.seasons.length) return null;
   return (
     <section>
       <div className="mb-4 flex items-center justify-between gap-4">
-        <h2 className="section-title">Episodes</h2>
+        <div className="flex items-center gap-3">
+          <h2 className="section-title">Episodes</h2>
+          {episodes.data && !seasonDone && (
+            <button className="chip" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode">
+              {markingSeason ? "Marking…" : "Mark season watched"}
+            </button>
+          )}
+        </div>
         <div className="flex gap-2 overflow-x-auto scrollbar-none">
           {d.seasons.map((s) => (
             <button key={s.seasonNumber} className="chip" data-active={s.seasonNumber === seasonNo} onClick={() => setSeasonNo(s.seasonNumber)}>
@@ -154,10 +205,10 @@ function Episodes({ d, progress, onPlay }: { d: MediaDetails; progress: WatchHis
           const ratio = p ? (p.isCompleted ? 1 : p.completionRatio) : 0;
           const still = img(ep.stillPath, "w300");
           return (
+            <div key={ep.episodeNumber} className="flex items-center gap-2 rounded-card pr-3 transition-colors hover:bg-white/[0.06]">
             <button
-              key={ep.episodeNumber}
               onClick={() => onPlay(ep.seasonNumber, ep.episodeNumber, ep.name)}
-              className="group flex items-center gap-4 rounded-card p-2 text-left transition-colors hover:bg-white/[0.06]"
+              className="group flex min-w-0 flex-1 items-center gap-4 rounded-card p-2 text-left"
             >
               <span className="relative aspect-video w-[168px] shrink-0 overflow-hidden rounded-[12px] bg-white/5">
                 {still && <img src={still} alt="" loading="lazy" className="h-full w-full object-cover" />}
@@ -181,6 +232,16 @@ function Episodes({ d, progress, onPlay }: { d: MediaDetails; progress: WatchHis
                 <span className="mt-1 line-clamp-2 block text-[13px] text-label-secondary">{ep.overview}</span>
               </span>
             </button>
+            <EpisodeWatchedToggle
+              tmdbId={d.id}
+              seasonNumber={ep.seasonNumber}
+              episodeNumber={ep.episodeNumber}
+              episodeTitle={ep.name}
+              runtimeMins={ep.runtimeMins}
+              entry={p}
+              onChanged={onChanged}
+            />
+            </div>
           );
         })}
       </div>
@@ -207,12 +268,14 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
   const playTitle = usePlayerStore((s) => s.playTitle);
   const launching = usePlayerStore((s) => s.launching);
   const [trailerOpen, setTrailerOpen] = useState(false);
+  const [progressNonce, setProgressNonce] = useState(0);
+  const reloadProgress = () => setProgressNonce((n) => n + 1);
 
   const det = useAsync(() => tmdbDetails(entry.mediaType, entry.id, region), [entry.id, entry.mediaType, region]);
   const d = det.data;
   const progress = useAsync(
     () => (profile ? history.titleProgress(profile.profileId, entry.id, entry.mediaType) : Promise.resolve([])),
-    [profile?.profileId, entry.id, entry.mediaType],
+    [profile?.profileId, entry.id, entry.mediaType, progressNonce],
   );
 
   // Cache rich metadata locally (artwork for Continue Watching + recommender features).
@@ -275,6 +338,11 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
               <button className="glass-button !py-3" onClick={() => void toggleWatchlist(seed)}>
                 {listed ? <CheckIcon size={18} /> : <PlusIcon size={18} />} Up Next
               </button>
+              <FavoriteButton tmdbId={seed.id} mediaType={seed.mediaType} title={seed.title} />
+              {seed.mediaType === "movie" && (
+                <MarkWatchedButton tmdbId={seed.id} title={seed.title} runtimeMins={d?.runtimeMins} progress={progress.data ?? []} onChanged={reloadProgress} />
+              )}
+              <CollectionMenu tmdbId={seed.id} mediaType={seed.mediaType} title={seed.title} />
               {trailer && (
                 <button className="glass-button !py-3" onClick={() => setTrailerOpen((o) => !o)}>
                   {trailerOpen ? "Hide trailer" : "Trailer"}
@@ -339,6 +407,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
             d={d}
             progress={progress.data ?? []}
             onPlay={(seasonNumber, episodeNumber, episodeTitle) => void playTitle(d, { seasonNumber, episodeNumber, episodeTitle })}
+            onChanged={reloadProgress}
           />
         )}
 

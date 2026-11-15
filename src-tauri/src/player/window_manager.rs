@@ -1287,6 +1287,27 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         (None, None) => None,
     };
 
+    // Netflix episodes: a deep link usually opens the series' landing page (/title/<id>). Use
+    // the episode's own player URL when history has it (/watch/<episodeId>); otherwise the
+    // injected script looks the episode up in Netflix's own metadata and jumps to it.
+    let mut target_url = target_url;
+    let mut jump_to_episode: Option<(i64, i64)> = None;
+    if let (PlayerMode::Play, Some(it), OttProvider::Netflix) = (request.mode, &item, provider) {
+        if it.media_type == "tv" && it.season_number > 0 && it.episode_number > 0 && !target_url.path().starts_with("/watch/") {
+            let (tmdb_id, s, e) = (it.tmdb_id, it.season_number, it.episode_number);
+            let stored = state
+                .db
+                .run(move |c| queries::get_history_entry(c, profile_id, tmdb_id, "tv", s, e))
+                .await?
+                .and_then(|h| h.direct_url)
+                .filter(|u| u.starts_with("https://www.netflix.com/watch/"));
+            match stored.as_deref().map(parse_https_url) {
+                Some(Ok(u)) => target_url = u,
+                _ => jump_to_episode = Some((s, e)),
+            }
+        }
+    }
+
     let (mapping, provider_has_mappings) = state
         .db
         .run(move |c| {
@@ -1326,6 +1347,8 @@ pub async fn open_player(app: AppHandle, state: State<'_, AppState>, request: Op
         "expectedOttProfileName": mapping.as_ref().and_then(|m| m.ott_native_profile_name.clone()),
         "targetUrl": switch_url.as_ref().map(|_| target_url.to_string()),
         "canLink": mapping.is_none(),
+        "targetSeason": jump_to_episode.map(|(s, _)| s),
+        "targetEpisode": jump_to_episode.map(|(_, e)| e),
     });
 
     let session = PlayerSession {

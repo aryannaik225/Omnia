@@ -91,6 +91,10 @@ export interface ContinueWatchingItem extends WatchHistoryEntry {
   runtimeMins: number | null;
   /** The latest episode was finished: offer the next one. */
   upNext: boolean;
+  /** Recorded with "Mark as Watched". */
+  isManual: boolean;
+  /** A caught-up airing series has a new episode out. */
+  newEpisode: { seasonNumber: number; episodeNumber: number; airDate: string } | null;
 }
 
 export interface ProgressUpdate {
@@ -419,6 +423,16 @@ export const deepLinks = {
     invoke<ResolvedLink[]>("get_cached_deep_links", { tmdbId, mediaType, regionCode }),
 };
 
+/** One "Recently watched" card: the title's latest row plus how many rows it has. */
+export interface HistoryTitle extends HistoryWithMedia {
+  entryCount: number;
+}
+
+export interface ProviderHistoryCount {
+  providerId: number;
+  rows: number;
+}
+
 export interface ClearedHistory {
   historyRows: number;
   playbackEvents: number;
@@ -435,6 +449,30 @@ export const history = {
   titleProgress: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<WatchHistoryEntry[]>("get_title_progress", { appProfileId, tmdbId, mediaType }),
   remove: (appProfileId: number, id: number) => invoke<boolean>("delete_watch_history_entry", { appProfileId, id }),
+  /** One row per title (newest first), paged by title, so lifetime imports show every show. */
+  /** `providerId`: one provider family, `0` = Offline / Manual, `null` = everything. */
+  titles: (appProfileId: number, limit = 60, offset = 0, providerId: number | null = null) =>
+    invoke<HistoryTitle[]>("get_history_titles", { appProfileId, limit, offset, providerId }),
+  removeTitle: (appProfileId: number, tmdbId: number, mediaType: MediaType) => invoke<number>("delete_title_history", { appProfileId, tmdbId, mediaType }),
+  /** "Mark as Watched" (cinema, local file, another device): history + Continue Watching. */
+  markWatched: (appProfileId: number, tmdbId: number, mediaType: MediaType, opts: { seasonNumber?: number; episodeNumber?: number; episodeTitle?: string | null; durationSeconds?: number | null } = {}) =>
+    invoke<WatchHistoryEntry>("mark_watched", {
+      appProfileId,
+      tmdbId,
+      mediaType,
+      seasonNumber: opts.seasonNumber ?? null,
+      episodeNumber: opts.episodeNumber ?? null,
+      episodeTitle: opts.episodeTitle ?? null,
+      durationSeconds: opts.durationSeconds ?? null,
+    }),
+  unmarkWatched: (appProfileId: number, tmdbId: number, mediaType: MediaType, seasonNumber = 0, episodeNumber = 0) =>
+    invoke<boolean>("unmark_watched", { appProfileId, tmdbId, mediaType, seasonNumber, episodeNumber }),
+  /** Caught-up airing series with a new episode come back to Continue Watching. */
+  checkAiringShows: (appProfileId: number) => invoke<number>("check_airing_shows", { appProfileId }),
+  /** History rows per provider family (canonical id; 0 = Offline / Manual). */
+  providerCounts: (appProfileId: number) => invoke<ProviderHistoryCount[]>("get_history_provider_counts", { appProfileId }),
+  /** Deletes only this profile's rows recorded on one provider family. */
+  clearProvider: (appProfileId: number, providerId: number) => invoke<number>("clear_provider_history", { appProfileId, providerId }),
   /** "Clear Watch History": wipes this profile's history + playback events (other profiles untouched). */
   clearAll: (appProfileId: number) => invoke<ClearedHistory>("clear_watch_history", { appProfileId }),
   /** "Remove from Continue Watching": hidden until watched again; history is kept. */
@@ -467,6 +505,39 @@ export const watchlist = {
   list: (appProfileId: number) => invoke<WatchlistItem[]>("get_watchlist", { appProfileId }),
   contains: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
     invoke<boolean>("is_in_watchlist", { appProfileId, tmdbId, mediaType }),
+};
+
+/** "Paste an image URL" avatar: Rust downloads it once and returns a data URL. */
+export const fetchAvatarImage = (url: string) => invoke<string>("fetch_avatar_image", { url });
+
+export const favorites = {
+  set: (appProfileId: number, tmdbId: number, mediaType: MediaType, favorite: boolean) =>
+    invoke<boolean>("set_favorite", { appProfileId, tmdbId, mediaType, favorite }),
+  contains: (appProfileId: number, tmdbId: number, mediaType: MediaType) => invoke<boolean>("is_favorite", { appProfileId, tmdbId, mediaType }),
+  list: (appProfileId: number) => invoke<WatchlistItem[]>("get_favorites", { appProfileId }),
+};
+
+export interface Collection {
+  collectionId: number;
+  appProfileId: number;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  itemCount: number;
+  coverPosters: string[];
+}
+
+export const collections = {
+  list: (appProfileId: number) => invoke<Collection[]>("get_collections", { appProfileId }),
+  create: (appProfileId: number, name: string) => invoke<Collection>("create_collection", { appProfileId, name }),
+  rename: (appProfileId: number, collectionId: number, name: string) => invoke<void>("rename_collection", { appProfileId, collectionId, name }),
+  remove: (appProfileId: number, collectionId: number) => invoke<boolean>("delete_collection", { appProfileId, collectionId }),
+  addItem: (appProfileId: number, collectionId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<boolean>("add_to_collection", { appProfileId, collectionId, tmdbId, mediaType }),
+  removeItem: (appProfileId: number, collectionId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<boolean>("remove_from_collection", { appProfileId, collectionId, tmdbId, mediaType }),
+  items: (appProfileId: number, collectionId: number) => invoke<WatchlistItem[]>("get_collection_items", { appProfileId, collectionId }),
+  containing: (appProfileId: number, tmdbId: number, mediaType: MediaType) => invoke<number[]>("get_title_collections", { appProfileId, tmdbId, mediaType }),
 };
 
 export const player = {

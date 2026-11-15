@@ -13,10 +13,16 @@ import { details as tmdbDetails, img, type MediaDetails, type MediaSummary } fro
 import type { SubscribedProvider } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { CheckIcon, PlayIcon, PlusIcon } from "../common/Icons";
+import { CheckIcon, PlayIcon, PlusIcon, SpeakerIcon, SpeakerMutedIcon } from "../common/Icons";
 
 const ROTATE_MS = 11_000;
 const TRAILER_DELAY_MS = 2_000;
+const YT_ORIGINS = new Set(["https://www.youtube-nocookie.com", "https://www.youtube.com"]);
+
+/** Commands for the YouTube IFrame player over postMessage (`enablejsapi=1`). */
+function ytCommand(frame: HTMLIFrameElement | null, func: string, args: unknown[] = []) {
+  frame?.contentWindow?.postMessage(JSON.stringify({ event: "command", func, args }), "*");
+}
 
 export function providerBadge(d: MediaDetails | undefined, region: string, subs: SubscribedProvider[]): string | null {
   const r = d?.providersByRegion[region];
@@ -51,6 +57,11 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
   const [cycle, setCycle] = useState(0);
   const [engaged, setEngaged] = useState(false);
   const [showTrailer, setShowTrailer] = useState(false);
+  /** Muted by default; the choice sticks across slides for this session. */
+  const [muted, setMuted] = useState(true);
+  /** Trailers play once: a finished trailer isn't restarted until the slide changes. */
+  const [endedKey, setEndedKey] = useState<string | null>(null);
+  const frame = useRef<HTMLIFrameElement | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const safeIndex = slides.length ? index % slides.length : 0;
   const current = slides[safeIndex];
@@ -99,17 +110,54 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
     return () => clearInterval(t);
   }, [engaged, slides.length, cycle]);
 
-  // Muted trailer preview after a 2s hover/focus.
+  // Muted trailer preview after a 2s hover/focus; plays once, then the artwork returns.
   const trailerKey = d?.videos[0]?.key;
   useEffect(() => {
     setShowTrailer(false);
     if (timer.current) clearTimeout(timer.current);
-    if (!engaged || !trailerAutoplay || !trailerKey) return;
+    if (!engaged || !trailerAutoplay || !trailerKey || endedKey === trailerKey) return;
     timer.current = setTimeout(() => setShowTrailer(true), TRAILER_DELAY_MS);
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [engaged, trailerAutoplay, trailerKey, safeIndex]);
+  }, [engaged, trailerAutoplay, trailerKey, safeIndex, endedKey]);
+  // A new slide may play its trailer again.
+  useEffect(() => setEndedKey(null), [safeIndex]);
+
+  // Player events: listen for "ended" (state 0) and keep the mute state in sync.
+  useEffect(() => {
+    if (!showTrailer || !trailerKey) return;
+    const onMessage = (e: MessageEvent) => {
+      if (!YT_ORIGINS.has(e.origin) || e.source !== frame.current?.contentWindow || typeof e.data !== "string") return;
+      let msg: { event?: string; info?: unknown };
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      const info = msg.info as { playerState?: number } | number | undefined;
+      const state = msg.event === "onStateChange" ? info : typeof info === "object" ? info?.playerState : undefined;
+      if (state === 0) {
+        setEndedKey(trailerKey);
+        setShowTrailer(false);
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [showTrailer, trailerKey]);
+
+  const onTrailerLoad = () => {
+    // Subscribe to player events, then apply the current mute choice.
+    frame.current?.contentWindow?.postMessage(JSON.stringify({ event: "listening", id: "omnia-hero" }), "*");
+    ytCommand(frame.current, "addEventListener", ["onStateChange"]);
+    if (!muted) ytCommand(frame.current, "unMute");
+  };
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    ytCommand(frame.current, next ? "mute" : "unMute");
+    if (!next) ytCommand(frame.current, "setVolume", [80]);
+  };
 
   if (!current) {
     return <div className="skeleton h-[68vh] min-h-[520px] w-full" />;
@@ -126,7 +174,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
   return (
     <section
-      className="relative h-[68vh] min-h-[520px] w-full overflow-hidden"
+      className={`relative h-[68vh] min-h-[520px] w-full overflow-hidden ${showTrailer && trailerKey ? "hero-trailer-on" : ""}`}
       onPointerEnter={() => setEngaged(true)}
       onPointerLeave={() => setEngaged(false)}
       onFocusCapture={() => setEngaged(true)}
@@ -151,16 +199,19 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
         {showTrailer && trailerKey && (
           <m.div
             key={trailerKey}
-            className="hero-mask pointer-events-none absolute inset-0 overflow-hidden"
+            // Fully opaque: no mask, no inherited fade (only the bottom edge blends into the rows).
+            className="hero-trailer-mask pointer-events-none absolute inset-0 overflow-hidden opacity-100"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.8 }}
           >
             <iframe
+              ref={frame}
               title={`${current.title} trailer`}
-              src={`https://www.youtube-nocookie.com/embed/${trailerKey}?autoplay=1&mute=1&controls=0&loop=1&playlist=${trailerKey}&modestbranding=1&playsinline=1&rel=0&iv_load_policy=3&disablekb=1`}
+              src={`https://www.youtube-nocookie.com/embed/${trailerKey}?autoplay=1&mute=1&controls=0&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}&modestbranding=1&playsinline=1&rel=0&iv_load_policy=3&disablekb=1`}
               allow="autoplay; encrypted-media"
+              onLoad={onTrailerLoad}
               className="absolute left-1/2 top-1/2 h-[140%] w-[140%] -translate-x-1/2 -translate-y-1/2 scale-[1.02]"
             />
           </m.div>
@@ -169,7 +220,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
       <div className="hero-scrim absolute inset-0" />
 
-      <div className="absolute bottom-[19%] left-[calc(var(--content-left)+8px)] z-20 max-w-[620px] pr-8 transition-[left] duration-500">
+      <div className="hero-copy absolute bottom-[19%] left-[calc(var(--content-left)+8px)] z-20 max-w-[620px] pr-8 transition-[left,opacity] duration-500">
         <AnimatePresence mode="wait">
           <m.div
             key={current.id}
@@ -203,9 +254,28 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
         </AnimatePresence>
       </div>
 
+      <div className="absolute bottom-[19%] right-8 z-20 flex items-center gap-3">
+      <AnimatePresence>
+        {showTrailer && trailerKey && (
+          <m.button
+            key="mute"
+            type="button"
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            onClick={toggleMute}
+            aria-label={muted ? "Unmute trailer" : "Mute trailer"}
+            aria-pressed={!muted}
+            title={muted ? "Unmute" : "Mute"}
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-black/35 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] backdrop-blur-md transition-colors hover:bg-black/55"
+          >
+            {muted ? <SpeakerMutedIcon size={18} /> : <SpeakerIcon size={18} />}
+          </m.button>
+        )}
+      </AnimatePresence>
       {slides.length > 1 && (
         <div
-          className="absolute bottom-[19%] right-8 z-20 flex items-center rounded-full bg-black/25 px-1.5 backdrop-blur-md"
+          className="flex items-center rounded-full bg-black/25 px-1.5 backdrop-blur-md"
           role="tablist"
           aria-label="Featured titles"
           onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
@@ -242,6 +312,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
           })}
         </div>
       )}
+      </div>
     </section>
   );
 }
