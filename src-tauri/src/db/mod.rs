@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("schema.sql")),
     (2, include_str!("migrations/002_preferred_providers.sql")),
     (3, include_str!("migrations/003_continue_watching_hidden.sql")),
+    (4, include_str!("migrations/004_imported_history.sql")),
 ];
 
 /// Cheap-to-clone handle to the local database (internally an mpsc sender to the SQLite thread).

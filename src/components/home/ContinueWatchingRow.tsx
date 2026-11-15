@@ -2,10 +2,12 @@
 import { useMemo, useRef } from "react";
 import { useSubscriptionFilter } from "../../lib/availability";
 import { episodeLabel, formatTimeLeft, watchedWithinDays } from "../../lib/format";
-import type { ContinueWatchingItem } from "../../services/tauriBridge";
+import { useAsync } from "../../lib/hooks";
+import { history, type ContinueWatchingItem } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { LandscapeCard } from "../common/Cards";
+import { EmptyState } from "../common/EmptyState";
 import { RowShell } from "./MediaCarouselRow";
 
 /** Home only shows recent activity; older items stay in the full "Watching Now" view. */
@@ -19,6 +21,7 @@ export function cwSubtitle(item: ContinueWatchingItem) {
 
 export function ContinueWatchingRow() {
   const stored = useAppStore((s) => s.continueWatching);
+  const loaded = useAppStore((s) => s.continueWatchingLoaded);
   const all = useMemo(() => stored.filter((it) => watchedWithinDays(it.lastWatchedAt, HOME_CONTINUE_WATCHING_DAYS)), [stored]);
   // "My Subscriptions": keep titles last watched on (or streaming on) a subscribed service.
   const { items } = useSubscriptionFilter(all, (it) => ({ id: it.tmdbId, mediaType: it.mediaType, providerName: it.providerName }));
@@ -26,7 +29,28 @@ export function ContinueWatchingRow() {
   const resume = usePlayerStore((s) => s.resumeItem);
   const launching = usePlayerStore((s) => s.launching);
   const scroller = useRef<HTMLDivElement | null>(null);
-  if (!items.length) return null;
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  // Imported history is silent (it never appears here): only invite a profile with no history
+  // at all, not one that has imported but hasn't played anything in Omnia yet.
+  const anyHistory = useAsync(
+    () => (profileId ? history.list(profileId, 1).then((r) => r.length > 0) : Promise.resolve(false)),
+    [profileId, stored.length],
+    loaded && !stored.length && !!profileId,
+  );
+  if (!items.length) {
+    // A brand-new (or just-cleared) profile: invite rather than leave a gap. When there is
+    // history but it is all older / imported / on other services, the row stays out of the way.
+    if (!loaded || stored.length || anyHistory.data !== false) return null;
+    return (
+      <RowShell title="Continue Watching">
+        <EmptyState
+          size="row"
+          title="Nothing here yet"
+          body="Go discover your next favorite show. Anything you play in Omnia lands here with its exact position, or import your past history from your services."
+        />
+      </RowShell>
+    );
+  }
 
   return (
     <RowShell

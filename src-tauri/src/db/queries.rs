@@ -861,9 +861,11 @@ pub fn record_progress(c: &Connection, u: &ProgressUpdate) -> rusqlite::Result<W
     c.execute(
         "INSERT INTO watch_history (app_profile_id, tmdb_id, media_type, season_number, episode_number,
             episode_title, provider_name, direct_url, progress_seconds, duration_seconds, is_completed,
-            watch_count, abandoned, last_watched_at, time_of_day_bucket)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, datetime('now'), ?12)
+            watch_count, abandoned, last_watched_at, time_of_day_bucket, is_imported)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, datetime('now'), ?12, 0)
          ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
+            -- Played in Omnia: an imported row graduates to Continue Watching.
+            is_imported = 0,
             episode_title = COALESCE(excluded.episode_title, watch_history.episode_title),
             provider_name = COALESCE(excluded.provider_name, watch_history.provider_name),
             direct_url = COALESCE(excluded.direct_url, watch_history.direct_url),
@@ -1081,6 +1083,8 @@ pub fn continue_watching(
              LEFT JOIN continue_watching_hidden h
                 ON h.app_profile_id = w.app_profile_id AND h.tmdb_id = w.tmdb_id AND h.media_type = w.media_type
              WHERE w.rn = 1
+               -- Silent import: only titles whose latest activity was played in Omnia.
+               AND w.is_imported = 0
                -- Hidden by the user, unless watched again after hiding.
                AND (h.hidden_at IS NULL OR w.last_watched_at > h.hidden_at)
                AND (
@@ -1168,16 +1172,18 @@ pub struct HistoryImport {
 }
 
 /// Idempotent bulk import: re-importing the same activity never duplicates rows or rolls back
-/// newer live telemetry. Returns the number of rows processed.
+/// newer live telemetry. Rows keep the source's own watch date and are stored as imported
+/// (`is_imported = 1`, "silent"): they feed the recommender and the history view but not
+/// Continue Watching. A row already played in Omnia stays live. Returns the rows processed.
 pub fn upsert_imported_history(c: &mut Connection, rows: &[HistoryImport]) -> rusqlite::Result<usize> {
     let tx = c.transaction()?;
     {
         let mut stmt = tx.prepare(
             "INSERT INTO watch_history (app_profile_id, tmdb_id, media_type, season_number, episode_number,
                 episode_title, provider_name, direct_url, progress_seconds, duration_seconds, is_completed,
-                watch_count, abandoned, last_watched_at, time_of_day_bucket)
+                watch_count, abandoned, last_watched_at, time_of_day_bucket, is_imported)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, MAX(1, COALESCE(?14, 1)), 0,
-                     COALESCE(datetime(?12), datetime('now')), ?13)
+                     COALESCE(datetime(?12), datetime('now')), ?13, 1)
              ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
                 episode_title = COALESCE(watch_history.episode_title, excluded.episode_title),
                 provider_name = COALESCE(watch_history.provider_name, excluded.provider_name),
@@ -1968,5 +1974,49 @@ mod tests {
         assert!(rows[0].is_completed);
         assert_eq!(rows[0].last_watched_at, "2025-01-10 21:30:00");
         assert_eq!(rows[0].watch_count, 2);
+    }
+
+    #[test]
+    fn imported_history_is_silent_until_played_in_omnia() {
+        let mut c = test_db();
+        // Half-watched episode imported with its real (old) Netflix date, plus an unfinished movie.
+        let episode = HistoryImport {
+            app_profile_id: 1,
+            tmdb_id: 1396,
+            media_type: "tv".into(),
+            season_number: 2,
+            episode_number: 3,
+            episode_title: None,
+            provider_name: Some("Netflix".into()),
+            direct_url: None,
+            progress_seconds: 1200.0,
+            duration_seconds: 2700.0,
+            is_completed: false,
+            watched_at: Some("2019-03-04T22:15:00Z".into()),
+            time_of_day_bucket: None,
+            watch_count: None,
+        };
+        let movie = HistoryImport { tmdb_id: 603, media_type: "movie".into(), season_number: 0, episode_number: 0, ..episode.clone() };
+        upsert_imported_history(&mut c, &[episode.clone(), movie]).unwrap();
+
+        // Feeds history (with the source's date), but not Continue Watching.
+        let history = get_title_history(&c, 1, 1396, "tv").unwrap();
+        assert_eq!(history[0].last_watched_at, "2019-03-04 22:15:00");
+        assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+
+        // Played in Omnia today: the series graduates; the untouched movie stays silent.
+        let mut live = sample_update(1300.0, 2700.0);
+        live.tmdb_id = 1396;
+        live.media_type = "tv".into();
+        live.season_number = 2;
+        live.episode_number = 3;
+        record_progress(&c, &live).unwrap();
+        let rows = continue_watching(&c, 1, 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.tmdb_id, 1396);
+
+        // Re-importing older activity never silences a title played in Omnia.
+        upsert_imported_history(&mut c, &[episode]).unwrap();
+        assert_eq!(continue_watching(&c, 1, 20).unwrap().len(), 1);
     }
 }

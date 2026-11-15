@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS watch_history (
     abandoned BOOLEAN DEFAULT 0,
     last_watched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     time_of_day_bucket TEXT, 
+    is_imported BOOLEAN NOT NULL DEFAULT 0, -- migration v4: bulk-imported ("silent") rows feed the recommender and history but not Continue Watching until played in Omnia
     UNIQUE(app_profile_id, tmdb_id, media_type, season_number, episode_number),
     FOREIGN KEY (app_profile_id) REFERENCES app_profiles(profile_id) ON DELETE CASCADE
 );
