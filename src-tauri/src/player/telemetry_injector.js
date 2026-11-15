@@ -278,6 +278,8 @@
     if (!v || typeof v !== "object") return false;
     var title = typeof v.title === "string" ? clean(v.title) : "";
     if (!title || title.length > 200) return false;
+    var year = toInt(v.year != null ? v.year : v.releaseYear);
+    if (year != null && (year < 1880 || year > 2100)) year = null;
     if (Array.isArray(v.seasons)) {
       var added = false;
       v.seasons.forEach(function (season, si) {
@@ -296,6 +298,8 @@
             seasonNumber: sNum,
             episodeNumber: eNum,
             episodeTitle: typeof ep.title === "string" ? clean(ep.title) || null : null,
+            mediaType: "tv",
+            releaseYear: year,
           };
           added = true;
         });
@@ -304,7 +308,7 @@
     }
     if (v.type === "movie" && v.id != null && !NFX_VIDEOS[v.id]) {
       NFX_VIDEO_COUNT++;
-      NFX_VIDEOS[v.id] = { title: title, seasonNumber: null, episodeNumber: null, episodeTitle: null };
+      NFX_VIDEOS[v.id] = { title: title, seasonNumber: null, episodeNumber: null, episodeTitle: null, mediaType: "movie", releaseYear: year };
       return true;
     }
     return false;
@@ -530,6 +534,8 @@
     }
     if (into.seasonNumber == null && from.seasonNumber != null) into.seasonNumber = from.seasonNumber;
     if (!into.episodeTitle && from.episodeTitle) into.episodeTitle = from.episodeTitle;
+    if (!into.mediaType && from.mediaType) into.mediaType = from.mediaType;
+    if (into.releaseYear == null && from.releaseYear != null) into.releaseYear = from.releaseYear;
     return into;
   }
 
@@ -573,6 +579,9 @@
         // With only an episode name, Rust places it by name in TMDB's season data.
         episodeTitle: r.episodeTitle,
         ottTitleId: id,
+        // From Netflix's own metadata: lets Rust search the right TMDB type and year.
+        mediaType: r.mediaType || (r.episodeNumber != null || r.seasonNumber != null || r.episodeTitle ? "tv" : null),
+        releaseYear: r.releaseYear != null ? r.releaseYear : null,
         confidence: "high",
       };
     },
@@ -1114,10 +1123,13 @@
     return items;
   }
 
-  function submitHistory(items, error) {
+  function submitHistory(items, error, notes) {
     return invoke("submit_scraped_history", {
+      // Diagnostics for the local log: HTTP statuses, page counts and totals only.
+      notes: notes && notes.length ? notes.join("; ").slice(0, 2000) : null,
       token: CONFIG.token,
-      items: items.slice(0, 6000),
+      // Lifetime activity: no practical cap (a decade of daily viewing is well under this).
+      items: items.slice(0, 100000),
       ottProfile: detectOttProfile(),
       pageUrl: location.origin + location.pathname,
       error: items.length ? null : error,
@@ -1163,9 +1175,22 @@
   //   4. DOM rows — only once the React page has hydrated, and without relying on class names.
   // Entries are recognised by shape (a title plus a watch date), not by a fixed schema path.
   // -------------------------------------------------------------------------------------------
-  var NFX = { items: [], keys: {}, total: 0, responses: 0, sources: {} };
+  var NFX = { items: [], keys: {}, total: 0, responses: 0, sources: {}, paths: {}, hits: {}, dataRequest: null, template: null, clicks: 0, buttonSeen: false };
   var NFX_TITLE_KEYS = ["seriesTitle", "title", "videoTitle", "showTitle"];
   var NFX_DATE_KEYS = ["date", "dateWatched", "watchedDate", "lastWatched", "viewedAt", "timestamp"];
+  var nfxLastReport = 0;
+
+  /** Tells the hub how far a (possibly multi-minute) lifetime import has got. Throttled. */
+  function nfxReportProgress(force) {
+    var now = Date.now();
+    if (!force && now - nfxLastReport < 1200) return;
+    nfxLastReport = now;
+    invoke("report_scrape_progress", { token: CONFIG.token, fetched: NFX.items.length, total: NFX.total || null });
+  }
+
+  function nfxSleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
 
   function nfxText(v) {
     var s = typeof v === "string" ? clean(v) : "";
@@ -1205,6 +1230,8 @@
       // and, failing that, places the episode by its name across the whole series.
       seasonNumber: isTv && seasonMatch ? parseInt(seasonMatch[0], 10) : null,
       seasonLabel: isTv ? nfxText(v.seasonDescriptor) || null : null,
+      // The watched video's id: /watch/<id> reopens exactly this episode.
+      ottVideoId: v.movieID != null && /^\d{3,12}$/.test(String(v.movieID)) ? String(v.movieID) : null,
       episodeNumber: null,
       episodeTitle: nfxText(v.episodeTitle),
       progressRatio: null,
@@ -1219,7 +1246,7 @@
     list.forEach(function (v) {
       var it = nfxToItem(v);
       if (!it.title) return;
-      var key = [v.movieID || "", it.title, it.episodeTitle || "", it.watchedAt || ""].join("|");
+      var key = [it.ottVideoId || "", it.title, it.episodeTitle || "", it.watchedAt || ""].join("|");
       if (NFX.keys[key]) return;
       NFX.keys[key] = true;
       NFX.items.push(it);
@@ -1230,10 +1257,10 @@
   }
 
   /** Harvests every viewing-activity-shaped array inside a JSON value (cycle- and size-safe). */
-  function nfxFindViewed(root, source) {
+  function nfxCollect(root) {
     var seen = typeof WeakSet === "function" ? new WeakSet() : null;
     var budget = 250000;
-    var found = 0;
+    var lists = [];
     (function walk(node, depth) {
       if (!node || typeof node !== "object" || depth > 12 || --budget < 0) return;
       if (seen) {
@@ -1252,7 +1279,7 @@
           }
         }
         if (viewed.length && viewed.length * 2 >= objects) {
-          found += nfxHarvest(viewed, source);
+          lists.push(viewed);
           return;
         }
         for (var j = 0; j < node.length && j < 5000; j++) walk(node[j], depth + 1);
@@ -1266,14 +1293,44 @@
         walk(child, depth + 1);
       }
     })(root, 0);
+    return lists;
+  }
+
+  /** Harvests every viewing-activity-shaped array inside a JSON value. */
+  function nfxFindViewed(root, source) {
+    var found = 0;
+    nfxCollect(root).forEach(function (list) { found += nfxHarvest(list, source); });
     return found;
   }
 
   function nfxConsiderText(text, source) {
-    if (typeof text !== "string" || text.length < 2 || text.length > 8e6) return;
+    if (typeof text !== "string" || text.length < 2 || text.length > 8e6) return 0;
     var first = text.charAt(0);
-    if (first !== "{" && first !== "[") return;
-    try { nfxFindViewed(JSON.parse(text), source); } catch (_) {}
+    if (first !== "{" && first !== "[") return 0;
+    try { return nfxFindViewed(JSON.parse(text), source); } catch (_) { return 0; }
+  }
+
+  function nfxPath(url) {
+    try {
+      var u = new URL(url, location.href);
+      return (u.hostname.replace(/^www\./, "") + u.pathname).slice(0, 80);
+    } catch (_) {
+      return "?";
+    }
+  }
+
+  /**
+   * Bookkeeping for each Netflix JSON response the page received: which paths answered (for
+   * the diagnostic log) and the first request that actually carried viewing activity — that
+   * request is replayed page by page, whatever endpoint the current web app uses.
+   */
+  function nfxNoteResponse(url, method, headers, body, found) {
+    var path = nfxPath(url);
+    NFX.paths[path] = (NFX.paths[path] || 0) + 1;
+    if (found > 0) {
+      NFX.hits[path] = (NFX.hits[path] || 0) + found;
+      if (!NFX.dataRequest) NFX.dataRequest = { url: String(url), method: String(method || "GET").toUpperCase(), headers: headers || {}, body: typeof body === "string" ? body : null };
+    }
   }
 
   function nfxSameSite(url) {
@@ -1285,19 +1342,47 @@
   }
 
   /** Observes the page's own requests. Installed at document start, before Netflix's scripts. */
+  /** Plain object from Headers / [k, v][] / object. */
+  function nfxHeadersObject(h) {
+    var out = {};
+    try {
+      if (!h) return out;
+      if (typeof Headers !== "undefined" && h instanceof Headers) h.forEach(function (v, k) { out[k] = v; });
+      else if (Array.isArray(h)) h.forEach(function (p) { out[p[0]] = p[1]; });
+      else Object.keys(h).forEach(function (k) { out[k] = h[k]; });
+    } catch (_) {}
+    return out;
+  }
+
+  /** Netflix's own paged viewing-activity request (URL + headers), replayed page by page. */
+  function nfxRememberTemplate(url, headers) {
+    try {
+      var u = new URL(url, location.href);
+      if (!/viewingactivity/i.test(u.pathname) || !u.searchParams.has("pg")) return;
+      NFX.template = { url: u.toString(), headers: headers || {} };
+    } catch (_) {}
+  }
+
   function installNetflixCapture() {
     if (typeof window.fetch === "function") {
       var origFetch = window.fetch;
-      window.fetch = function (input) {
+      NFX.fetch = origFetch;
+      window.fetch = function (input, init) {
         var p = origFetch.apply(window, arguments);
         try {
           var url = typeof input === "string" ? input : (input && input.url) || String(input || "");
           if (nfxSameSite(url)) {
+            var hdrs = nfxHeadersObject((init && init.headers) || (input && typeof input === "object" && input.headers));
+            var method = (init && init.method) || (input && typeof input === "object" && input.method) || "GET";
+            var reqBody = init && typeof init.body === "string" ? init.body : null;
+            nfxRememberTemplate(url, hdrs);
             p.then(function (r) {
               var type = (r.headers && r.headers.get("content-type")) || "";
               if (!r.ok || type.indexOf("json") < 0) return;
               NFX.responses++;
-              r.clone().text().then(function (t) { nfxConsiderText(t, "page requests"); }).catch(function () {});
+              r.clone().text().then(function (t) {
+                nfxNoteResponse(url, method, hdrs, reqBody, nfxConsiderText(t, "page requests"));
+              }).catch(function () {});
             }).catch(function () {});
           }
         } catch (_) {}
@@ -1308,19 +1393,31 @@
     if (!X) return;
     var origOpen = X.open;
     var origSend = X.send;
+    var origSetHeader = X.setRequestHeader;
     X.open = function (method, url) {
-      try { this.__omniaUrl = String(url); } catch (_) {}
+      try {
+        this.__omniaUrl = String(url);
+        this.__omniaMethod = String(method || "GET");
+        this.__omniaHeaders = {};
+      } catch (_) {}
       return origOpen.apply(this, arguments);
     };
-    X.send = function () {
+    X.setRequestHeader = function (name, value) {
+      try { if (this.__omniaHeaders) this.__omniaHeaders[name] = value; } catch (_) {}
+      return origSetHeader.apply(this, arguments);
+    };
+    X.send = function (sent) {
       var xhr = this;
       if (nfxSameSite(xhr.__omniaUrl || "")) {
+        nfxRememberTemplate(xhr.__omniaUrl, xhr.__omniaHeaders);
         xhr.addEventListener("load", function () {
           try {
             if (xhr.status < 200 || xhr.status >= 300) return;
             NFX.responses++;
-            if (xhr.responseType === "json") nfxFindViewed(xhr.response, "page requests");
-            else if (!xhr.responseType || xhr.responseType === "text") nfxConsiderText(xhr.responseText, "page requests");
+            var found = 0;
+            if (xhr.responseType === "json") found = nfxFindViewed(xhr.response, "page requests");
+            else if (!xhr.responseType || xhr.responseType === "text") found = nfxConsiderText(xhr.responseText, "page requests");
+            nfxNoteResponse(xhr.__omniaUrl, xhr.__omniaMethod, xhr.__omniaHeaders, typeof sent === "string" ? sent : null, found);
           } catch (_) {}
         });
       }
@@ -1372,15 +1469,214 @@
     });
   }
 
+  /** Every entry Netflix counts (vhSize) has been read. */
+  function nfxHaveAll() {
+    return NFX.total > 0 && NFX.items.length >= NFX.total;
+  }
+
+  /**
+   * Close enough to call an *empty page* the real end: a few of Netflix's entries can collapse
+   * into one on our side (same video, same moment). Never used to stop paging early.
+   */
+  function nfxReachedTotal() {
+    return NFX.total > 0 && NFX.items.length >= NFX.total - Math.max(3, Math.floor(NFX.total * 0.02));
+  }
+
+  /** One JSON page with retries (backoff 1.5s, 3s, 6s, 12s) for throttling and transient errors. */
+  function nfxFetchJson(req, deadline) {
+    var attempt = 0;
+    var doFetch = NFX.fetch || window.fetch;
+    function once() {
+      var init = { credentials: "include", headers: req.headers || {}, method: req.method || "GET" };
+      if (req.body != null && init.method !== "GET") init.body = req.body;
+      return doFetch.call(window, req.url, init).then(function (r) {
+        if (!r.ok) {
+          var err = new Error("HTTP " + r.status);
+          // Auth / not-found won't fix themselves; rate limits and server errors usually do.
+          err.fatal = r.status === 401 || r.status === 403 || r.status === 404;
+          throw err;
+        }
+        return r.text().then(function (t) {
+          try {
+            return JSON.parse(t);
+          } catch (_) {
+            throw new Error("non-JSON response");
+          }
+        });
+      });
+    }
+    function tryIt() {
+      return once().catch(function (e) {
+        attempt++;
+        var wait = 1500 * Math.pow(2, attempt - 1);
+        if (e.fatal || attempt > 4 || Date.now() + wait > deadline) throw e;
+        return nfxSleep(wait).then(tryIt);
+      });
+    }
+    return tryIt();
+  }
+
+  var NFX_CURSOR_OUT = /^(endCursor|nextCursor|nextPageCursor|nextPageToken|nextToken|continuationToken|cursor)$/;
+
+  /** The "next page" cursor in a response, if it pages by cursor (null when there's no more). */
+  function nfxFindCursor(root) {
+    var found = null, more = null;
+    (function walk(node, depth) {
+      if (!node || typeof node !== "object" || depth > 10 || found) return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length && i < 50; i++) walk(node[i], depth + 1);
+        return;
+      }
+      Object.keys(node).forEach(function (k) {
+        var v = node[k];
+        if (k === "hasNextPage" && typeof v === "boolean") more = v;
+        if (!found && NFX_CURSOR_OUT.test(k) && typeof v === "string" && v) found = v;
+        else if (v && typeof v === "object") walk(v, depth + 1);
+      });
+    })(root, 0);
+    return more === false ? null : found;
+  }
+
+  /** Viewing entries in one response: Shakti's `viewedItems`, or any entry-shaped arrays. */
+  function nfxEntriesIn(body) {
+    if (body && Array.isArray(body.viewedItems)) return body.viewedItems;
+    var all = [];
+    nfxCollect(body).forEach(function (list) { all = all.concat(list); });
+    return all;
+  }
+
+  /**
+   * Pages through one viewing-activity source until Netflix's own total is reached.
+   * `pager.request(pg, size, cursor)` builds each request (same headers every time); pages are
+   * stepped by index, offset or cursor. Netflix may serve fewer entries than asked (20 of a
+   * requested 100): the page size then follows what it actually serves, so nothing is skipped.
+   * An empty page before the total is NOT treated as the end — the caller tries another way.
+   */
+  function nfxCrawl(label, pager, deadline, notes) {
+    var pg = 0, pages = 0, repeats = 0, lastSig = null, cursor = null;
+    var size = pager.size || 20;
+    var maxPages = 4000;
+    function step() {
+      if (Date.now() > deadline) {
+        notes.push(label + ": time limit reached at page " + pg);
+        return Promise.resolve(false);
+      }
+      if (pages >= maxPages) return Promise.resolve(false);
+      // Sent with the unhooked fetch, so these pages aren't double-counted as the page's own.
+      var req = pager.request(pg, size, cursor);
+      return nfxFetchJson(req, deadline)
+        .then(function (body) {
+          pages++;
+          nfxCollect(body); // picks up vhSize / totals anywhere in the response
+          if (body && body.vhSize > NFX.total) NFX.total = body.vhSize;
+          var list = nfxEntriesIn(body);
+          if (!list.length) {
+            var done = !NFX.total || nfxReachedTotal();
+            notes.push(label + ": " + (done ? "end" : "empty page " + pg + " at " + NFX.items.length + "/" + NFX.total));
+            return done;
+          }
+          if (pg === 0 && list.length < size) {
+            notes.push(label + ": asked " + size + " per page, got " + list.length);
+            size = list.length;
+          }
+          // The same page twice means the server ignored the page parameter: stop, don't loop.
+          var sig = list.length + "|" + JSON.stringify(list[0]).slice(0, 300) + "|" + JSON.stringify(list[list.length - 1]).slice(0, 300);
+          repeats = sig === lastSig ? repeats + 1 : 0;
+          lastSig = sig;
+          if (repeats >= 2) {
+            notes.push(label + ": page " + pg + " repeated the previous page");
+            return false;
+          }
+          nfxHarvest(list, label);
+          nfxReportProgress(false);
+          if (nfxHaveAll()) return true;
+          if (pager.mode === "cursor") {
+            cursor = nfxFindCursor(body);
+            if (!cursor) {
+              var end = !NFX.total || nfxReachedTotal();
+              if (!end) notes.push(label + ": no next cursor at " + NFX.items.length + "/" + NFX.total);
+              return end;
+            }
+          }
+          pg++;
+          // Paced like a person scrolling, so Netflix doesn't throttle a long history.
+          return nfxSleep(250).then(step);
+        })
+        .catch(function (e) {
+          notes.push(label + ": page " + pg + " failed (" + String((e && e.message) || e).slice(0, 80) + ")");
+          return false;
+        });
+    }
+    return step().then(function (complete) {
+      notes.push(label + ": " + pages + " pages, " + NFX.items.length + (NFX.total ? "/" + NFX.total : "") + " entries" + (complete ? ", complete" : ""));
+      nfxReportProgress(true);
+      return complete;
+    });
+  }
+
+  var NFX_PAGE_KEYS = /^(pg|page|pageNumber|pageIndex|pageNum)$/i;
+  var NFX_OFFSET_KEYS = /^(offset|start|from|skip|startIndex)$/i;
+  var NFX_SIZE_KEYS = /^(pgSize|pageSize|size|limit|count|first|perPage|num)$/i;
+  var NFX_CURSOR_IN = /^(after|cursor|pageToken|nextToken|continuationToken|nextCursor)$/i;
+
+  /**
+   * How a captured request pages — a page index, an offset or a cursor, in the query string or
+   * the JSON body (including GraphQL `variables`). Null when it has no paging parameter.
+   */
+  function nfxPagerFor(req) {
+    var u;
+    try { u = new URL(req.url, location.href); } catch (_) { return null; }
+    var body = null;
+    if (req.body) { try { body = JSON.parse(req.body); } catch (_) {} }
+    var holders = [{
+      where: "query",
+      keys: function () { var a = []; u.searchParams.forEach(function (_, k) { a.push(k); }); return a; },
+      get: function (k) { return u.searchParams.get(k); },
+      set: function (k, v) { if (v == null) u.searchParams.delete(k); else u.searchParams.set(k, String(v)); },
+    }];
+    [body, body && body.variables].forEach(function (o) {
+      if (!o || typeof o !== "object" || Array.isArray(o)) return;
+      holders.push({
+        where: o === body ? "body" : "variables",
+        keys: function () { return Object.keys(o); },
+        get: function (k) { return o[k]; },
+        set: function (k, v) { o[k] = typeof o[k] === "string" && v != null ? String(v) : v; },
+      });
+    });
+    var page = null, offset = null, size = null, cursor = null;
+    holders.forEach(function (h) {
+      h.keys().forEach(function (k) {
+        if (!page && NFX_PAGE_KEYS.test(k)) page = { h: h, k: k, base: parseInt(h.get(k), 10) || 0 };
+        else if (!offset && NFX_OFFSET_KEYS.test(k)) offset = { h: h, k: k, base: parseInt(h.get(k), 10) || 0 };
+        else if (!size && NFX_SIZE_KEYS.test(k) && /^\d+$/.test(String(h.get(k)))) size = { h: h, k: k };
+        else if (!cursor && NFX_CURSOR_IN.test(k)) cursor = { h: h, k: k, first: h.get(k) };
+      });
+    });
+    if (!page && !offset && !cursor) return null;
+    var mode = page ? "page" : offset ? "offset" : "cursor";
+    var where = (page || offset || cursor).h.where + "." + (page || offset || cursor).k;
+    return {
+      mode: mode,
+      where: where,
+      size: size ? parseInt(size.h.get(size.k), 10) || 20 : 20,
+      request: function (pg, sz, cur) {
+        if (page) page.h.set(page.k, page.base + pg);
+        if (offset) offset.h.set(offset.k, offset.base + pg * sz);
+        if (size) size.h.set(size.k, sz);
+        if (mode === "cursor") cursor.h.set(cursor.k, pg === 0 ? cursor.first : cur);
+        return { url: u.toString(), method: req.method || "GET", headers: req.headers || {}, body: body ? JSON.stringify(body) : req.body };
+      },
+    };
+  }
+
   /** Strategy 3: Netflix's Shakti API, called in-page as Netflix's own web client does. */
-  function netflixApiHistory(deadline) {
+  function netflixApiHistory(deadline, notes) {
     var build = netflixContextValue(["serverDefs", "data", "BUILD_IDENTIFIER"]);
     var info = netflixUserInfo() || {};
     var auth = info.authURL || netflixContextValue(["memberContext", "data", "userInfo", "authURL"]) || "";
     var esn = netflixContextValue(["esnGeneratorModel", "data", "esn"]) || "";
     var locale = netflixContextValue(["geo", "data", "locale", "id"]) || "";
     var bases = (build ? ["/api/shakti/" + build + "/viewingactivity"] : []).concat(["/api/shakti/mre/viewingactivity"]);
-    var statuses = [];
     var headers = {
       Accept: "*/*",
       "X-Netflix.client.request.name": "ui/xhrUnclassified",
@@ -1389,42 +1685,46 @@
     if (build) headers["X-Netflix.uiVersion"] = build;
     if (typeof esn === "string" && esn) headers["X-Netflix.esnPrefix"] = esn.split("-").slice(0, 2).join("-") + "-";
 
-    function page(base, pg) {
-      var url = base + "?" + (locale ? "languages=" + encodeURIComponent(locale) + "&" : "") + "pg=" + pg + "&pgSize=100" + (auth ? "&authURL=" + encodeURIComponent(auth) : "");
-      return fetch(url, { credentials: "include", headers: headers }).then(function (r) {
-        if (!r.ok) {
-          statuses.push("HTTP " + r.status + " from " + base.split("/api/")[1]);
-          return null;
-        }
-        return r.json();
+    var i = 0;
+    function nextBase() {
+      if (i >= bases.length) return Promise.resolve(false);
+      var base = bases[i++];
+      var url = function (pg, size) {
+        return base + "?" + (locale ? "languages=" + encodeURIComponent(locale) + "&" : "") + "pg=" + pg + "&pgSize=" + size + (auth ? "&authURL=" + encodeURIComponent(auth) : "");
+      };
+      var pager = { mode: "page", size: 100, request: function (pg, size) { return { url: url(pg, size), method: "GET", headers: headers }; } };
+      return nfxCrawl("shakti " + base.split("/")[3], pager, deadline, notes).then(function (complete) {
+        return complete || nextBase();
       });
     }
+    return nextBase();
+  }
 
-    function fromBase(i) {
-      if (i >= bases.length) return Promise.resolve(false);
-      return page(bases[i], 0)
-        .then(function (first) {
-          if (!first || !Array.isArray(first.viewedItems)) return fromBase(i + 1);
-          if (first.vhSize > NFX.total) NFX.total = first.vhSize;
-          nfxHarvest(first.viewedItems, "in-page API");
-          var pg = 1;
-          function next() {
-            if (Date.now() > deadline || (NFX.total && NFX.items.length >= NFX.total) || pg >= 60) return true;
-            return page(bases[i], pg++).then(function (body) {
-              var list = body && body.viewedItems;
-              if (!list || !list.length) return true;
-              nfxHarvest(list, "in-page API");
-              return next();
-            });
-          }
-          return first.viewedItems.length ? next() : true;
-        })
-        .catch(function (e) {
-          statuses.push(String((e && e.message) || e).slice(0, 80));
-          return fromBase(i + 1);
-        });
+  /**
+   * Replays the exact request Netflix's own viewing-activity page used for its entries (same
+   * endpoint, query, body and headers, captured by the fetch / XHR hooks), stepping only its
+   * page / offset / cursor parameter.
+   */
+  function netflixTemplateHistory(deadline, notes) {
+    var reqs = [NFX.dataRequest, NFX.template && { url: NFX.template.url, method: "GET", headers: NFX.template.headers }].filter(Boolean);
+    if (!reqs.length) {
+      notes.push("no request carrying viewing activity was captured");
+      return Promise.resolve(false);
     }
-    return fromBase(0).then(function () { return statuses.join(", "); });
+    var i = 0;
+    function next() {
+      if (i >= reqs.length) return Promise.resolve(false);
+      var req = reqs[i++];
+      var pager = nfxPagerFor(req);
+      if (!pager) {
+        notes.push("page's request " + nfxPath(req.url) + " (" + req.method + ") has no page/offset/cursor parameter");
+        return next();
+      }
+      return nfxCrawl("page's request " + nfxPath(req.url) + " by " + pager.where, pager, deadline, notes).then(function (complete) {
+        return complete || next();
+      });
+    }
+    return next();
   }
 
   function nfxRowLinks() {
@@ -1445,25 +1745,82 @@
     );
   }
 
-  /** Clicks "Show more" until everything is listed; each click makes the page fetch another page. */
+  function nfxShowMoreButton() {
+    return Array.prototype.find.call(document.querySelectorAll("button, [role=button]"), function (b) {
+      return /show more|load more|see more/i.test(clean(b.textContent)) && !b.disabled;
+    });
+  }
+
+  /**
+   * A real-looking press: scrolled into view first (WebView2 can ignore clicks on off-screen
+   * elements), then pointer / mouse down-up at its centre, then click.
+   */
+  function nfxPress(el) {
+    try { el.scrollIntoView({ block: "center" }); } catch (_) {}
+    var r = el.getBoundingClientRect();
+    var opts = { bubbles: true, cancelable: true, view: window, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    try { el.dispatchEvent(new PointerEvent("pointerdown", opts)); } catch (_) {}
+    try { el.dispatchEvent(new MouseEvent("mousedown", opts)); } catch (_) {}
+    try { el.dispatchEvent(new PointerEvent("pointerup", opts)); } catch (_) {}
+    try { el.dispatchEvent(new MouseEvent("mouseup", opts)); } catch (_) {}
+    el.click();
+  }
+
+  /**
+   * Clicks "Show more" until the button is gone — the whole lifetime list. Each click makes the
+   * page fetch another page; a slow response is retried (up to 3 clicks) rather than ending.
+   */
   function expandNetflixActivity(deadline) {
     return new Promise(function (resolve) {
-      var clicks = 0;
+      var misses = 0;
       (function step() {
-        if (Date.now() > deadline || clicks >= 80 || (NFX.total && NFX.items.length >= NFX.total)) return resolve();
-        var more = Array.prototype.find.call(document.querySelectorAll("button, [role=button]"), function (b) {
-          return /show more|load more|see more/i.test(clean(b.textContent)) && !b.disabled;
-        });
-        if (!more) return resolve();
+        if (Date.now() > deadline || nfxHaveAll()) return resolve();
+        // Bring the end of the list (and the button) into the viewport so it renders.
+        try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (_) {}
+        var more = nfxShowMoreButton();
+        if (!more) {
+          // The button can briefly vanish while the next batch renders: confirm it's really gone.
+          return waitFor(nfxShowMoreButton, 2500, 250).then(function (back) {
+            if (back && Date.now() < deadline) step();
+            else resolve();
+          });
+        }
         var before = NFX.items.length + nfxRowLinks().length;
-        clicks++;
-        more.click();
-        waitFor(function () { return NFX.items.length + nfxRowLinks().length > before; }, 8000, 300).then(function (grew) {
-          if (!grew) return resolve();
-          setTimeout(step, 350);
+        NFX.buttonSeen = true;
+        NFX.clicks++;
+        nfxPress(more);
+        waitFor(function () { return NFX.items.length + nfxRowLinks().length > before; }, 15000, 300).then(function (grew) {
+          nfxReportProgress(false);
+          if (!grew && ++misses >= 3) return resolve();
+          if (grew) misses = 0;
+          setTimeout(step, grew ? 300 : 1500);
         });
       })();
     });
+  }
+
+  // Entries already read survive the hop from the homepage (API) to the activity page.
+  var NFX_STASH_KEY = "omnia-import-stash-" + TOKEN_KEY;
+
+  function nfxStash() {
+    try {
+      sessionStorage.setItem(NFX_STASH_KEY, JSON.stringify({ items: NFX.items, total: NFX.total }));
+    } catch (_) {}
+  }
+
+  function nfxRestoreStash() {
+    try {
+      var raw = sessionStorage.getItem(NFX_STASH_KEY);
+      if (!raw) return;
+      var data = JSON.parse(raw);
+      (data.items || []).forEach(function (it) {
+        var key = [it.ottVideoId || "", it.title, it.episodeTitle || "", it.watchedAt || ""].join("|");
+        if (NFX.keys[key]) return;
+        NFX.keys[key] = true;
+        NFX.items.push(it);
+      });
+      if (data.total > NFX.total) NFX.total = data.total;
+    } catch (_) {}
   }
 
   /** Strategy 4: rows rendered on the page — title links plus the nearest date, no class names. */
@@ -1484,18 +1841,76 @@
           return !!watchedAt;
         });
       }
+      // The page shows a calendar date: keep that date in UTC (midday), so it doesn't shift a
+      // day when converted (local midnight in UTC+5:30 is the previous day in UTC).
+      if (watchedAt) {
+        var local = new Date(watchedAt);
+        watchedAt = new Date(Date.UTC(local.getFullYear(), local.getMonth(), local.getDate(), 12)).toISOString();
+      }
       var key = title + "|" + (watchedAt || "");
       if (seen[key]) return;
       seen[key] = true;
-      items.push({ title: title, isTv: false, seasonNumber: null, episodeNumber: null, episodeTitle: null, progressRatio: null, watchedAt: watchedAt });
+      var id = (String(link.getAttribute("href") || "").match(/\/title\/(\d{3,12})/) || [])[1] || null;
+      items.push({ title: title, isTv: false, seasonNumber: null, episodeNumber: null, episodeTitle: null, progressRatio: null, watchedAt: watchedAt, ottVideoId: id });
     });
     return items;
+  }
+
+  /**
+   * Adds rendered activity rows that weren't already captured as data ("Show more" may load rows
+   * whose responses aren't recognisable JSON). A row is a duplicate when a captured entry has
+   * the same day and the same video id, or its title (and episode title) appear in the row text.
+   */
+  function nfxMergeDomRows(rows) {
+    // Rows show a local calendar date while data carries a UTC timestamp: compare a day either
+    // side. Indexed by UTC day number.
+    var DAY = 86400000;
+    var dayOf = function (iso) { var t = Date.parse(iso || ""); return isNaN(t) ? null : Math.floor(t / DAY); };
+    var byDay = {};
+    var index = function (it) {
+      var d = dayOf(it.watchedAt);
+      (byDay[d] = byDay[d] || []).push(it);
+    };
+    NFX.items.forEach(index);
+    var lower = function (v) { return String(v || "").toLowerCase(); };
+    var added = 0;
+    rows.forEach(function (row) {
+      var d = dayOf(row.watchedAt);
+      var text = lower(row.title);
+      var near = d == null ? byDay[null] || [] : [].concat(byDay[d - 1] || [], byDay[d] || [], byDay[d + 1] || []);
+      var dup = near.some(function (it) {
+        if (row.ottVideoId && it.ottVideoId) return row.ottVideoId === it.ottVideoId;
+        return !!it.title && text.indexOf(lower(it.title)) >= 0 && (!it.episodeTitle || text.indexOf(lower(it.episodeTitle)) >= 0);
+      });
+      if (dup) return;
+      NFX.items.push(row);
+      index(row);
+      added++;
+    });
+    return added;
+  }
+
+  /** Short, title-free summary of what the page fetched, for the local diagnostic log. */
+  function nfxResponseSummary() {
+    var paths = Object.keys(NFX.paths).sort(function (a, b) { return NFX.paths[b] - NFX.paths[a]; }).slice(0, 8);
+    var sources = Object.keys(NFX.sources).map(function (k) { return k + " " + NFX.sources[k]; }).join(", ");
+    return (
+      "entries by source: " + (sources || "none") +
+      "; responses: " + (paths.map(function (p) { return p + " x" + NFX.paths[p] + (NFX.hits[p] ? " (" + NFX.hits[p] + " entries)" : ""); }).join(", ") || "none")
+    );
   }
 
   function runNetflixImport() {
     var NAV_KEY = "omnia-import-nav-" + TOKEN_KEY;
     var API_KEY = "omnia-import-api-" + TOKEN_KEY;
-    var deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 120000);
+    // One deadline for the whole import, kept across the hop to the activity page (Rust's
+    // timer doesn't restart when the page navigates).
+    var DEADLINE_KEY = "omnia-import-deadline-" + TOKEN_KEY;
+    var deadline = parseInt(session(DEADLINE_KEY) || "0", 10);
+    if (!deadline) {
+      deadline = Date.now() + (CONFIG.scrapeTimeoutMs || 120000);
+      session(DEADLINE_KEY, String(deadline));
+    }
     if (/\/login/i.test(location.pathname)) {
       submitHistory([], "Netflix asked to sign in again: this Omnia profile's Netflix session has expired. Sign in via Connect Accounts.");
       return;
@@ -1512,17 +1927,24 @@
       // fetch() (Netflix's own TLS stack, cookies and headers). Most imports finish here.
       if (!onActivityPage && apiOutcome === null) {
         harvestNetflixPageState();
-        netflixApiHistory(deadline).then(function (status) {
-          if (NFX.items.length) {
-            submitHistory(NFX.items.slice(), null);
+        var apiNotes = [];
+        netflixApiHistory(deadline, apiNotes).then(function (complete) {
+          // Done only when Netflix's own total was reached (or time is up). Otherwise keep what
+          // was read and continue on the activity page: Netflix's own request, then "Show more".
+          if (NFX.items.length && (complete || Date.now() > deadline - 20000)) {
+            nfxReportProgress(true);
+            submitHistory(NFX.items.slice(), null, apiNotes);
             return;
           }
-          session(API_KEY, status || "no entries returned");
+          session(API_KEY, apiNotes.join("; ") || "no entries returned");
           session(NAV_KEY, "1");
+          nfxStash();
           location.href = "/viewingactivity";
         });
         return;
       }
+
+      nfxRestoreStash();
 
       var navigations = parseInt(session(NAV_KEY) || "0", 10);
       if (!onActivityPage && navigations < 2) {
@@ -1539,31 +1961,46 @@
         .then(function (ready) {
           if (!ready) notes.push("the page didn't finish loading within 30s");
           harvestNetflixPageState();
-          return expandNetflixActivity(deadline);
+          if (nfxHaveAll()) return true;
+          // Netflix's own paged request, replayed with its exact headers.
+          return waitFor(function () { return NFX.template; }, 8000, 300).then(function () {
+            return netflixTemplateHistory(deadline, notes);
+          });
         })
-        .then(function () {
-          if (NFX.items.length || apiOutcome !== null) return null;
-          return netflixApiHistory(deadline).then(function (status) {
-            if (status) notes.push("in-page API: " + status);
+        .then(function (complete) {
+          if (complete || nfxHaveAll()) return null;
+          var before = NFX.items.length;
+          return expandNetflixActivity(deadline).then(function () {
+            notes.push("show more: " + before + " -> " + NFX.items.length + (NFX.total ? "/" + NFX.total : "") + " entries");
           });
         })
         .then(function () {
-          var items = NFX.items.slice();
-          var domRows = 0;
-          if (!items.length) {
-            items = scrapeNetflixActivityDom();
-            domRows = items.length;
-          }
-          notes.push(NFX.responses + " page responses inspected");
-          notes.push("embedded/captured entries: " + NFX.items.length);
-          notes.push("rendered rows: " + domRows);
-          submitHistory(items, "No readable Netflix viewing activity (" + notes.join("; ") + ").");
+          nfxReportProgress(true);
+          if (NFX.items.length || apiOutcome !== null) return null;
+          return netflixApiHistory(deadline, notes);
+        })
+        .then(function () {
+          var captured = NFX.items.length;
+          var rows = scrapeNetflixActivityDom();
+          var added = nfxMergeDomRows(rows);
+          notes.push("show more button " + (NFX.buttonSeen ? "clicked " + NFX.clicks + "x" : "not found"));
+          notes.push("captured entries: " + captured + (NFX.total ? "/" + NFX.total : ""));
+          notes.push("rendered rows: " + rows.length + " (" + added + " not in captured data)");
+          notes.push(NFX.responses + " page responses; " + nfxResponseSummary());
+          submitHistory(NFX.items.slice(), "No readable Netflix viewing activity (" + notes.join("; ") + ").", notes);
         });
     });
   }
 
   // Capture must be live before Netflix's own scripts issue their first request.
   if (CONFIG.mode === "import" && CONFIG.scraper === "netflix_history") installNetflixCapture();
+  // A hidden window is a background page: Chromium may throttle or freeze it. A held Web Lock
+  // keeps it running for the length of the import (WebView2 has no throttling switch).
+  if (CONFIG.mode === "import") {
+    try {
+      if (navigator.locks && navigator.locks.request) navigator.locks.request("omnia-import-" + TOKEN_KEY, function () { return new Promise(function () {}); });
+    } catch (_) {}
+  }
   if (CONFIG.mode === "play" && IS_NETFLIX) installNetflixPlayerTap();
 
   // -------------------------------------------------------------------------------------------

@@ -316,6 +316,12 @@ pub struct DetectedMedia {
     pub episode_title: Option<String>,
     #[serde(default)]
     pub ott_title_id: Option<String>,
+    /// "tv" / "movie" when the provider's own metadata says so.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// Release year from the provider's metadata (TMDB year filter / disambiguation).
+    #[serde(default)]
+    pub release_year: Option<i64>,
     #[serde(default)]
     pub confidence: Confidence,
 }
@@ -1135,7 +1141,7 @@ async fn finalize_session(app: &AppHandle, label: &str, reason: &str) {
 
 /// Flushes the final position from the page, finalizes the session and destroys the window
 /// (releasing the WebView2 renderer's memory). Returns the last status, if a player was open.
-async fn close_active_player(app: &AppHandle, reason: &str) -> Option<PlayerStatus> {
+pub(crate) async fn close_active_player(app: &AppHandle, reason: &str) -> Option<PlayerStatus> {
     let state = app.state::<AppState>();
     let (label, flush, status) = {
         let guard = state.player.lock();
@@ -1714,6 +1720,8 @@ mod tests {
             episode_number: Some(e),
             episode_title: Some(format!("Episode {e}")),
             ott_title_id: None,
+            media_type: None,
+            release_year: None,
             confidence: Confidence::High,
         }
     }
@@ -1821,6 +1829,8 @@ mod tests {
             episode_number: None,
             episode_title: Some("The One with the Breast Milk".into()),
             ott_title_id: Some("70274078".into()),
+            media_type: Some("tv".into()),
+            release_year: Some(1994),
             confidence: Confidence::High,
         };
         let job = episode_lookup_job(s.item.as_ref(), Some(&name_only)).expect("lookup needed");

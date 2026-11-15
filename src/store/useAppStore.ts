@@ -77,6 +77,8 @@ interface AppState {
 
   hubs: CustomHub[];
   continueWatching: ContinueWatchingItem[];
+  /** True once the active profile's Continue Watching has loaded (empty states wait for it). */
+  continueWatchingLoaded: boolean;
   watchlist: WatchlistItem[];
   watchlistKeys: Set<string>;
   recs: RecommendationsResponse | null;
@@ -163,6 +165,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   hubs: [],
   continueWatching: [],
+  continueWatchingLoaded: false,
   watchlist: [],
   watchlistKeys: new Set(),
   recs: null,
@@ -232,6 +235,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeProfile: p,
       profileGateOpen: false,
       continueWatching: [],
+      continueWatchingLoaded: false,
       watchlist: [],
       watchlistKeys: new Set(),
       recs: null,
@@ -365,7 +369,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const p = get().activeProfile;
     if (!p) return;
     const items = await history.continueWatching(p.profileId, 30);
-    if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: items });
+    if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: items, continueWatchingLoaded: true });
   },
 
   hideFromContinueWatching: async (tmdbId, mediaType, title) => {

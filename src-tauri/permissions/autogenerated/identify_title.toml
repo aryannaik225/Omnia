@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-identify-title"
+description = "Enables the identify_title command without any pre-configured scope."
+commands.allow = ["identify_title"]
+
+[[permission]]
+identifier = "deny-identify-title"
+description = "Denies the identify_title command without any pre-configured scope."
+commands.deny = ["identify_title"]

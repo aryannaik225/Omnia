@@ -31,6 +31,7 @@ const COMMANDS: &[&str] = &[
     "get_title_progress",
     "delete_watch_history_entry",
     "clear_watch_history",
+    "identify_title",
     "import_watch_history",
     "export_watch_history",
     "log_playback_event",
@@ -61,6 +62,7 @@ const COMMANDS: &[&str] = &[
     "player_back_to_hub",
     "report_ott_profile",
     "submit_scraped_history",
+    "report_scrape_progress",
 ];
 
 fn main() {

@@ -46,11 +46,13 @@ pub const EVT_IMPORT_FINISHED: &str = "omnia://history-import-finished";
 
 const IMPORTER_LABEL_PREFIX: &str = "importer-";
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(50);
-/// The Netflix fallback may page through years of activity inside the page.
-const NETFLIX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Lifetime Netflix activity is paged in-page (100 entries a page, paced, with retries): years
+/// of history can take several minutes. The script reports what it has before this ceiling.
+const NETFLIX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TMDB_CONCURRENCY: usize = 4;
-const MAX_UNIQUE_TITLES: usize = 1500;
-const MAX_SEASON_LOOKUPS: usize = 400;
+/// Distinct titles (a series counts once) — sized for a lifetime of viewing activity.
+const MAX_UNIQUE_TITLES: usize = 5000;
+const MAX_SEASON_LOOKUPS: usize = 2000;
 /// Series scanned season-by-season to place episodes whose season couldn't be parsed.
 const MAX_FULL_SERIES_LOOKUPS: usize = 60;
 const MAX_SEASONS_PER_SHOW: usize = 40;
@@ -66,6 +68,8 @@ fn msg(m: impl Into<String>) -> AppError {
 struct PendingScrape {
     token: String,
     tx: oneshot::Sender<ScrapePayload>,
+    app_profile_id: i64,
+    provider_name: String,
 }
 
 #[derive(Default)]
@@ -125,6 +129,9 @@ pub struct ScrapedItem {
     /// The provider's raw season label ("Season 2", "Part 3", "Volume II", "Limited Series").
     #[serde(default)]
     pub season_label: Option<String>,
+    /// The provider's id of the watched video (Netflix `movieID`: the episode itself).
+    #[serde(default)]
+    pub ott_video_id: Option<String>,
     #[serde(default)]
     pub is_tv: bool,
     #[serde(default)]
@@ -149,6 +156,9 @@ pub struct ScrapePayload {
     pub page_url: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// How the scrape went (statuses, page counts, totals; never titles), for the local log.
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -183,6 +193,8 @@ struct RawItem {
     progress_ratio: Option<f64>,
     /// History pages without progress info list titles the user watched: treat as completed.
     assume_completed: bool,
+    /// Provider URL that reopens exactly this item (Netflix `/watch/<episode id>`).
+    direct_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -314,6 +326,34 @@ pub async fn import_history_file(
     Ok(report)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrapeProgress {
+    pub token: String,
+    /// Entries read so far.
+    pub fetched: usize,
+    /// Size of the whole history, when the provider reports it.
+    #[serde(default)]
+    pub total: Option<usize>,
+}
+
+/// Live "entries read so far" from a hidden importer window (remote origin, token-gated), so
+/// a multi-minute lifetime import visibly advances in Connect Accounts.
+#[tauri::command]
+pub fn report_scrape_progress(window: WebviewWindow, app: AppHandle, state: State<'_, AppState>, payload: ScrapeProgress) -> AppResult<()> {
+    let target = {
+        let map = state.importer.pending();
+        match map.get(window.label()) {
+            Some(p) if wm::tokens_equal(&p.token, &payload.token) => Some((p.app_profile_id, p.provider_name.clone())),
+            _ => None,
+        }
+    };
+    let (app_profile_id, provider_name) = target.ok_or_else(|| msg("unauthorized importer session"))?;
+    let total = payload.total.unwrap_or(0).max(payload.fetched);
+    emit_progress(&app, app_profile_id, &provider_name, "fetching", payload.fetched, if payload.total.is_some() { total } else { 0 });
+    Ok(())
+}
+
 /// Called by the injected script inside a hidden importer window (remote origin, token-gated).
 #[tauri::command]
 pub async fn submit_scraped_history(window: WebviewWindow, state: State<'_, AppState>, payload: ScrapePayload) -> AppResult<()> {
@@ -370,6 +410,9 @@ async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, pr
         Some(_) => return Err(msg("Netflix is on a different profile than the linked one; import aborted to keep profiles separate.")),
         None => return Err(msg("Couldn't verify the active Netflix profile; import aborted to keep profiles separate.")),
     }
+    if let Some(notes) = payload.notes.as_deref() {
+        log::info!("Netflix history read: {} entries ({notes})", payload.items.len());
+    }
     if payload.items.is_empty() {
         return Err(msg(payload.error.unwrap_or_else(|| "No Netflix history was found.".into())));
     }
@@ -406,7 +449,10 @@ async fn scrape_with_hidden_window(
     let label = wm::next_window_label(IMPORTER_LABEL_PREFIX);
     let token = wm::random_token();
     let (tx, rx) = oneshot::channel();
-    state.importer.pending().insert(label.clone(), PendingScrape { token: token.clone(), tx });
+    state.importer.pending().insert(
+        label.clone(),
+        PendingScrape { token: token.clone(), tx, app_profile_id, provider_name: provider_name.to_string() },
+    );
 
     let config = json!({
         "token": token,
@@ -420,7 +466,7 @@ async fn scrape_with_hidden_window(
         "scraper": scraper,
         "expectedOttProfileId": expected_profile,
         // Leave headroom so the script reports what it has before Rust gives up.
-        "scrapeTimeoutMs": timeout.saturating_sub(Duration::from_secs(10)).as_millis() as u64,
+        "scrapeTimeoutMs": timeout.saturating_sub(Duration::from_secs(20)).as_millis() as u64,
     });
     let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false, app_profile_id) {
         Ok(w) => w,
@@ -487,9 +533,17 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
                 duration_seconds: if has_seconds { i.duration_seconds } else { None },
                 progress_ratio: ratio,
                 assume_completed: history_page && ratio.is_none() && !has_seconds,
+                direct_url: if netflix { netflix_watch_url(i.ott_video_id.as_deref()) } else { None },
             }
         })
         .collect()
+}
+
+/// `https://www.netflix.com/watch/<id>` for a numeric Netflix video id. Opening it starts that
+/// exact episode (or film) in the player, unlike the series' `/title/<id>` landing page.
+pub(crate) fn netflix_watch_url(video_id: Option<&str>) -> Option<String> {
+    let id = video_id?.trim();
+    (id.len() >= 3 && id.len() <= 12 && id.chars().all(|c| c.is_ascii_digit())).then(|| format!("https://www.netflix.com/watch/{id}"))
 }
 
 async fn scrape_provider_history(
@@ -766,13 +820,20 @@ fn parse_netflix_title(full: &str) -> NetflixTitle {
     NetflixTitle { series: full.to_string(), ..Default::default() }
 }
 
+/// Netflix "Download viewing activity" CSV. It only has `Title` and `Date` columns (no profile
+/// column: each profile downloads its own file), so every row is imported into the Omnia profile
+/// that dropped the file.
+///
+/// Media type is decided strictly from the title: rows with a season/episode marker are series
+/// (TMDB `/search/tv` only); a bare title is a film (`/search/movie` only) unless the same title
+/// also appears with episodes in this file.
 fn parse_viewing_activity_csv(text: &str) -> AppResult<Vec<RawItem>> {
     let rows = parse_csv(text);
     let header = rows.first().ok_or_else(|| msg("The CSV file is empty."))?;
-    let find = |name: &str| header.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
+    let find = |name: &str| header.iter().position(|h| h.trim().trim_start_matches('\u{feff}').eq_ignore_ascii_case(name));
     let title_col = find("Title").ok_or_else(|| msg("CSV needs a 'Title' column (Netflix viewing activity format)."))?;
     let date_col = find("Date");
-    Ok(rows
+    let mut items: Vec<RawItem> = rows
         .iter()
         .skip(1)
         .filter_map(|r| {
@@ -793,7 +854,18 @@ fn parse_viewing_activity_csv(text: &str) -> AppResult<Vec<RawItem>> {
                 ..Default::default()
             })
         })
-        .collect())
+        .collect();
+    let series: HashSet<String> = items
+        .iter()
+        .filter(|i| i.is_tv == Some(true))
+        .map(|i| normalize_title(&clean_search_title(&i.title)))
+        .collect();
+    for item in &mut items {
+        if item.is_tv.is_none() {
+            item.is_tv = Some(series.contains(&normalize_title(&clean_search_title(&item.title))));
+        }
+    }
+    Ok(items)
 }
 
 /// Omnia JSON export (array of watch-history entries, or `{ "history": [...] }`).
@@ -857,14 +929,17 @@ struct TmdbHit {
     overview: Option<String>,
     vote_average: Option<f64>,
     genre_ids: Value,
+    /// TMDB popularity and vote count: tie-breakers so obscure same-name titles never win.
+    popularity: f64,
+    vote_count: i64,
 }
 
 #[derive(Debug, Clone)]
-struct Matched {
-    tmdb_id: i64,
-    media_type: String,
+pub(crate) struct Matched {
+    pub(crate) tmdb_id: i64,
+    pub(crate) media_type: String,
     runtime_mins: Option<i64>,
-    catalog: Option<MediaCatalogEntry>,
+    pub(crate) catalog: Option<MediaCatalogEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -934,13 +1009,14 @@ impl TmdbClient {
         Err(msg("TMDB rate limit exceeded; try again shortly."))
     }
 
-    async fn search(&self, media_type: &'static str, query: &str) -> AppResult<Vec<TmdbHit>> {
-        let body = self
-            .get(
-                &format!("/search/{media_type}"),
-                &[("query", query.to_string()), ("include_adult", "false".into()), ("page", "1".into())],
-            )
-            .await?;
+    /// `/search/tv` or `/search/movie` only (never `/search/multi`), optionally filtered by year
+    /// (`first_air_date_year` / `primary_release_year`).
+    async fn search(&self, media_type: &'static str, query: &str, year: Option<i64>) -> AppResult<Vec<TmdbHit>> {
+        let mut params = vec![("query", query.to_string()), ("include_adult", "false".into()), ("page", "1".into())];
+        if let Some(y) = year {
+            params.push((if media_type == "tv" { "first_air_date_year" } else { "primary_release_year" }, y.to_string()));
+        }
+        let body = self.get(&format!("/search/{media_type}"), &params).await?;
         let (t, ot, date) = if media_type == "movie" {
             ("title", "original_title", "release_date")
         } else {
@@ -963,6 +1039,8 @@ impl TmdbClient {
                     overview: r["overview"].as_str().map(str::to_string),
                     vote_average: r["vote_average"].as_f64(),
                     genre_ids: r["genre_ids"].clone(),
+                    popularity: r["popularity"].as_f64().unwrap_or(0.0),
+                    vote_count: r["vote_count"].as_i64().unwrap_or(0),
                 })
             })
             .collect())
@@ -1063,15 +1141,28 @@ fn main_title(normalized_source: &str) -> Option<String> {
     ((head.len() >= 4 && head.contains(' ')) || head.len() >= 6).then_some(head)
 }
 
-/// Strict match of a history title against TMDB search hits (ghost-history guard).
+/// How well a TMDB candidate fits: (title match, year agreement, popularity). Compared
+/// lexicographically, so an exact title always beats a subtitle match, a matching year beats a
+/// different one, and only then does popularity decide ("Gladiator" 2000 over 1992 when no
+/// year is known; the TV show "Friends" over an obscure film of the same name).
+pub(crate) type HitRank = (i32, i32, i64);
+
+/// Strict match of a title against TMDB search hits (ghost-history guard).
 ///
 /// * Titles must match exactly (title or original title, normalised), or by main title before a
-///   subtitle — and the latter only among the top three results. No substring matching:
+///   subtitle, and the latter only among the top three results. No substring matching:
 ///   "Friends" must never resolve to "Friends with Benefits".
-/// * `year_hint` (a year in the source title) must agree within ±1 year.
-/// * `released_by` (the earliest year the user watched it) rejects anything released later —
+/// * `year_hint` (a year written in the source title) must agree within one year.
+/// * `soft_year` (a release year the provider reported) ranks closer years first.
+/// * `released_by` (the earliest year the user watched it) rejects anything released later:
 ///   you can't have watched a 2024 remake in 2019.
-fn pick_hit(hits: &[TmdbHit], wanted: &str, year_hint: Option<i64>, released_by: Option<i64>) -> Option<(i32, TmdbHit)> {
+fn pick_hit(
+    hits: &[TmdbHit],
+    wanted: &str,
+    year_hint: Option<i64>,
+    soft_year: Option<i64>,
+    released_by: Option<i64>,
+) -> Option<(HitRank, TmdbHit)> {
     let w = normalize_title(wanted);
     if w.is_empty() {
         return None;
@@ -1100,57 +1191,85 @@ fn pick_hit(hits: &[TmdbHit], wanted: &str, year_hint: Option<i64>, released_by:
             if score == 0 {
                 return None;
             }
-            match (year_hint, h.year) {
-                (Some(y), Some(hy)) if (y - hy).abs() > 1 => return None,
-                (Some(y), Some(hy)) => score += if y == hy { 20 } else { 10 },
-                (Some(_), None) => score -= 15,
-                _ => {}
-            }
-            Some((score - idx as i32, h.clone()))
+            let year_rank = match (year_hint.or(soft_year), h.year) {
+                (Some(y), Some(hy)) if year_hint.is_some() && (y - hy).abs() > 1 => return None,
+                (Some(y), Some(hy)) if y == hy => 3,
+                (Some(y), Some(hy)) if (y - hy).abs() == 1 => 2,
+                (Some(y), Some(hy)) => -((y - hy).abs().min(200) as i32),
+                (Some(_), None) => -1,
+                (None, _) => 0,
+            };
+            let popularity = (h.popularity.max(0.0) * 1000.0) as i64 + h.vote_count.max(0);
+            Some(((score, year_rank, popularity), h.clone()))
         })
-        .max_by_key(|(score, _)| *score)
+        .max_by_key(|(rank, _)| *rank)
 }
 
-async fn resolve_title(
+/// Resolves a provider title to a TMDB id.
+///
+/// `is_tv` decides the endpoint: `Some(true)` searches `/search/tv` only, `Some(false)`
+/// `/search/movie` only; `None` (type genuinely unknown) searches both and the strict ranking
+/// decides. `release_year` (reported by the provider) is sent to TMDB as a year filter first,
+/// then used to rank an unfiltered search if the filtered one has no exact match.
+pub(crate) async fn resolve_title(
     db: &Database,
     tmdb: &TmdbClient,
     title: &str,
     is_tv: Option<bool>,
     released_by: Option<i64>,
+    release_year: Option<i64>,
 ) -> AppResult<Option<Matched>> {
     let cleaned = clean_search_title(title);
     if cleaned.is_empty() {
         return Ok(None);
     }
     let year_hint = title_year_hint(title);
-    let type_filter = is_tv.map(|t| if t { "tv".to_string() } else { "movie".to_string() });
-    let (q, tf) = (cleaned.clone(), type_filter.clone());
-    if let Some(local) = db.run(move |c| queries::find_media_by_title(c, &q, tf.as_deref())).await? {
-        // The local cache is exact-title only; it must also satisfy the year rules.
-        let year_ok = match local.release_year {
-            Some(y) => year_hint.is_none_or(|h| (h - y).abs() <= 1) && released_by.is_none_or(|by| y <= by),
-            None => year_hint.is_none(),
-        };
-        if year_ok {
-            return Ok(Some(Matched {
-                tmdb_id: local.tmdb_id,
-                media_type: local.media_type,
-                runtime_mins: local.runtime_mins,
-                catalog: None,
-            }));
+    let release_year = release_year.filter(|y| (1880..=2100).contains(y));
+    // The local cache is only trusted when the media type is known: an exact-title row of the
+    // other type ("The Mentalist" film vs series) must not short-circuit the search.
+    if let Some(tv) = is_tv {
+        let q = cleaned.clone();
+        let tf = if tv { "tv" } else { "movie" };
+        if let Some(local) = db.run(move |c| queries::find_media_by_title(c, &q, Some(tf))).await? {
+            // The local cache is exact-title only; it must also satisfy the year rules. A series'
+            // provider year can be its latest season, so it only bounds the premiere from above.
+            let year_ok = match local.release_year {
+                Some(y) => {
+                    year_hint.is_none_or(|h| (h - y).abs() <= 1)
+                        && released_by.is_none_or(|by| y <= by)
+                        && release_year.is_none_or(|r| if tv { y <= r + 1 } else { (r - y).abs() <= 1 })
+                }
+                None => year_hint.is_none(),
+            };
+            if year_ok {
+                return Ok(Some(Matched {
+                    tmdb_id: local.tmdb_id,
+                    media_type: local.media_type,
+                    runtime_mins: local.runtime_mins,
+                    catalog: None,
+                }));
+            }
         }
     }
 
     let types: &[&'static str] = match is_tv {
         Some(true) => &["tv"],
         Some(false) => &["movie"],
-        None => &["movie", "tv"],
+        None => &["tv", "movie"],
     };
-    let mut best: Option<(i32, TmdbHit)> = None;
+    let mut best: Option<(HitRank, TmdbHit)> = None;
     for &media_type in types {
-        let hits = tmdb.search(media_type, &cleaned).await?;
-        if let Some(candidate) = pick_hit(&hits, &cleaned, year_hint, released_by) {
-            if best.as_ref().is_none_or(|(s, _)| candidate.0 > *s) {
+        let mut candidate = None;
+        if let Some(year) = release_year.or(year_hint) {
+            let hits = tmdb.search(media_type, &cleaned, Some(year)).await?;
+            candidate = pick_hit(&hits, &cleaned, year_hint, release_year, released_by).filter(|(rank, _)| rank.0 == 100);
+        }
+        if candidate.is_none() {
+            let hits = tmdb.search(media_type, &cleaned, None).await?;
+            candidate = pick_hit(&hits, &cleaned, year_hint, release_year, released_by);
+        }
+        if let Some(candidate) = candidate {
+            if best.as_ref().is_none_or(|(rank, _)| candidate.0 > *rank) {
                 best = Some(candidate);
             }
         }
@@ -1176,6 +1295,43 @@ async fn resolve_title(
             certification: None,
             updated_at: None,
         }),
+    }))
+}
+
+/// A title playing in the player window, identified on TMDB.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifiedTitle {
+    pub tmdb_id: i64,
+    pub media_type: String,
+    pub title: String,
+    pub original_title: Option<String>,
+    pub release_year: Option<i64>,
+}
+
+/// Identifies the title the user switched to inside the OTT player. The media type is strict
+/// (`/search/tv` for anything with season/episode data, `/search/movie` otherwise) and the
+/// provider's release year is passed to TMDB; the matched entry is cached locally.
+pub async fn identify_title(state: &AppState, title: &str, is_tv: bool, release_year: Option<i64>) -> AppResult<Option<IdentifiedTitle>> {
+    let tmdb = TmdbClient::from_settings(state).await?;
+    let Some(m) = resolve_title(&state.db, &tmdb, title, Some(is_tv), None, release_year).await? else {
+        return Ok(None);
+    };
+    let (tmdb_id, mt) = (m.tmdb_id, m.media_type.clone());
+    let entry = match m.catalog {
+        Some(entry) => {
+            let cached = entry.clone();
+            state.db.run(move |c| queries::upsert_media(c, &cached)).await?;
+            Some(entry)
+        }
+        None => state.db.run(move |c| queries::get_media(c, tmdb_id, &mt)).await?,
+    };
+    Ok(Some(IdentifiedTitle {
+        tmdb_id: m.tmdb_id,
+        media_type: m.media_type,
+        title: entry.as_ref().map_or_else(|| title.trim().to_string(), |e| e.title.clone()),
+        original_title: entry.as_ref().and_then(|e| e.original_title.clone()),
+        release_year: entry.and_then(|e| e.release_year),
     }))
 }
 
@@ -1230,7 +1386,7 @@ async fn resolve_and_store(
         let (db, tmdb, sem) = (db.clone(), tmdb.clone(), sem.clone());
         set.spawn(async move {
             let _permit = sem.acquire_owned().await;
-            (gi, resolve_title(&db, &tmdb, &title, is_tv, released_by).await)
+            (gi, resolve_title(&db, &tmdb, &title, is_tv, released_by, None).await)
         });
     }
     let mut matches: Vec<Option<Matched>> = vec![None; total];
@@ -1411,7 +1567,7 @@ async fn resolve_and_store(
             episode_number: episode,
             episode_title: item.episode_title.clone(),
             provider_name: Some(provider_name.to_string()),
-            direct_url: None,
+            direct_url: item.direct_url.clone(),
             progress_seconds: progress,
             duration_seconds: duration,
             is_completed: completed,
@@ -1512,6 +1668,24 @@ mod tests {
     }
 
     #[test]
+    fn csv_rows_are_typed_strictly() {
+        let csv = "Title,Date\n\"Friends: Season 2: The One with the Breast Milk\",11/12/26\nFriends,11/01/26\nGladiator,10/01/26\n\"The Mentalist: Season 1: Pilot\",09/01/26\n";
+        let items = parse_viewing_activity_csv(csv).unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!((items[0].title.as_str(), items[0].is_tv), ("Friends", Some(true)));
+        assert_eq!(items[1].is_tv, Some(true), "a bare series title seen with episodes stays TV");
+        assert_eq!(items[2].is_tv, Some(false), "a bare title is a movie");
+        assert_eq!((items[3].title.as_str(), items[3].is_tv), ("The Mentalist", Some(true)));
+    }
+
+    #[test]
+    fn netflix_watch_urls_open_the_episode() {
+        assert_eq!(netflix_watch_url(Some("70274078")).as_deref(), Some("https://www.netflix.com/watch/70274078"));
+        assert_eq!(netflix_watch_url(Some("../evil")), None);
+        assert_eq!(netflix_watch_url(None), None);
+    }
+
+    #[test]
     fn netflix_title_variants() {
         let friends = Some("The One with Ross's New Girlfriend");
         assert_eq!(parse_netflix_title("Friends: Season 2: The One with Ross's New Girlfriend"), nt("Friends", Some(2), None, friends));
@@ -1576,6 +1750,7 @@ mod tests {
                 episode_number: None,
                 episode_title: None,
                 season_label: None,
+                ott_video_id: Some("70274077".into()),
                 is_tv: false,
                 progress_ratio: None,
                 progress_seconds: Some(600.0),
@@ -1589,6 +1764,7 @@ mod tests {
         assert_eq!(rows[0].season, Some(2));
         assert_eq!(rows[0].episode_title.as_deref(), Some("The One with Ross's New Girlfriend"));
         assert_eq!(rows[0].progress_seconds, Some(600.0));
+        assert_eq!(rows[0].direct_url.as_deref(), Some("https://www.netflix.com/watch/70274077"));
         assert!(!rows[0].assume_completed);
     }
 
@@ -1615,28 +1791,45 @@ mod tests {
             overview: None,
             vote_average: None,
             genre_ids: Value::Null,
+            popularity: 0.0,
+            vote_count: 0,
         };
         let hits = vec![hit(1, "The Matrix Reloaded"), hit(2, "The Matrix")];
-        assert_eq!(pick_hit(&hits, "The Matrix", None, None).unwrap().1.id, 2);
-        assert!(pick_hit(&[hit(3, "Something Else")], "The Matrix", None, None).is_none());
+        assert_eq!(pick_hit(&hits, "The Matrix", None, None, None).unwrap().1.id, 2);
+        assert!(pick_hit(&[hit(3, "Something Else")], "The Matrix", None, None, None).is_none());
 
         // Ghost-history guards.
         let dated = |id, title: &str, year| TmdbHit { year: Some(year), ..hit(id, title) };
         // No substring matches, even on the top result.
-        assert!(pick_hit(&[dated(10, "Friends with Benefits", 2011)], "Friends", None, None).is_none());
+        assert!(pick_hit(&[dated(10, "Friends with Benefits", 2011)], "Friends", None, None, None).is_none());
         // Subtitle-tolerant main-title match, top results only.
         let onion = [dated(11, "Glass Onion: A Knives Out Mystery", 2022)];
-        assert_eq!(pick_hit(&onion, "Glass Onion", None, None).unwrap().1.id, 11);
+        assert_eq!(pick_hit(&onion, "Glass Onion", None, None, None).unwrap().1.id, 11);
         let buried = [dated(1, "A", 2000), dated(2, "B", 2000), dated(3, "C", 2000), dated(12, "Glass Onion: A Knives Out Mystery", 2022)];
-        assert!(pick_hit(&buried, "Glass Onion", None, None).is_none());
+        assert!(pick_hit(&buried, "Glass Onion", None, None, None).is_none());
         // Released after it was watched => not the title the user saw (remakes, reboots).
         let remakes = [dated(20, "The Office", 2025), dated(21, "The Office", 2005)];
-        assert_eq!(pick_hit(&remakes, "The Office", None, Some(2019)).unwrap().1.id, 21);
-        assert!(pick_hit(&[dated(22, "Dune", 2021)], "Dune", None, Some(2019)).is_none());
+        assert_eq!(pick_hit(&remakes, "The Office", None, None, Some(2019)).unwrap().1.id, 21);
+        assert!(pick_hit(&[dated(22, "Dune", 2021)], "Dune", None, None, Some(2019)).is_none());
         // A year in the source title is strict (±1).
         let dunes = [dated(30, "Dune", 2021), dated(31, "Dune", 1984)];
-        assert_eq!(pick_hit(&dunes, "Dune", Some(1984), None).unwrap().1.id, 31);
-        assert!(pick_hit(&[dated(30, "Dune", 2021)], "Dune", Some(1984), None).is_none());
+        assert_eq!(pick_hit(&dunes, "Dune", Some(1984), None, None).unwrap().1.id, 31);
+        assert!(pick_hit(&[dated(30, "Dune", 2021)], "Dune", Some(1984), None, None).is_none());
+        // Same name, different titles: the reported year decides, then popularity.
+        let popular = |id, title: &str, year, popularity: f64| TmdbHit { popularity, vote_count: (popularity * 100.0) as i64, ..dated(id, title, year) };
+        let gladiators = [popular(40, "Gladiator", 1992, 4.0), popular(41, "Gladiator", 2000, 90.0)];
+        assert_eq!(pick_hit(&gladiators, "Gladiator", None, Some(1992), None).unwrap().1.id, 40);
+        assert_eq!(pick_hit(&gladiators, "Gladiator", None, Some(2000), None).unwrap().1.id, 41);
+        assert_eq!(pick_hit(&gladiators, "Gladiator", None, None, None).unwrap().1.id, 41, "unknown year: the popular one");
+        let crashes = [popular(50, "Crash", 2004, 30.0), popular(51, "Crash", 1996, 20.0)];
+        assert_eq!(pick_hit(&crashes, "Crash", None, Some(1996), None).unwrap().1.id, 51);
+        // An obscure exact-title film never outranks the popular series of the same name.
+        let film = popular(60, "The Mentalist", 2012, 0.6);
+        let series = TmdbHit { media_type: "tv", ..popular(61, "The Mentalist", 2008, 120.0) };
+        assert!(pick_hit(&[series], "The Mentalist", None, None, None).unwrap().0 > pick_hit(&[film], "The Mentalist", None, None, None).unwrap().0);
+        // An exact title beats a more popular subtitle match.
+        let mixed = [popular(70, "Friends: The Reunion", 2021, 300.0), popular(71, "Friends", 1994, 200.0)];
+        assert_eq!(pick_hit(&mixed, "Friends", None, None, None).unwrap().1.id, 71);
         assert_eq!(title_year_hint("Dune (1984)"), Some(1984));
         assert_eq!(title_year_hint("The Office (US) (2005)"), Some(2005));
         assert_eq!(title_year_hint("RRR (Hindi)"), None);

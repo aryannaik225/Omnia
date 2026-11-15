@@ -44,6 +44,7 @@ permissions = [
   "allow-clear-preferred-provider",
   "allow-hide-from-continue-watching",
   "allow-clear-watch-history",
+  "allow-identify-title",
   "allow-unhide-from-continue-watching",
   "allow-open-player",
   "allow-close-player",
@@ -63,5 +64,6 @@ permissions = [
   "allow-sync-playback-telemetry",
   "allow-player-back-to-hub",
   "allow-report-ott-profile",
-  "allow-submit-scraped-history"
+  "allow-submit-scraped-history",
+  "allow-report-scrape-progress"
 ]

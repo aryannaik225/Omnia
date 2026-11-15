@@ -8,6 +8,7 @@ import { history, type HistoryWithMedia } from "../../services/tauriBridge";
 import { useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { LandscapeCard, PosterCard } from "../common/Cards";
+import { EmptyState } from "../common/EmptyState";
 import { DownloadIcon, TrashIcon } from "../common/Icons";
 import { MediaGrid } from "../common/MediaGrid";
 import { cwSubtitle } from "../home/ContinueWatchingRow";
@@ -78,6 +79,7 @@ function historySubtitle(h: HistoryWithMedia, count: number) {
 export function ContinueWatchingView() {
   const profile = useAppStore((s) => s.activeProfile);
   const items = useAppStore((s) => s.continueWatching);
+  const loaded = useAppStore((s) => s.continueWatchingLoaded);
   const refresh = useAppStore((s) => s.refreshContinueWatching);
   const openTitle = useAppStore((s) => s.openTitle);
   const toast = useAppStore((s) => s.toast);
@@ -105,6 +107,10 @@ export function ContinueWatchingView() {
     toast({ kind: "info", title: "Removed from history", body: g.latest.title ?? undefined });
   };
 
+  // A profile with no activity at all (new, or history just cleared): one inviting state
+  // instead of two empty sections.
+  const nothingAtAll = loaded && !items.length && !recent.loading && recent.data !== undefined && !groups.length;
+
   return (
     <div className="pb-16">
       <PageHeader
@@ -116,6 +122,15 @@ export function ContinueWatchingView() {
           </button>
         }
       />
+      {nothingAtAll ? (
+        <div className="pt-6">
+          <EmptyState
+            title="Nothing here yet"
+            body="Go discover your next favorite show. Everything you watch in Omnia shows up here with its exact position, across all your services."
+          />
+        </div>
+      ) : (
+        <>
       {items.length ? (
         <div className="grid gap-x-5 gap-y-7" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
           {items.map((item) => (
@@ -131,7 +146,7 @@ export function ContinueWatchingView() {
           ))}
         </div>
       ) : (
-        <p className="text-label-secondary">Nothing in progress. Start something and it'll appear here, with its exact position.</p>
+        <EmptyState size="row" actions={false} title="Nothing in progress" body="Start something and it'll appear here, with its exact position." />
       )}
 
       <h2 className="section-title mb-4 mt-12">Recently watched</h2>
@@ -176,6 +191,8 @@ export function ContinueWatchingView() {
         </div>
       ) : (
         <p className="text-label-secondary">{recent.loading ? "Loading…" : "No history yet."}</p>
+      )}
+        </>
       )}
     </div>
   );

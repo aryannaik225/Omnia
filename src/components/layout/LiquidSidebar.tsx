@@ -5,6 +5,7 @@
  */
 import { m } from "framer-motion";
 import { useState, type ComponentType, type FocusEvent } from "react";
+import wordmark from "../../assets/omnia-wordmark.png";
 import { flag } from "../../lib/format";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
@@ -13,6 +14,9 @@ import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon,
 
 export const SIDEBAR_EXPANDED = 248;
 export const SIDEBAR_COLLAPSED = 76;
+/** Wordmark is drawn 32 px tall: the rounded-square mark alone is 32 px wide, mark + "Omnia" 101 px. */
+const LOGO_H = 32;
+const LOGO_FULL_W = Math.round((LOGO_H * 3232) / 1024);
 
 const NAV: { view: View; label: string; icon: ComponentType<{ size?: number }> }[] = [
   { view: "search", label: "Search", icon: SearchIcon },
@@ -61,13 +65,20 @@ export function LiquidSidebar() {
           aria-pressed={pinned}
           aria-label={pinned ? "Collapse sidebar" : "Keep sidebar open"}
           title={pinned ? "Collapse sidebar" : "Keep sidebar open"}
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] bg-gradient-to-br from-white/90 to-white/50 text-[15px] font-bold text-ink-900 shadow-specular transition-transform hover:scale-105"
+          className="shrink-0 rounded-[10px] transition-transform hover:scale-[1.03]"
         >
-          O
+          {/* Collapsed rail shows just the mark; expanding reveals the "Omnia" lettering. */}
+          <m.div
+            initial={false}
+            animate={{ width: collapsed ? LOGO_H : LOGO_FULL_W }}
+            transition={{ type: "spring", stiffness: 300, damping: 32 }}
+            className="overflow-hidden"
+            style={{ height: LOGO_H }}
+          >
+            <img src={wordmark} alt="Omnia" draggable={false} style={{ height: LOGO_H, width: LOGO_FULL_W, maxWidth: "none" }} />
+          </m.div>
         </button>
-        <m.span animate={{ opacity: collapsed ? 0 : 1 }} className="flex-1 whitespace-nowrap text-[20px] font-semibold tracking-tight">
-          Omnia
-        </m.span>
+        <span className="flex-1" />
         <m.button
           animate={{ opacity: collapsed ? 0 : 1 }}
           onClick={togglePinned}

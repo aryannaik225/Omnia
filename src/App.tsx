@@ -17,6 +17,7 @@ import { OttPickerModal } from "./components/modals/OttPickerModal";
 import { ProfileGate } from "./components/profile/ProfileGate";
 import { ContinueWatchingView, MyOttsView, SearchView, WatchlistView } from "./components/views/BrowseViews";
 import { HomeView } from "./components/views/HomeView";
+import wordmark from "./assets/omnia-wordmark.png";
 
 // Secondary screens load on demand to keep the startup bundle small.
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
@@ -107,7 +108,9 @@ function Splash({ message, error = false }: { message: string; error?: boolean }
   return (
     <div className="flex h-full items-center justify-center">
       <m.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="glass-panel w-[420px] px-8 py-7 text-center">
-        <h1 className="text-3xl font-semibold tracking-tight">Omnia</h1>
+        <h1>
+          <img src={wordmark} alt="Omnia" draggable={false} className="mx-auto h-12 w-auto" />
+        </h1>
         <p className={`mt-2 ${error ? "text-[#ff6961]" : "text-label-secondary"}`}>{message}</p>
       </m.div>
     </div>

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-report-scrape-progress"
+description = "Enables the report_scrape_progress command without any pre-configured scope."
+commands.allow = ["report_scrape_progress"]
+
+[[permission]]
+identifier = "deny-report-scrape-progress"
+description = "Denies the report_scrape_progress command without any pre-configured scope."
+commands.deny = ["report_scrape_progress"]

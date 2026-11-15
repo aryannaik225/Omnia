@@ -507,6 +507,18 @@ async fn clear_watch_history(app: tauri::AppHandle, state: State<'_, AppState>, 
     Ok(cleared)
 }
 
+/// Identifies a title the user switched to inside the player (strict TMDB type + year match).
+#[tauri::command]
+async fn identify_title(
+    state: State<'_, AppState>,
+    title: String,
+    media_type: String,
+    release_year: Option<i64>,
+) -> AppResult<Option<history_importer::IdentifiedTitle>> {
+    check_media_type(&media_type)?;
+    history_importer::identify_title(&state, &title, media_type == "tv", release_year).await
+}
+
 /// Manual CSV/JSON import (parsed on the frontend into typed rows).
 #[tauri::command]
 async fn import_watch_history(state: State<'_, AppState>, rows: Vec<HistoryImport>) -> AppResult<usize> {
@@ -683,16 +695,109 @@ fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 // Entry point
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// Desktop shell: system tray, close-to-tray, window state, single instance
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(desktop)]
+const TRAY_ID: &str = "omnia-tray";
+#[cfg(desktop)]
+const TRAY_OPEN: &str = "tray-open";
+#[cfg(desktop)]
+const TRAY_QUIT: &str = "tray-quit";
+
+/// Tray icon (Omnia's ring, from the generated icon set) with "Open Omnia" / "Quit Omnia".
+/// Left click opens the hub; right click shows the menu.
+#[cfg(desktop)]
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open = MenuItem::with_id(app, TRAY_OPEN, "Open Omnia", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, TRAY_QUIT, "Quit Omnia", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
+    // Tray uses the transparent mark (no dark square) so it sits cleanly on the taskbar.
+    // icons/tray-icon.png is assets/app-icon-transparent.png with its background-removal
+    // speckles stripped, at 64 px: crisp on 150-200% scaling, downscaled by Windows at 100%.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
+
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon)
+        .tooltip("Omnia")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_OPEN => window_manager::focus_main_window(app),
+            TRAY_QUIT => quit_app(app.clone()),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                window_manager::focus_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// Real exit (tray "Quit"): flush the open player's final position to SQLite first, then exit.
+/// The window-state plugin saves the main window's size / position on exit.
+#[cfg(desktop)]
+fn quit_app(app: tauri::AppHandle) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static QUITTING: AtomicBool = AtomicBool::new(false);
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        window_manager::close_active_player(&app, "quit").await;
+        app.exit(0);
+    });
+}
+
+/// Main window size, position and maximized state across restarts. Player and importer
+/// windows are never tracked: they are per-title / hidden.
+#[cfg(desktop)]
+fn window_state_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_window_state::StateFlags;
+    tauri_plugin_window_state::Builder::new()
+        .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+        .with_filter(|label| label == window_manager::MAIN_LABEL)
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(
+    let builder = tauri::Builder::default();
+
+    // Must be the first plugin: a second launch (e.g. from the Start menu while Omnia sits in
+    // the tray) focuses the running hub instead of opening the database twice.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        window_manager::focus_main_window(app);
+    }));
+
+    let builder = builder.plugin(
         tauri_plugin_log::Builder::new()
             .level(log::LevelFilter::Info)
             .build(),
     );
 
     #[cfg(desktop)]
-    let builder = builder.plugin(global_shortcut_plugin());
+    let builder = builder
+        .plugin(global_shortcut_plugin())
+        .plugin(window_state_plugin())
+        // Close-to-tray: the main window's X hides it; the process keeps the embedding model,
+        // recommender cache and isolated WebView2 sessions warm. "Quit Omnia" in the tray exits.
+        .on_window_event(|window, event| {
+            if window.label() == window_manager::MAIN_LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        });
 
     builder
         .setup(|app| {
@@ -778,6 +883,9 @@ pub fn run() {
             });
 
             #[cfg(desktop)]
+            setup_tray(app)?;
+
+            #[cfg(desktop)]
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 for shortcut in back_to_hub_shortcuts() {
@@ -817,6 +925,7 @@ pub fn run() {
             get_title_progress,
             delete_watch_history_entry,
             clear_watch_history,
+            identify_title,
             import_watch_history,
             export_watch_history,
             log_playback_event,
@@ -846,6 +955,7 @@ pub fn run() {
             history_importer::import_ott_history,
             history_importer::import_history_file,
             history_importer::submit_scraped_history,
+            history_importer::report_scrape_progress,
             // Recommendations
             recommender::get_recommendations,
             recommender::get_taste_summary,

@@ -273,7 +273,18 @@ export interface DetectedMedia {
   episodeNumber: number | null;
   episodeTitle: string | null;
   ottTitleId: string | null;
+  /** From the provider's own metadata when known. */
+  mediaType?: MediaType | null;
+  releaseYear?: number | null;
   confidence: "high" | "low";
+}
+
+export interface IdentifiedTitle {
+  tmdbId: number;
+  mediaType: MediaType;
+  title: string;
+  originalTitle: string | null;
+  releaseYear: number | null;
 }
 
 export interface RebindRequest {
@@ -468,6 +479,9 @@ export const player = {
   close: () => invoke<void>("close_player"),
   status: () => invoke<PlayerStatus | null>("get_player_status"),
   rebind: (request: RebindRequest) => invoke<PlayerStatus>("player_rebind_title", { request }),
+  /** Strict TMDB identification in Rust: /search/tv or /search/movie only, with the release year. */
+  identify: (title: string, mediaType: MediaType, releaseYear: number | null = null) =>
+    invoke<IdentifiedTitle | null>("identify_title", { title, mediaType, releaseYear }),
 };
 
 export const importer = {

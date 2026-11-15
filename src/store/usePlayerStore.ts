@@ -10,7 +10,7 @@
 import { create } from "zustand";
 import { groupLinks, nextEpisode, rankLinks, type LinkGroup } from "../services/catalog";
 import { providerFamily } from "../lib/providers";
-import { details as tmdbDetails, providerHints, searchTitle, toCatalogEntry, type MediaDetails } from "../services/tmdbClient";
+import { details as tmdbDetails, providerHints, toCatalogEntry, type MediaDetails } from "../services/tmdbClient";
 import {
   catalog,
   deepLinks,
@@ -22,6 +22,7 @@ import {
   preferredProviders,
   type ContinueWatchingItem,
   type ImportReport,
+  type MediaType,
   type OttProfileMapping,
   type PlayerStatus,
   type PreferredProvider,
@@ -92,6 +93,21 @@ interface PlayerState {
 const app = () => useAppStore.getState();
 const importKey = (profileId: number, providerName: string) => `${profileId}:${providerName}`;
 
+const NETFLIX_WATCH = /^https:\/\/www\.netflix\.com\/watch\/\d{3,12}(?:[/?#]|$)/i;
+const NETFLIX_TITLE = /^https:\/\/(?:www\.)?netflix\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?title\/(\d{3,12})/i;
+
+/**
+ * Netflix player URL for a resolved link. `/watch/<episode id>` is kept as is; a series or
+ * film landing page (`/title/<id>`, what JustWatch returns) becomes `/watch/<id>`, which opens
+ * the player directly: for a series Netflix starts the profile's current / next episode.
+ */
+export function netflixPlayerUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (NETFLIX_WATCH.test(url)) return url;
+  const m = url.match(NETFLIX_TITLE);
+  return m ? `https://www.netflix.com/watch/${m[1]}` : null;
+}
+
 export const usePlayerStore = create<PlayerState>((set, get) => ({
   status: null,
   launching: null,
@@ -137,19 +153,24 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         // The user switched titles inside the OTT player: identify it and rebind tracking.
         const d = e.detected;
         if (!d.title) return;
-        const isTv = !!d.episodeNumber;
+        // Strict type: anything with season / episode data is a series, never a film (and the
+        // other type is never tried as a fallback). Rust matches exact titles + release year.
+        const mediaType: MediaType =
+          d.mediaType === "tv" || d.mediaType === "movie"
+            ? d.mediaType
+            : d.seasonNumber != null || d.episodeNumber != null || !!d.episodeTitle
+              ? "tv"
+              : "movie";
         try {
-          const hits = await searchTitle(d.title, isTv ? "tv" : "movie");
-          const fallback = hits.length ? hits : await searchTitle(d.title, isTv ? "movie" : "tv");
-          const match = fallback[0];
+          const match = await player.identify(d.title, mediaType, d.releaseYear ?? null);
           if (!match) {
             app().toast({ kind: "warning", title: "Couldn't identify the new title", body: `“${d.title}” won't be tracked.` });
             return;
           }
-          const full = await tmdbDetails(match.mediaType, match.id, app().region).catch(() => null);
+          const full = await tmdbDetails(match.mediaType, match.tmdbId, app().region).catch(() => null);
           if (full) await catalog.cache([toCatalogEntry(full)]);
           await player.rebind({
-            tmdbId: match.id,
+            tmdbId: match.tmdbId,
             mediaType: match.mediaType,
             title: match.title,
             originalTitle: match.originalTitle,
@@ -326,32 +347,56 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     if (!profile) return;
     set({ launching: `${item.mediaType}:${item.tmdbId}` });
     try {
-      // Up Next: start the following episode via the title's deep links.
-      if (item.upNext || !item.directUrl) {
+      const isNetflix = /netflix/i.test(item.providerName ?? "");
+      // The episode's own player URL, captured by live telemetry or the Netflix importer.
+      const episodeUrl = isNetflix ? netflixPlayerUrl(item.directUrl) : null;
+      const exactUrl = !item.upNext && (episodeUrl ?? (isNetflix ? null : item.directUrl));
+
+      let directUrl = exactUrl || null;
+      let providerId = 0;
+      let providerName = item.providerName ?? "Provider";
+      if (!directUrl && isNetflix) {
+        // No episode URL (e.g. CSV import, or Up Next): open Netflix's player for the title
+        // instead of its landing page; Netflix picks the profile's current / next episode.
+        const d = await tmdbDetails(item.mediaType, item.tmdbId, s.region);
+        const ranked = await get().resolveLinks(d).catch(() => [] as ResolvedLink[]);
+        const link = ranked.find((l) => /netflix/i.test(l.providerName) && netflixPlayerUrl(l.directUrl));
+        if (link) {
+          directUrl = netflixPlayerUrl(link.directUrl);
+          providerId = link.providerId;
+          providerName = link.providerName;
+        }
+      }
+      if (!directUrl) {
+        // Other providers (or nothing resolvable): the normal play flow with its deep links.
         const d = await tmdbDetails(item.mediaType, item.tmdbId, s.region);
         await get().playTitle(d);
         return;
       }
-      // Exact resume page captured by telemetry; find the provider id for profile isolation.
-      const cached = await deepLinks.cached(item.tmdbId, item.mediaType, s.region).catch(() => []);
-      const name = (item.providerName ?? "").toLowerCase();
-      const providerId =
-        cached.find((l) => l.providerName.toLowerCase() === name)?.providerId ??
-        s.subscriptions.find((p) => p.providerName.toLowerCase() === name)?.providerId ??
-        0;
+      if (!providerId) {
+        // Find the provider id for profile isolation.
+        const cached = await deepLinks.cached(item.tmdbId, item.mediaType, s.region).catch(() => []);
+        const name = providerName.toLowerCase();
+        providerId =
+          cached.find((l) => l.providerName.toLowerCase() === name)?.providerId ??
+          s.subscriptions.find((p) => p.providerName.toLowerCase() === name)?.providerId ??
+          (isNetflix ? 8 : 0);
+      }
       await player.open({
         appProfileId: profile.profileId,
         providerId,
-        providerName: item.providerName ?? "Provider",
+        providerName,
         mode: "play",
         tmdbId: item.tmdbId,
         mediaType: item.mediaType,
         title: item.title ?? "Untitled",
+        // A guess until the player confirms the episode (Netflix always reports it).
         seasonNumber: item.seasonNumber,
         episodeNumber: item.episodeNumber,
-        episodeTitle: item.episodeTitle,
-        directUrl: item.directUrl,
-        resumeAtSeconds: item.progressSeconds,
+        episodeTitle: item.upNext ? null : item.episodeTitle,
+        directUrl,
+        // Netflix resumes its own bookmark; the saved point is only a hint for other providers.
+        resumeAtSeconds: exactUrl ? item.progressSeconds : undefined,
         region: s.region,
       });
     } catch (e) {

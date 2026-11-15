@@ -26,13 +26,28 @@ function ImportProgress({ state }: { state: ImportState }) {
       </p>
     );
   }
-  const pct = state.total > 0 ? Math.round((state.done / state.total) * 100) : null;
-  const label = { starting: "Starting…", fetching: "Reading history…", matching: "Matching titles…", saving: "Saving…" }[state.stage];
+  const pct = state.total > 0 ? Math.min(100, Math.round((state.done / state.total) * 100)) : null;
+  const n = (v: number) => v.toLocaleString();
+  // A lifetime import reads page after page for minutes: say so, and show the running count.
+  const label =
+    state.stage === "fetching"
+      ? `Importing full history… this may take a few minutes${
+          state.done > 0 ? ` · ${n(state.done)}${state.total > 0 ? ` of ${n(state.total)}` : ""} entries read` : ""
+        }`
+      : state.stage === "matching"
+        ? `Matching titles…${state.total > 0 ? ` ${n(state.done)} of ${n(state.total)}` : ""}`
+        : { starting: "Starting…", saving: "Saving…" }[state.stage];
   return (
-    <div className="mt-2">
-      <p className="text-[12px] text-label-secondary">
-        {label}
-        {pct !== null ? ` ${pct}%` : ""}
+    <div className="mt-2" role="status" aria-live="polite">
+      <p className="flex items-center gap-2 text-[12px] text-label-secondary">
+        <span
+          aria-hidden
+          className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-white/25 border-t-white/90 motion-reduce:animate-none"
+        />
+        <span>
+          {label}
+          {state.stage !== "fetching" && state.stage !== "matching" && pct !== null ? ` ${pct}%` : ""}
+        </span>
       </p>
       <div className="progress-track mt-1.5">
         <div className={`progress-fill ${pct === null ? "animate-pulse" : ""}`} style={{ width: `${pct ?? 35}%` }} />
