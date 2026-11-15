@@ -39,20 +39,36 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 - Titles open in a dedicated **WebView2 player window** (Windows' built-in Edge engine, with Widevine/PlayReady DRM support).
 - A small observer script tracks the real `<video>` element: position, pauses, seeks, episode changes and switches to a different title. Progress is saved every few seconds.
 - A frosted **"← Omnia" pill** (top-left, appears on mouse movement) or the hotkeys **Ctrl+Shift+O** / **Ctrl+Shift+H** save your exact position, close the player and bring you back to the catalog.
-- **Watching Now** shows everything in progress across every service, with exact progress bars.
+- **Exact episodes.** Playing an episode from a series page opens that episode itself (on Netflix, `netflix.com/watch/<episode>`), not the show's landing page.
+- **Watching Now** shows everything in progress across every service, with exact progress bars, and your full history, one card per title, with a **platform filter** (each service, or *Offline / Manual*).
+- **Airing shows come back.** If you were caught up on a series and a new episode has aired since, it returns to **Continue Watching** with a *New Episode* card that plays that episode.
 
 ### Family profiles that stay separate
-- A "Who's watching?" screen with per-profile history, watchlist, recommendations and kids mode.
+- A "Who's watching?" screen with per-profile history, watchlist, collections, recommendations and kids mode.
+- **Profile pictures:** 8 built-in characters and colours, any actor or character from TMDB (search a show to pick from its cast by character name), an image from your computer, or a pasted image link. Uploaded and linked images are cropped and stored locally.
+- Each Omnia profile has its **own browser data** for the services (cookies, sign-ins), so family members never share a session.
 - Each Omnia profile is **linked to its own profile on each service** (e.g. Clara ↔ Clara's Netflix profile).
 - Omnia records viewing **only when the linked profile is active**. If someone watches on another person's Netflix profile, nothing is saved anywhere. When it can, Omnia switches the service to the right profile automatically before playing.
 
 ### Import your past history
-- **Connect Accounts** links your service profile and imports your past viewing (Netflix through its viewing-activity data, Prime Video and others from their history or "Continue Watching" pages).
+- **Connect Accounts** links your service profile and imports your past viewing:
+  - **Netflix:** your profile's whole lifetime viewing activity, with real watch dates.
+  - **Prime Video:** its watch-history page.
+  - **JioHotstar, Apple TV and others:** their "Continue Watching" data, read from the page's own app state and API responses, with the rendered page as a fallback.
+- Sign-in is detected automatically on every service. Once you've signed in (and picked your profile, where the service has profiles), the account is linked and the import starts.
+- Titles are matched to TMDB strictly. When several titles share a name (*The Traitors* US vs India), Omnia picks the one that service actually carries in your region.
+- **Imported history is silent.** It shapes your recommendations and Watch History, but stays off *Continue Watching* until you play the title in Omnia.
+- **Clear by provider.** Delete only one service's history (say, someone else's Prime Video imported by mistake) and keep everything else.
 - Or drop in Netflix's **"Download viewing activity" CSV**, or an Omnia JSON backup.
+
+### Your own library
+- **Mark as Watched** for movies, single episodes or a whole season: for things you saw in a cinema, from a local file or on another device. Marked titles appear in Watch History and Continue Watching, and count towards recommendations.
+- **Love** a title to make it count the most towards your recommendations.
+- **Collections**: make your own lists ("Date night", "Best of 2025") and add any movie or series from its page. Everything you've loved is listed there too.
 
 ### On-device recommendations
 - A small sentence-embedding model (**all-MiniLM-L6-v2**, run locally via ONNX Runtime) turns each title's plot, genres, keywords, cast, director, studio and mood into a vector.
-- Your viewing behaviour shapes your taste profile: finishing titles, **binge sessions** (3+ episodes in one sitting), **rewatching** favourites, **abandoning** titles early, skipping through, and **time of day** (lighter picks late at night, for example).
+- Your viewing behaviour shapes your taste profile: finishing titles, **binge sessions** (3+ episodes in one sitting), **rewatching** favourites, titles you **love**, **abandoning** titles early, skipping through, and **time of day** (lighter picks late at night, for example).
 - Rows come with explanations: *"Because you binged Stranger Things late at night"*, *"Atmospheric Science Fiction matching your taste profile"*, *"Rediscover your Comfort Favorites"*.
 - **Settings → Recommendations** shows exactly which titles shape your taste profile, and why.
 
@@ -60,6 +76,9 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 - Marvel, MCU, DC, Star Wars, Wizarding World, Fast & Furious, MonsterVerse, Middle-earth, James Bond, Anime, Studio Ghibli, Apple Originals, Netflix Exclusives, Prime Video Originals, HBO & Max, Disney & Pixar, Hotstar Specials, A24, Blumhouse, Kids & Family, K-Drama and the Christopher Nolan Collection.
 - Filters can be combined: Movies/Series, *Under 90 mins* / *Epic 2.5h+*, era, original language, and Kids & Family safe.
 - Hubs are stored as data, so you can add new ones (see [Adding a hub](#adding-a-hub)).
+
+### A proper desktop app
+- A system-tray icon, close-to-tray, a single running instance, and the window's size and position remembered between launches.
 
 ---
 
@@ -69,7 +88,8 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 |---|---|---|
 | Profiles, watch history, playback events, watchlist | Local SQLite (`omnia.db`) | **Never** |
 | Taste vectors and recommendation scores | Local SQLite, computed on-device | **Never** |
-| Streaming-service cookies (for history import) | WebView2's own cookie store; read into memory only during an import | Only to that service's own website, never logged |
+| Streaming-service cookies and sign-ins | WebView2's own store, one folder per Omnia profile; Rust never reads them | Only to that service's own website, never logged |
+| Profile pictures | Local SQLite (uploaded / linked images are stored as a small local copy) | Never |
 | Title names, for catalog/metadata lookups | — | Sent to TMDB and JustWatch as **anonymous public title strings** |
 
 The only network calls Omnia makes:
@@ -79,6 +99,7 @@ The only network calls Omnia makes:
 - **ipwho.is / ip-api.com**: one-time region detection; can be overridden manually.
 - **Hugging Face and GitHub (Microsoft)**: one-time download of the recommendation model and ONNX Runtime, both pinned to an exact version and verified with SHA-256.
 - **youtube-nocookie.com**: trailer previews; can be turned off in Settings.
+- **An image link you paste** as a profile picture: downloaded once, from public websites only, without cookies; the picture never loads from that site again.
 - **The streaming services themselves**: inside the player, and during history import.
 
 ONNX Runtime's built-in telemetry is explicitly disabled.
@@ -133,13 +154,14 @@ The installer is written to `src-tauri/target/release/bundle/`.
 
 1. **Pick or create a profile** on the "Who's watching?" screen. Kids profiles only see family-safe titles, hubs and recommendations.
 2. **Settings → My Subscriptions**: tick the services you pay for, then use **My Subscriptions** in the top bar to hide everything else.
-3. **Settings → Connect accounts & import**: for each service, click **Connect**, sign in inside Omnia's player and choose *your* profile, then click **Link this profile**. Your past history is imported automatically (Netflix, Prime Video and others), or you can drop in a CSV/JSON file.
+3. **Settings → Connect accounts & import**: for each service, click **Connect**, sign in inside Omnia's player and choose *your* profile. Omnia links it as soon as it sees you're signed in (if you were already signed in, confirm with **Link this profile**), then imports your past history. You can also drop in a CSV/JSON file, or clear one service's history.
 4. **Play something.** Open any title and click a service under *Where to watch*, or press Play.
 5. **Watch the pill** in the player's top-left corner:
    - 🟢 **green**: viewing is being recorded for your profile.
    - 🟠 **orange**: wrong or unlinked profile on the service; nothing is recorded. If unlinked, click **Link to *you*** in the pill.
    - ⚪ **grey**: verifying the profile or identifying the episode.
 6. Press **Ctrl+Shift+O** (or **Ctrl+Shift+H**), or click **← Omnia**, to save your position and return. Your progress appears under **Continue Watching** and **Watching Now**.
+7. **Build your library.** On any title page: **Love**, **Mark as Watched** (or the ✓ on each episode), and **Add to Collection**. Your lists live under **Collections** in the sidebar.
 
 ---
 
@@ -154,13 +176,13 @@ The installer is written to `src-tauri/target/release/bundle/`.
 │  │ TMDB client            │◄──────────┤ + injected telemetry  │  │
 │  │ Liquid Glass UI        │           │   observer + pill     │  │
 │  └──────────┬─────────────┘           └──────────┬────────────┘  │
-│             │ typed IPC (44 commands)            │ 4 token-gated │
+│             │ typed IPC (75 commands)            │ 5 token-gated │
 │  ┌──────────▼────────────────────────────────────▼────────────┐  │
 │  │ Rust backend                                               │  │
 │  │  db/        SQLite (rusqlite, WAL)                         │  │
 │  │  resolver/  JustWatch deep links + 7-day cache             │  │
 │  │  player/    window manager, profile attribution, hotkeys   │  │
-│  │  sync/      cookie-based / in-page history importer        │  │
+│  │  sync/      in-page history importer, airing-show checks   │  │
 │  │  ml/        ONNX embeddings, affinity, centroids, MMR      │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
@@ -175,18 +197,25 @@ The installer is written to `src-tauri/target/release/bundle/`.
 
 ### Security
 - Third-party pages run inside player windows, so all backend commands are **denied by default**. The catalog window is granted its commands explicitly (`src-tauri/permissions/omnia.toml`).
-- Player and importer windows can reach **only four commands**, and only from a list of known streaming domains (`src-tauri/capabilities/player.json`).
+- Player and importer windows can reach **only five commands**, and only from a list of known streaming domains (`src-tauri/capabilities/player.json`).
 - Every call from the injected script must carry a random secret generated per session.
 - Player windows block non-HTTPS navigation.
 
 ### Recommendations
 1. **Signals.** Per profile: completion, partial progress, binge sessions, abandonment, rewatches, forward-seeking, hours watched, watchlist, and time of day.
-2. **Affinity weight per title.** Completed **+1.0**, rewatched (Comfort Favorite) **+2.0**, binge **×1.8**, abandoned **−0.8**, plus smaller terms. Weights fade with a 120-day half-life, so your taste profile keeps up with you.
+2. **Affinity weight per title.** Completed **+1.0**, rewatched (Comfort Favorite) **+2.0**, loved **+3.0**, binge **×1.8**, abandoned **−0.8**, plus smaller terms. Weights fade with a 120-day half-life, so your taste profile keeps up with you; loved and rewatched titles fade much less.
 3. **Taste profile.** A weighted average of the vectors of titles you liked; disliked titles push it away. There is one per time of day, and "what to watch now" blends in the current one.
 4. **Candidates.** TMDB titles filtered by region, subscriptions and kids safety, plus genre-targeted, trending and "similar to your favourites" results. Anything you've already watched or saved is excluded.
 5. **Ranking.** Cosine similarity, then **MMR** (maximal marginal relevance) to keep each row varied, assembled into the explained rows shown on Home.
 
 The embedding model is `all-MiniLM-L6-v2` (uint8-quantised), with a built-in tokenizer that matches the model's own exactly. ONNX Runtime is **loaded at runtime rather than linked** into the app, so a missing or broken runtime can never stop Omnia from starting. If the model isn't available, a fixed hashing-based fallback is used.
+
+### History import
+- Imports run in a hidden window that uses the profile's own browser data, so the service only ever sees its normal website. The importer verifies the active service profile before reading anything, and aborts instead of mixing histories.
+- **Netflix** pages through the whole viewing-activity list (it can take a few minutes for years of history). Dates are read in the page's own format (day/month in India, month/day in the US).
+- Season names like *Stranger Things 4* and episode titles like *Chapter One: …* are matched to TMDB seasons and episodes. An episode that can't be placed is kept under its season rather than dropped.
+- Other services: the page's embedded app state and the JSON its app downloads are searched for "Continue Watching" / history sections, falling back to the rendered page. JioHotstar also tries **My Space**.
+- Diagnostics go to the local log as counts, page paths and HTTP statuses only, never titles.
 
 ### Local data
 
@@ -195,8 +224,9 @@ The embedding model is `all-MiniLM-L6-v2` (uint8-quantised), with a built-in tok
 | Database | `%APPDATA%\app.omnia.hub\omnia.db` |
 | Models & ONNX Runtime | `%APPDATA%\app.omnia.hub\models\` |
 | Logs | `%LOCALAPPDATA%\app.omnia.hub\logs\` |
+| Per-profile browser data (service sign-ins) | `%LOCALAPPDATA%\app.omnia.hub\Profiles\<profile id>\` |
 
-Schema: 11 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subscribed_providers`, `media_catalog`, `deep_links`, `watch_history`, `playback_events`, `media_embeddings`, `custom_hubs`, `watchlist`), all applied by the versioned migrations in `src-tauri/src/db/schema.sql`.
+Schema: 17 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subscribed_providers`, `media_catalog`, `deep_links`, `watch_history`, `playback_events`, `media_embeddings`, `custom_hubs`, `watchlist`, `preferred_providers`, `continue_watching_hidden`, `favorites`, `collections`, `collection_items`, `airing_checks`). They're created by `src-tauri/src/db/schema.sql` and the numbered migrations in `src-tauri/src/db/migrations/`, which run automatically on startup.
 
 ---
 
@@ -208,11 +238,11 @@ Schema: 11 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subs
 │   ├── components/
 │   │   ├── layout/               LiquidSidebar, TopFilterBar, AmbientBackground
 │   │   ├── home/                 HeroBillboard, ContinueWatchingRow, BrandHubsRow, MediaCarouselRow
-│   │   ├── modals/               MediaDetailModal, AccountSyncModal
+│   │   ├── modals/               MediaDetailModal, AccountSyncModal, OttPickerModal
 │   │   ├── settings/             SettingsView
 │   │   ├── profile/              ProfileGate ("Who's watching?")
-│   │   ├── views/                Home, Search, Watching Now, My OTTs, Hubs, Watchlist
-│   │   └── common/               cards (3D specular hover), grid, toasts, icons, avatars
+│   │   ├── views/                Home, Search, Watching Now, My OTTs, Hubs, Watchlist, Collections
+│   │   └── common/               cards (3D specular hover), grid, toasts, icons, avatars, library actions
 │   ├── config/hubsRegistry.ts    franchise / studio / originals hub definitions
 │   ├── lib/                      colour extraction, provider families, hooks, formatting
 │   ├── services/                 tauriBridge (typed IPC), tmdbClient, catalog helpers
@@ -227,7 +257,7 @@ Schema: 11 tables (`app_profiles`, `ott_profile_mappings`, `app_settings`, `subs
         ├── db/                   connection, migrations, queries
         ├── resolver/justwatch.rs deep-link resolver
         ├── player/               window_manager.rs, telemetry_injector.js
-        ├── sync/history_importer.rs
+        ├── sync/                 history_importer.rs, airing.rs
         └── ml/                   embeddings.rs, recommender.rs
 ```
 
@@ -278,7 +308,9 @@ hub("a24", "A24", "studio", {
 | Recommendations say *offline fallback* | Check the logs for `ONNX embeddings unavailable…`. The first-run download may have failed; it retries on next launch. |
 | The pill stays orange | The service is on a different or unlinked profile. Switch profiles inside the service, or click **Link to *you*** in the pill. |
 | Nothing is tracked in the player | Open the player's DevTools (right-click → Inspect) and run `window.__omniaTelemetry` (should be `true`). Then run `window.__TAURI_INTERNALS__.invoke('sync_playback_telemetry',{payload:{token:'x',kind:'progress'}}).catch(console.log)`. **"unauthorized player session"** is correct. **"not allowed by ACL"** means the site's domain is missing from `capabilities/player.json`. |
-| Netflix import fails | The log says whether Netflix's API worked (`Netflix history read via …`) or the in-page fallback ran. Profile errors abort the import on purpose, so histories never mix. |
+| Netflix import fails | The log line `Netflix history read: …` shows which source worked (Netflix's API, captured requests, or the rendered page). Profile errors abort the import on purpose, so histories never mix. |
+| Another service imports nothing | Look for `<service> history read: N entries (page: …, trays found: …, json responses: …)` in the log. It shows where the hidden window ended up (e.g. a sign-in page) and what data it saw. |
+| Old imports show "Just now" or are missing shows | They predate the date and season fixes. Clear that service's history in Connect Accounts and import again. |
 | A hotkey doesn't work | Another app may own it (check the logs for `could not register global shortcut`). The other hotkey and the pill still work. |
 
 **After upgrading:** Netflix links made before the `guid::name` identity format are removed on first launch (`removed a legacy Netflix link…` in the logs). Re-link Netflix once per Omnia profile.
