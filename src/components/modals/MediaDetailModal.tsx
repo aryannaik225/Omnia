@@ -183,18 +183,18 @@ function Episodes({
   if (!d.seasons.length) return null;
   return (
     <section>
-      <div className="mb-4 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <h2 className="section-title">Episodes</h2>
+      <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-col max-md:items-stretch max-md:gap-3">
+        <div className="flex shrink-0 items-center gap-3 max-md:justify-between">
+          <h2 className="section-title whitespace-nowrap">Episodes</h2>
           {episodes.data && !seasonDone && (
-            <button className="glass-button !px-3.5 !py-1.5 text-[13px]" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode at once">
+            <button className="glass-button shrink-0 whitespace-nowrap !px-3.5 !py-1.5 text-[13px] leading-none max-md:!px-3 max-md:text-[12px]" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode at once">
               <CheckIcon size={14} /> {markingSeason ? "Marking…" : "Mark Season as Watched"}
             </button>
           )}
         </div>
-        <div className="flex gap-2 overflow-x-auto scrollbar-none">
+        <div className="flex min-w-0 gap-2 overflow-x-auto scrollbar-none">
           {d.seasons.map((s) => (
-            <button key={s.seasonNumber} className="chip" data-active={s.seasonNumber === seasonNo} onClick={() => setSeasonNo(s.seasonNumber)}>
+            <button key={s.seasonNumber} className="chip shrink-0 whitespace-nowrap" data-active={s.seasonNumber === seasonNo} onClick={() => setSeasonNo(s.seasonNumber)}>
               {s.name}
             </button>
           ))}

@@ -429,7 +429,7 @@ export function SettingsView() {
   const loadDev = useDevMode((s) => s.load);
   useEffect(() => void loadDev(), [loadDev]);
   return (
-    <div className="flex w-full min-w-0 max-w-[980px] flex-col gap-6 pb-16">
+    <div className="mx-auto flex w-full min-w-0 max-w-[980px] flex-col gap-6 pb-16">
       <PageHeader title="Settings" subtitle={isRemote ? "Your data stays on your PC; this device reads it over your Wi-Fi." : "Everything stays on this device."} />
       <ProfileSection />
       <RegionSection />
