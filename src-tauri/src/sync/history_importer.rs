@@ -463,14 +463,21 @@ async fn scrape_netflix_in_page(app: &AppHandle, mapping: &OttProfileMapping, pr
         since_ms,
     )
     .await?;
+    // Logged before the profile check, so a refused read still shows where the window ended up.
+    if let Some(notes) = payload.notes.as_deref() {
+        log::info!("Netflix history read: {} entries ({notes})", payload.items.len());
+    }
     // Netflix exposes the active profile reliably, so verification is mandatory here.
     match payload.ott_profile.as_ref().map(|p| p.id.as_str()) {
         Some(id) if id == mapping.ott_native_profile_id || netflix_identity_matches(&mapping.ott_native_profile_id, wm::netflix_guid(id), id.split_once("::").map(|(_, n)| n)) => {}
         Some(_) => return Err(msg("Netflix is on a different profile than the linked one; import aborted to keep profiles separate.")),
-        None => return Err(msg("Couldn't verify the active Netflix profile; import aborted to keep profiles separate.")),
-    }
-    if let Some(notes) = payload.notes.as_deref() {
-        log::info!("Netflix history read: {} entries ({notes})", payload.items.len());
+        // Usually signed out (the script says so): report that, not a profile mismatch.
+        None => {
+            return Err(msg(match payload.error.as_deref() {
+                Some(e) if !e.trim().is_empty() => format!("{e} (active Netflix profile not verified; nothing imported)"),
+                _ => "Couldn't verify the active Netflix profile; import aborted to keep profiles separate.".to_string(),
+            }))
+        }
     }
     if payload.items.is_empty() {
         return Err(msg(payload.error.unwrap_or_else(|| "No Netflix history was found.".into())));
@@ -493,6 +500,14 @@ fn verify_scraped_profile(mapped_id: &str, observed: Option<&str>, mappings_for_
     }
 }
 
+/// Attempts to open a hidden window while the profile's browser data is busy.
+const WEBVIEW_BUSY_RETRIES: u32 = 4;
+
+/// WebView2's ERROR_BUSY (0x800700AA): the user data folder is still held by a closing browser.
+fn is_webview_busy(err: &str) -> bool {
+    err.contains("0x800700AA") || err.to_ascii_lowercase().contains("resource is in use")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn scrape_with_hidden_window(
     app: &AppHandle,
@@ -508,14 +523,7 @@ async fn scrape_with_hidden_window(
 ) -> AppResult<ScrapePayload> {
     let state = app.state::<AppState>();
     let parsed = tauri::Url::parse(url).map_err(|e| msg(e.to_string()))?;
-    let label = wm::next_window_label(IMPORTER_LABEL_PREFIX);
     let token = wm::random_token();
-    let (tx, rx) = oneshot::channel();
-    state.importer.pending().insert(
-        label.clone(),
-        PendingScrape { token: token.clone(), tx, app_profile_id, provider_name: provider_name.to_string(), quiet: since_ms.is_some() },
-    );
-
     let config = json!({
         "token": token,
         "mode": "import",
@@ -534,11 +542,28 @@ async fn scrape_with_hidden_window(
         // Delta sync: stop reading at activity older than this (epoch ms).
         "sinceMs": since_ms,
     });
-    let window = match wm::build_ott_window(app, &label, parsed, "Omnia — importing history", wm::build_injection(&config), false, app_profile_id) {
-        Ok(w) => w,
-        Err(e) => {
-            state.importer.pending().remove(&label);
-            return Err(e);
+    // The profile's previous hidden window (another provider, moments ago) may still be shutting
+    // its browser process down; WebView2 then refuses the shared data folder with ERROR_BUSY
+    // ("The requested resource is in use"). Wait for it and try again.
+    let mut attempt = 0u32;
+    let (label, window, rx) = loop {
+        let label = wm::next_window_label(IMPORTER_LABEL_PREFIX);
+        let (tx, rx) = oneshot::channel();
+        state.importer.pending().insert(
+            label.clone(),
+            PendingScrape { token: token.clone(), tx, app_profile_id, provider_name: provider_name.to_string(), quiet: since_ms.is_some() },
+        );
+        match wm::build_ott_window(app, &label, parsed.clone(), "Omnia — importing history", wm::build_injection(&config), false, app_profile_id) {
+            Ok(w) => break (label, w, rx),
+            Err(e) => {
+                state.importer.pending().remove(&label);
+                attempt += 1;
+                if attempt >= WEBVIEW_BUSY_RETRIES || !is_webview_busy(&e.to_string()) {
+                    return Err(e);
+                }
+                log::info!("{provider_name}: browser data still in use, retrying in {}s", attempt * 2);
+                tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 2)).await;
+            }
         }
     };
     let outcome = tokio::time::timeout(timeout, rx).await;
@@ -556,7 +581,7 @@ async fn scrape_with_hidden_window(
 fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) -> Vec<RawItem> {
     items
         .into_iter()
-        .filter(|i| !i.title.trim().is_empty())
+        .filter(|i| !i.title.trim().is_empty() && !is_marker_only(&i.title))
         .map(|i| {
             let ratio = i.progress_ratio.filter(|r| r.is_finite()).map(|r| r.clamp(0.0, 1.0));
             let has_seconds = i.progress_seconds.is_some_and(|p| p.is_finite()) && i.duration_seconds.is_some_and(|d| d > 1.0);
@@ -606,10 +631,34 @@ fn scraped_to_raw(items: Vec<ScrapedItem>, history_page: bool, netflix: bool) ->
         .collect()
 }
 
+/// A "title" that is only a season / episode label ("S1", "S2 E4", "Season 1", "Episode 3"):
+/// a tile's subtitle read as its title. Searching TMDB for it matches unrelated shows.
+fn is_marker_only(title: &str) -> bool {
+    fn se_token(t: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+        match t.strip_prefix('s') {
+            Some(rest) => match rest.split_once('e') {
+                Some((s, e)) => digits(s) && digits(e),
+                None => digits(rest),
+            },
+            None => t.strip_prefix('e').is_some_and(digits) || t.strip_prefix("ep").is_some_and(digits),
+        }
+    }
+    let tokens: Vec<String> = title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let marker = |t: &String| se_token(t) || matches!(t.as_str(), "season" | "episode" | "ep");
+    // Plain numbers alone are real titles ("1917", "24").
+    tokens.iter().any(marker) && tokens.iter().all(|t| marker(t) || t.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Mode-specific clean-up before matching.
 ///
 /// * Delta: entries dated before the window (minus the overlap) are dropped; undated entries
-///   (Continue Watching tiles) are kept: the store only treats them as new when progress moved.
+///   (Continue Watching tiles) are kept only with progress: the store treats them as new when
+///   it moved.
 /// * Full import: undated entries get an order hint (just below the entry above them) that is
 ///   only used when their row is created, so the history keeps the provider's order and a
 ///   re-import never overwrites a stored date.
@@ -617,7 +666,12 @@ fn prepare_raw(mut raw: Vec<RawItem>, mode: ImportMode) -> Vec<RawItem> {
     match mode {
         ImportMode::Delta { since } => {
             let cutoff = since - chrono::Duration::hours(DELTA_OVERLAP_HOURS);
-            raw.retain(|i| i.watched_at.is_none_or(|d| d >= cutoff));
+            raw.retain(|i| match i.watched_at {
+                Some(d) => d >= cutoff,
+                // No date and no progress says nothing about new activity: a missing progress
+                // would read as 0 and look like "progress moved", stamping the title now.
+                None => i.progress_seconds.is_some() || i.progress_ratio.is_some() || i.assume_completed,
+            });
         }
         ImportMode::Full => {
             // Sources list activity newest first. An undated entry sits just below the entry
@@ -2069,10 +2123,37 @@ mod tests {
         assert!(out.iter().filter(|i| i.order_hint.is_some()).all(|i| i.watched_at.is_none()));
         assert!(out[0].order_hint > out[1].order_hint);
         assert_eq!(out[3].order_hint, at("2025-11-10T11:59:59Z"));
-        // Delta: entries older than the window are dropped, undated tiles are kept.
+        // Delta: entries older than the window are dropped, undated tiles with progress are kept.
         let since = at("2025-11-12T00:00:00Z").unwrap();
-        let kept = prepare_raw(vec![item(at("2025-11-01T12:00:00Z")), item(at("2025-11-11T12:00:00Z")), item(None)], ImportMode::Delta { since });
+        let tile = RawItem { progress_ratio: Some(0.5), ..item(None) };
+        let kept = prepare_raw(vec![item(at("2025-11-01T12:00:00Z")), item(at("2025-11-11T12:00:00Z")), tile], ImportMode::Delta { since });
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn webview_busy_errors_are_recognised() {
+        assert!(is_webview_busy(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x800700AA), message: "The requested resource is in use." })"#));
+        assert!(!is_webview_busy("Timed out reading Netflix history."));
+    }
+
+    #[test]
+    fn season_episode_labels_are_not_titles() {
+        for t in ["S1", "S2 E4", "s01e02", "Season 1", "Episode 3", "E12", "S1 · E2"] {
+            assert!(is_marker_only(t), "{t}");
+        }
+        for t in ["1917", "24", "Silicon Valley", "Season of the Witch", "Se7en", "Episodes", "S.W.A.T."] {
+            assert!(!is_marker_only(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn delta_drops_undated_entries_without_progress() {
+        let since = Utc::now() - chrono::Duration::hours(8);
+        let undated = RawItem { title: "x".into(), ..Default::default() };
+        let with_progress = RawItem { title: "y".into(), progress_ratio: Some(0.4), ..Default::default() };
+        let kept = prepare_raw(vec![undated, with_progress], ImportMode::Delta { since });
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].title, "y");
     }
 
     #[test]

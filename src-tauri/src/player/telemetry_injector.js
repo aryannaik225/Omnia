@@ -1619,8 +1619,9 @@
       try { keys = Object.keys(n); } catch (_) { return; }
       for (var i = 0; i < keys.length && i < 60 && !found; i++) {
         var c = n[keys[i]];
-        // Not into lists or release / air-date metadata.
-        if (c && typeof c === "object" && !Array.isArray(c) && !/release|air|premiere|publish|expir|avail|start|end|schedule/i.test(keys[i])) walk(c, depth + 1);
+        // Not into lists, release / air-date metadata, or analytics blocks (their "ts" is the
+        // time the response was built, not a watch date).
+        if (c && typeof c === "object" && !Array.isArray(c) && !/release|air|premiere|publish|expir|avail|start|end|schedule|track|analytic|instrumentation|metric|event/i.test(keys[i])) walk(c, depth + 1);
       }
     })(obj, 0);
     return found;
