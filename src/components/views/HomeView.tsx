@@ -92,6 +92,19 @@ function RecommendationRows() {
   );
 }
 
+/** "Your List": the watchlist, most recently added first (the backend orders by `added_at`). */
+function YourListRow() {
+  const list = useAppStore((s) => s.watchlist);
+  const items = useMemo(
+    () =>
+      list.map(
+        (i): CarouselItem => ({ id: i.tmdbId, mediaType: i.mediaType, title: i.title ?? "Untitled", posterPath: i.posterPath, year: i.releaseYear, rating: i.voteAverage }),
+      ),
+    [list],
+  );
+  return <MediaCarouselRow title="Your List" subtitle="Saved with + Up Next, newest first" items={items} />;
+}
+
 /** Profiles whose airing shows were checked this session (Rust also throttles per series). */
 const airingChecked = new Set<number>();
 
@@ -192,6 +205,7 @@ export function HomeView() {
       <HeroBillboard items={heroItems} />
       <div className="relative z-10 -mt-16 flex flex-col gap-11 pb-16 pr-8" style={{ paddingLeft: "var(--content-left)" }}>
         <ContinueWatchingRow />
+        <YourListRow />
         <BrandHubsRow />
         <RecommendationRows />
         <LazyTmdbRow

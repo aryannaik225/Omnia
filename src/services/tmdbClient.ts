@@ -281,6 +281,8 @@ export interface MediaDetails extends MediaSummary {
   spokenLanguages: string[];
   videos: VideoInfo[];
   similar: MediaSummary[];
+  /** TMDB recommendations, then similar titles (deduplicated). Watched titles are included. */
+  recommendations: MediaSummary[];
   seasons: SeasonSummary[];
   numberOfSeasons: number | null;
   imdbId: string | null;
@@ -332,8 +334,8 @@ function pickCertification(raw: any, mt: MediaType, region: string): string | nu
 export async function details(mt: MediaType, id: number, region: string): Promise<MediaDetails> {
   const append =
     mt === "movie"
-      ? "videos,credits,keywords,similar,release_dates,external_ids,watch/providers"
-      : "videos,aggregate_credits,credits,keywords,similar,content_ratings,external_ids,watch/providers";
+      ? "videos,credits,keywords,recommendations,similar,release_dates,external_ids,watch/providers"
+      : "videos,aggregate_credits,credits,keywords,recommendations,similar,content_ratings,external_ids,watch/providers";
   const raw = await request<any>(`/${mt}/${id}`, { append_to_response: append });
   const base = toSummary({ ...raw, media_type: mt }, mt)!;
   const castSource: any[] = mt === "tv" ? raw.aggregate_credits?.cast ?? raw.credits?.cast ?? [] : raw.credits?.cast ?? [];
@@ -343,6 +345,7 @@ export async function details(mt: MediaType, id: number, region: string): Promis
     character: c.character ?? c.roles?.[0]?.character ?? "",
     profilePath: c.profile_path ?? null,
   }));
+  const similar = (raw.similar?.results ?? []).map((r: RawListItem) => toSummary(r, mt)).filter(Boolean) as MediaSummary[];
   const keywords: string[] = (raw.keywords?.keywords ?? raw.keywords?.results ?? []).map((k: any) => k.name);
   const videos: VideoInfo[] = (raw.videos?.results ?? [])
     .filter((v: any) => v.site === "YouTube")
@@ -362,7 +365,17 @@ export async function details(mt: MediaType, id: number, region: string): Promis
     certification: pickCertification(raw, mt, region),
     spokenLanguages: (raw.spoken_languages ?? []).map((l: any) => l.english_name || l.name).filter(Boolean),
     videos,
-    similar: (raw.similar?.results ?? []).map((r: RawListItem) => toSummary(r, mt)).filter(Boolean) as MediaSummary[],
+    similar,
+    recommendations: (() => {
+      const recs = (raw.recommendations?.results ?? []).map((r: RawListItem) => toSummary(r, mt)).filter(Boolean) as MediaSummary[];
+      const seen = new Set<string>([`${mt}-${id}`]);
+      return [...recs, ...similar].filter((m) => {
+        const k = `${m.mediaType}-${m.id}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    })(),
     seasons: (raw.seasons ?? [])
       .filter((s: any) => s.season_number > 0 || (raw.seasons ?? []).length === 1)
       .map((s: any) => ({

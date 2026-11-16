@@ -157,14 +157,16 @@ function Episodes({
     if (!todo.length) return;
     setMarkingSeason(true);
     try {
-      for (const ep of todo) {
-        await history.markWatched(profile.profileId, d.id, "tv", {
+      await history.markEpisodesWatched(
+        profile.profileId,
+        d.id,
+        todo.map((ep) => ({
           seasonNumber: ep.seasonNumber,
           episodeNumber: ep.episodeNumber,
           episodeTitle: ep.name,
           durationSeconds: ep.runtimeMins ? ep.runtimeMins * 60 : null,
-        });
-      }
+        })),
+      );
       toast({ kind: "success", title: "Season marked as watched", body: `${todo.length} episode${todo.length > 1 ? "s" : ""} of ${d.title}` });
       onChanged();
       void refreshContinueWatching();
@@ -184,8 +186,8 @@ function Episodes({
         <div className="flex items-center gap-3">
           <h2 className="section-title">Episodes</h2>
           {episodes.data && !seasonDone && (
-            <button className="chip" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode">
-              {markingSeason ? "Marking…" : "Mark season watched"}
+            <button className="glass-button !px-3.5 !py-1.5 text-[13px]" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode at once">
+              <CheckIcon size={14} /> {markingSeason ? "Marking…" : "Mark Season as Watched"}
             </button>
           )}
         </div>
@@ -428,7 +430,8 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
           </section>
         )}
 
-        {d && d.similar.length > 0 && <MediaCarouselRow title="More like this" items={d.similar.filter((x) => x.posterPath).map(fromSummary)} />}
+        {/* Everything TMDB relates to this title, watched or not. */}
+        {d && d.recommendations.length > 0 && <MediaCarouselRow title="Recommendations" items={d.recommendations.filter((x) => x.posterPath).map(fromSummary)} />}
       </div>
     </div>
   );

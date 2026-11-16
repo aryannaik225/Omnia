@@ -109,7 +109,9 @@ export function ProfileGate() {
             onClick={() => (managing ? setEditing(p) : void selectProfile(p))}
             className="group flex w-[150px] flex-col items-center gap-4 outline-none"
           >
-            <span className="relative">
+            {/* A block box exactly the avatar's size: an inline wrapper also holds the line's
+                descender space, which left a gap between the avatar and its hover ring. */}
+            <span className="relative block h-[140px] w-[140px] leading-none">
               <Avatar name={p.profileName} avatar={p.avatarAsset ?? defaultAvatarFor(p.profileId)} size={140} kids={p.isKidsProfile} />
               {managing && (
                 <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/45">

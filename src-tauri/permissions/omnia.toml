@@ -50,6 +50,7 @@ permissions = [
   "allow-clear-provider-history",
   "allow-mark-watched",
   "allow-unmark-watched",
+  "allow-mark-episodes-watched",
   "allow-set-favorite",
   "allow-is-favorite",
   "allow-get-favorites",

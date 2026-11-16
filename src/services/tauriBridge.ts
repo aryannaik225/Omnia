@@ -466,6 +466,12 @@ export const history = {
       episodeTitle: opts.episodeTitle ?? null,
       durationSeconds: opts.durationSeconds ?? null,
     }),
+  /** "Mark season as watched": all listed episodes in one transaction (stamped in episode order). */
+  markEpisodesWatched: (
+    appProfileId: number,
+    tmdbId: number,
+    episodes: { seasonNumber: number; episodeNumber: number; episodeTitle?: string | null; durationSeconds?: number | null }[],
+  ) => invoke<number>("mark_episodes_watched", { appProfileId, tmdbId, episodes }),
   unmarkWatched: (appProfileId: number, tmdbId: number, mediaType: MediaType, seasonNumber = 0, episodeNumber = 0) =>
     invoke<boolean>("unmark_watched", { appProfileId, tmdbId, mediaType, seasonNumber, episodeNumber }),
   /** Caught-up airing series with a new episode come back to Continue Watching. */

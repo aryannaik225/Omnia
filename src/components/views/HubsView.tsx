@@ -1,8 +1,9 @@
 /** Franchises & Hubs: hub directory, and a hub feed with combinable multi-facet filters. */
 import { useState } from "react";
 import { HUB_CATEGORY_LABELS, hubRule, type HubCategory } from "../../config/hubsRegistry";
-import { DEFAULT_FACETS, loadHubPage, type HubFacets } from "../../services/catalog";
-import type { CatalogContext, MediaSummary } from "../../services/tmdbClient";
+import { useAsync } from "../../lib/hooks";
+import { DEFAULT_FACETS, hubArtwork, hubOrders, loadHubPage, loadOrderedHub, type HubFacets, type HubOrder } from "../../services/catalog";
+import { img, type CatalogContext, type MediaSummary } from "../../services/tmdbClient";
 import type { CustomHub } from "../../services/tauriBridge";
 import { useAppStore, useCatalogKey } from "../../store/useAppStore";
 import { ChevronLeftIcon } from "../common/Icons";
@@ -59,24 +60,57 @@ function HubDetail({ hub, onBack }: { hub: CustomHub; onBack: () => void }) {
   const ctx = useAppStore((s) => s.catalogContext)();
   const catalogKey = useCatalogKey();
   const kidsProfile = useAppStore((s) => s.isKids());
+  const region = useAppStore((s) => s.region);
+  const tmdbReady = useAppStore((s) => s.tmdbReady);
+  const orders = hubOrders(hub);
+  const [order, setOrder] = useState<HubOrder | null>(orders[0] ?? null);
   const [facets, setFacets] = useState<HubFacets>(DEFAULT_FACETS);
   const set = <K extends keyof HubFacets>(k: K, v: HubFacets[K]) => setFacets((f) => ({ ...f, [k]: v }));
-  const feedKey = `${hub.hubSlug}|${catalogKey}|${JSON.stringify(facets)}`;
+  const feedKey = `${hub.hubSlug}|${catalogKey}|${JSON.stringify(facets)}|${order ?? "popular"}`;
+  const art = useAsync(() => hubArtwork(hub, region), [hub.hubSlug, region], tmdbReady);
+  const hero = img(art.data?.backdropPath, "w1280");
+  const [heroLoaded, setHeroLoaded] = useState(false);
 
   return (
     <div className="pb-16">
       <div
-        className="relative mb-8 mt-8 overflow-hidden rounded-panel px-10 py-12"
+        className="relative mb-8 mt-8 flex min-h-[340px] flex-col justify-end overflow-hidden rounded-panel px-10 pb-10 pt-8"
         style={{ background: `linear-gradient(120deg, ${rule.theme.from} 0%, ${rule.theme.to} 100%)` }}
       >
-        <div className="pointer-events-none absolute -right-20 -top-24 h-72 w-72 rounded-full blur-3xl" style={{ background: `${rule.theme.accent}55` }} />
-        <button className="chip mb-6 !bg-black/30 !text-white" onClick={onBack}>
+        {hero && (
+          <img
+            src={hero}
+            alt=""
+            onLoad={() => setHeroLoaded(true)}
+            className={`absolute inset-0 h-full w-full object-cover object-[center_25%] transition-opacity duration-700 ${heroLoaded ? "opacity-100" : "opacity-0"}`}
+          />
+        )}
+        {/* Legibility: dark from the bottom-left where the title sits, theme tint over the art. */}
+        <div
+          className="pointer-events-none absolute inset-0"
+          style={{
+            background: `linear-gradient(0deg, ${rule.theme.from}f2 0%, ${rule.theme.from}99 35%, transparent 75%), linear-gradient(90deg, rgba(0,0,0,0.55) 0%, transparent 60%)`,
+          }}
+        />
+        <div className="pointer-events-none absolute -right-20 -top-24 h-72 w-72 rounded-full blur-3xl" style={{ background: `${rule.theme.accent}40` }} />
+        <button className="chip absolute left-10 top-8 !bg-black/40 !text-white backdrop-blur-md" onClick={onBack}>
           <ChevronLeftIcon size={14} /> All hubs
         </button>
-        <h1 className="text-[44px] font-bold tracking-tight" style={{ textShadow: `0 0 40px ${rule.theme.accent}55` }}>
-          {hub.displayName}
-        </h1>
-        {rule.tagline && <p className="mt-1 text-[17px] text-white/80">{rule.tagline}</p>}
+        <div className="relative">
+          <h1 className="text-[48px] font-bold tracking-tight drop-shadow-lg" style={{ textShadow: `0 0 40px ${rule.theme.accent}55` }}>
+            {hub.displayName}
+          </h1>
+          {rule.tagline && <p className="mt-1 text-[17px] text-white/85 drop-shadow">{rule.tagline}</p>}
+          {orders.length > 1 && order && (
+            <div className="mt-5 flex gap-2" role="radiogroup" aria-label="Order">
+              {orders.map((o) => (
+                <button key={o} role="radio" aria-checked={order === o} className="chip !bg-black/40 backdrop-blur-md" data-active={order === o} onClick={() => setOrder(o)}>
+                  {o === "release" ? "Release Order" : "Timeline Order"}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="glass-panel mb-8 flex flex-col gap-3 px-5 py-4">
@@ -96,7 +130,11 @@ function HubDetail({ hub, onBack }: { hub: CustomHub; onBack: () => void }) {
         {facets.runtime !== "any" && facets.mediaType !== "movie" && <p className="text-[12px] text-label-tertiary">Runtime filters apply to movies.</p>}
       </div>
 
-      <HubFeed hub={hub} ctx={ctx} facets={facets} feedKey={feedKey} />
+      {order ? (
+        <OrderedHubFeed hub={hub} ctx={ctx} facets={facets} order={order} feedKey={feedKey} />
+      ) : (
+        <HubFeed hub={hub} ctx={ctx} facets={facets} feedKey={feedKey} />
+      )}
     </div>
   );
 }
@@ -113,6 +151,18 @@ function HubFeed({ hub, ctx, facets, feedKey }: { hub: CustomHub; ctx: CatalogCo
         if (page === 1) setPinned({ key: feedKey, items: res.pinned });
         return res;
       }}
+      filter={(m) => !!m.posterPath}
+      emptyMessage="No titles match these filters in your region."
+    />
+  );
+}
+
+/** Franchise feed: every title at once, in release (or story) order. */
+function OrderedHubFeed({ hub, ctx, facets, order, feedKey }: { hub: CustomHub; ctx: CatalogContext; facets: HubFacets; order: HubOrder; feedKey: string }) {
+  return (
+    <MediaGrid
+      feedKey={feedKey}
+      loadPage={async () => ({ results: await loadOrderedHub(hub, ctx, facets, order), totalPages: 1 })}
       filter={(m) => !!m.posterPath}
       emptyMessage="No titles match these filters in your region."
     />

@@ -104,7 +104,7 @@ export function Avatar({ name, avatar, size = 96, kids = false }: { name: string
   const [a, b] = AVATAR_PALETTES[avatar ?? ""] ?? AVATAR_PALETTES.aurora!;
   return (
     <span
-      className="relative inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full font-semibold text-white"
+      className="relative inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full align-middle font-semibold leading-none text-white"
       style={{
         width: size,
         height: size,
@@ -114,7 +114,7 @@ export function Avatar({ name, avatar, size = 96, kids = false }: { name: string
       }}
     >
       {character ? (
-        <img src={character.src} alt="" draggable={false} className={`absolute inset-0 block h-full w-full ${photo ? (photo.startsWith("data:") ? "object-cover" : "object-cover object-[center_20%]") : ""}`} />
+        <img src={character.src} alt="" draggable={false} className={`absolute inset-0 block h-full w-full rounded-full object-cover ${photo && !photo.startsWith("data:") ? "object-[center_20%]" : ""}`} />
       ) : (
         <span className="drop-shadow">{name.trim().charAt(0).toUpperCase() || "?"}</span>
       )}

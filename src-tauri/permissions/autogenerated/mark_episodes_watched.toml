@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mark-episodes-watched"
+description = "Enables the mark_episodes_watched command without any pre-configured scope."
+commands.allow = ["mark_episodes_watched"]
+
+[[permission]]
+identifier = "deny-mark-episodes-watched"
+description = "Denies the mark_episodes_watched command without any pre-configured scope."
+commands.deny = ["mark_episodes_watched"]

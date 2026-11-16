@@ -14,6 +14,8 @@
  *                    (robust against id drift for long-lived franchise keywords).
  *   collections      TMDB movie collection ids whose parts are pinned in release order.
  *   kidsSafe         forces the kids-safe catalog filter for this hub.
+ *   order            "release": the whole hub is listed oldest release first (franchises).
+ *   timeline         "movie:<id>" / "tv:<id>" keys in story order: adds a Timeline Order toggle.
  */
 import type { CustomHub } from "../services/tauriBridge";
 
@@ -32,6 +34,8 @@ export interface HubRule {
   keywordQueries?: string[];
   collections?: number[];
   kidsSafe?: boolean;
+  order?: "release";
+  timeline?: string[];
   tagline: string;
   theme: HubTheme;
 }
@@ -42,6 +46,66 @@ export interface HubDefinition {
   category: HubCategory;
   rule: HubRule;
 }
+
+/**
+ * MCU story (chronological) order, after Marvel's own Disney+ timeline. TMDB keys; titles the
+ * hub lists that aren't here follow in release order.
+ */
+const MCU_TIMELINE = [
+  "movie:1771", // Captain America: The First Avenger
+  "movie:299537", // Captain Marvel
+  "movie:1726", // Iron Man
+  "movie:10138", // Iron Man 2
+  "movie:1724", // The Incredible Hulk
+  "movie:10195", // Thor
+  "movie:24428", // The Avengers
+  "movie:76338", // Thor: The Dark World
+  "movie:68721", // Iron Man 3
+  "movie:100402", // Captain America: The Winter Soldier
+  "movie:118340", // Guardians of the Galaxy
+  "movie:283995", // Guardians of the Galaxy Vol. 2
+  "movie:99861", // Avengers: Age of Ultron
+  "movie:102899", // Ant-Man
+  "movie:271110", // Captain America: Civil War
+  "movie:497698", // Black Widow
+  "movie:284054", // Black Panther
+  "movie:315635", // Spider-Man: Homecoming
+  "movie:284052", // Doctor Strange
+  "movie:284053", // Thor: Ragnarok
+  "movie:363088", // Ant-Man and the Wasp
+  "movie:299536", // Avengers: Infinity War
+  "movie:299534", // Avengers: Endgame
+  "tv:84958", // Loki
+  "tv:91363", // What If...?
+  "tv:85271", // WandaVision
+  "tv:88396", // The Falcon and the Winter Soldier
+  "movie:566525", // Shang-Chi and the Legend of the Ten Rings
+  "movie:524434", // Eternals
+  "movie:429617", // Spider-Man: Far From Home
+  "movie:634649", // Spider-Man: No Way Home
+  "movie:453395", // Doctor Strange in the Multiverse of Madness
+  "tv:88329", // Hawkeye
+  "tv:92749", // Moon Knight
+  "movie:505642", // Black Panther: Wakanda Forever
+  "tv:122226", // Echo
+  "tv:92783", // She-Hulk: Attorney at Law
+  "tv:92782", // Ms. Marvel
+  "movie:616037", // Thor: Love and Thunder
+  "movie:894205", // Werewolf by Night
+  "movie:774752", // The Guardians of the Galaxy Holiday Special
+  "movie:640146", // Ant-Man and the Wasp: Quantumania
+  "movie:447365", // Guardians of the Galaxy Vol. 3
+  "tv:114472", // Secret Invasion
+  "movie:609681", // The Marvels
+  "tv:138501", // Agatha All Along
+  "movie:822119", // Captain America: Brave New World
+  "movie:986056", // Thunderbolts*
+  "tv:202555", // Daredevil: Born Again
+  "tv:114471", // Ironheart
+  "tv:198178", // Wonder Man
+  "movie:533535", // Deadpool & Wolverine
+  "movie:617126", // The Fantastic 4: First Steps
+];
 
 const hub = (slug: string, displayName: string, category: HubCategory, rule: HubRule): HubDefinition => ({
   slug,
@@ -55,12 +119,15 @@ export const HUB_REGISTRY: HubDefinition[] = [
   hub("marvel", "Marvel", "franchise", {
     movie: { with_companies: "420|7505|19551" },
     tv: { with_companies: "420|7505|19551" },
+    order: "release",
     tagline: "The MCU and the Marvel legacy",
     theme: { from: "#7a0b0b", to: "#e62429", accent: "#ff6b6b" },
   }),
   hub("mcu", "Marvel Cinematic Universe", "franchise", {
     movie: { with_keywords: "180547" },
     tv: { with_keywords: "180547" },
+    timeline: MCU_TIMELINE,
+    order: "release",
     tagline: "Every phase, in one place",
     theme: { from: "#3a0a0a", to: "#b3121c", accent: "#ffcc4d" },
   }),
@@ -68,6 +135,7 @@ export const HUB_REGISTRY: HubDefinition[] = [
     movie: { with_companies: "9993|128064|429" },
     tv: { with_companies: "9993|128064|429" },
     keywordQueries: [],
+    order: "release",
     tagline: "DCU, Elseworlds & the Justice League",
     theme: { from: "#04163d", to: "#0476f2", accent: "#7cc4ff" },
   }),
@@ -76,6 +144,7 @@ export const HUB_REGISTRY: HubDefinition[] = [
     tv: {},
     keywordQueries: ["star wars"],
     collections: [10],
+    order: "release",
     tagline: "A galaxy far, far away",
     theme: { from: "#000000", to: "#1c1c1c", accent: "#ffe81f" },
   }),
@@ -84,11 +153,13 @@ export const HUB_REGISTRY: HubDefinition[] = [
     tv: {},
     keywordQueries: ["wizarding world"],
     collections: [1241, 435259],
+    order: "release",
     tagline: "Harry Potter & Fantastic Beasts",
     theme: { from: "#1a1030", to: "#5b3a8c", accent: "#d4af37" },
   }),
   hub("fast-furious", "Fast & Furious", "franchise", {
     collections: [9485],
+    order: "release",
     tagline: "It's all about family",
     theme: { from: "#1b1b1b", to: "#c2410c", accent: "#fb923c" },
   }),
@@ -96,6 +167,7 @@ export const HUB_REGISTRY: HubDefinition[] = [
     movie: {},
     tv: {},
     keywordQueries: ["monsterverse"],
+    order: "release",
     tagline: "Godzilla, Kong & the Titans",
     theme: { from: "#04201b", to: "#0f766e", accent: "#5eead4" },
   }),
@@ -103,13 +175,37 @@ export const HUB_REGISTRY: HubDefinition[] = [
     tv: {},
     keywordQueries: ["middle-earth"],
     collections: [119, 121938],
+    order: "release",
     tagline: "The Lord of the Rings & The Hobbit",
     theme: { from: "#1f1405", to: "#7c5a1a", accent: "#e9c46a" },
   }),
   hub("james-bond", "James Bond", "franchise", {
     collections: [645],
+    order: "release",
     tagline: "Licensed to thrill",
     theme: { from: "#0b0b0b", to: "#3f3f46", accent: "#e5e7eb" },
+  }),
+  hub("mission-impossible", "Mission: Impossible", "franchise", {
+    collections: [87359],
+    order: "release",
+    tagline: "Should you choose to accept it",
+    theme: { from: "#0b0f19", to: "#7f1d1d", accent: "#fca5a5" },
+  }),
+  hub("conjuring", "The Conjuring Universe", "franchise", {
+    // The Conjuring, Annabelle and The Nun films.
+    collections: [313086, 402074, 968052],
+    order: "release",
+    tagline: "From the case files of Ed & Lorraine Warren",
+    theme: { from: "#050505", to: "#3b2f2f", accent: "#d6c7a1" },
+  }),
+  hub("pokemon", "Pokémon", "franchise", {
+    movie: { with_companies: "12654" },
+    tv: { with_companies: "12654" },
+    // Pokémon movie collections: original, Advanced Generation, Best Wishes!, XY, alternate continuity.
+    collections: [34055, 661025, 661028, 661029, 661031],
+    order: "release",
+    tagline: "Gotta catch 'em all",
+    theme: { from: "#1e3a8a", to: "#dc2626", accent: "#facc15" },
   }),
   hub("anime", "Anime Hub", "franchise", {
     movie: { with_genres: "16", with_original_language: "ja" },
@@ -222,6 +318,8 @@ export function hubRule(h: CustomHub): HubRule {
     keywordQueries: raw.keywordQueries ?? [],
     collections: raw.collections ?? [],
     kidsSafe: raw.kidsSafe ?? false,
+    order: raw.order === "release" ? "release" : undefined,
+    timeline: Array.isArray(raw.timeline) ? raw.timeline.filter((k): k is string => typeof k === "string") : undefined,
     tagline: raw.tagline ?? "",
     theme: { ...DEFAULT_THEME, ...(raw.theme ?? {}) },
   };

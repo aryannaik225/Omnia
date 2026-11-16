@@ -28,23 +28,105 @@ export function PageHeader({ title, subtitle, actions }: { title: string; subtit
 
 // ---------------------------------------------------------------------------------------------
 
+/** Browsable genres; TMDB uses different ids for movies and series (null = no series genre). */
+const GENRES: { key: string; label: string; movie: number | null; tv: number | null }[] = [
+  { key: "action", label: "Action", movie: 28, tv: 10759 },
+  { key: "adventure", label: "Adventure", movie: 12, tv: 10759 },
+  { key: "animation", label: "Animation", movie: 16, tv: 16 },
+  { key: "comedy", label: "Comedy", movie: 35, tv: 35 },
+  { key: "crime", label: "Crime", movie: 80, tv: 80 },
+  { key: "documentary", label: "Documentary", movie: 99, tv: 99 },
+  { key: "drama", label: "Drama", movie: 18, tv: 18 },
+  { key: "family", label: "Family", movie: 10751, tv: 10751 },
+  { key: "fantasy", label: "Fantasy", movie: 14, tv: 10765 },
+  { key: "horror", label: "Horror", movie: 27, tv: null },
+  { key: "mystery", label: "Mystery", movie: 9648, tv: 9648 },
+  { key: "romance", label: "Romance", movie: 10749, tv: null },
+  { key: "scifi", label: "Sci-Fi", movie: 878, tv: 10765 },
+  { key: "thriller", label: "Thriller", movie: 53, tv: null },
+  { key: "war", label: "War", movie: 10752, tv: 10768 },
+  { key: "western", label: "Western", movie: 37, tv: 37 },
+];
+
+type SearchType = "all" | "movie" | "tv";
+
 export function SearchView() {
   const query = useAppStore((s) => s.searchQuery);
   const kids = useAppStore((s) => s.isKids());
+  const ctx = useAppStore((s) => s.catalogContext)();
+  const catalogKey = useCatalogKey();
   const debounced = useDebounced(query.trim(), 300);
+  const [genreKey, setGenreKey] = useState<string | null>(null);
+  const [type, setType] = useState<SearchType>("all");
+  const genre = GENRES.find((g) => g.key === genreKey) ?? null;
 
+  /** Genre browsing: popular titles of the genre on your services / in your region. */
+  const loadGenrePage = async (page: number) => {
+    const g = genre!;
+    const types = (type === "all" ? (["movie", "tv"] as const) : [type]).filter((mt) => g[mt] !== null);
+    const pages = await Promise.all(types.map((mt) => discover(mt, ctx, { with_genres: String(g[mt]) }, page).catch(() => null)));
+    const valid = pages.filter((p): p is NonNullable<typeof p> => !!p);
+    const results: MediaSummary[] = [];
+    for (let i = 0; i < Math.max(0, ...valid.map((p) => p.results.length)); i++) for (const p of valid) if (p.results[i]) results.push(p.results[i]!);
+    return { results, totalPages: Math.max(page, ...valid.map((p) => p.totalPages)) };
+  };
+  const matchesFilters = (m: MediaSummary) => {
+    if (type !== "all" && m.mediaType !== type) return false;
+    if (genre) {
+      const id = genre[m.mediaType];
+      if (id === null || !m.genreIds.includes(id)) return false;
+    }
+    return true;
+  };
+
+  const title = debounced ? `Results for “${debounced}”` : genre ? genre.label : "Search";
   return (
     <div>
-      <PageHeader title={debounced ? `Results for “${debounced}”` : "Search"} subtitle="Movies and series across every service in your region" />
+      <PageHeader title={title} subtitle={debounced || !genre ? "Movies and series across every service in your region" : `Popular ${genre.label.toLowerCase()} titles ${ctx.providers.length ? "on your services" : "in your region"}`} />
+      <div className="mb-8 flex flex-col gap-3">
+        <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Type">
+          {(["all", "movie", "tv"] as const).map((t) => (
+            <button key={t} role="radio" aria-checked={type === t} className="chip" data-active={type === t} onClick={() => setType(t)}>
+              {t === "all" ? "All" : t === "movie" ? "Movies" : "Series"}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Genre">
+          <button role="radio" aria-checked={!genre} className="chip" data-active={!genre} onClick={() => setGenreKey(null)}>
+            All genres
+          </button>
+          {GENRES.map((g) => (
+            <button
+              key={g.key}
+              role="radio"
+              aria-checked={genreKey === g.key}
+              className="chip"
+              data-active={genreKey === g.key}
+              disabled={type === "tv" && g.tv === null}
+              title={g.tv === null ? "Movies only: TMDB has no series genre for this" : undefined}
+              onClick={() => setGenreKey(genreKey === g.key ? null : g.key)}
+            >
+              {g.label}
+            </button>
+          ))}
+        </div>
+      </div>
       {debounced ? (
         <MediaGrid
-          feedKey={`search:${debounced}:${kids}`}
+          feedKey={`search:${debounced}:${kids}:${type}:${genreKey ?? ""}`}
           loadPage={(page) => searchMulti(debounced, page)}
+          filter={(m) => !!m.posterPath && (!kids || isKidsSafe(m)) && matchesFilters(m)}
+          emptyMessage={genre ? `No ${genre.label.toLowerCase()} titles match your search.` : "No titles match your search."}
+        />
+      ) : genre ? (
+        <MediaGrid
+          feedKey={`genre:${genre.key}:${type}:${catalogKey}`}
+          loadPage={loadGenrePage}
           filter={(m) => !!m.posterPath && (!kids || isKidsSafe(m))}
-          emptyMessage="No titles match your search."
+          emptyMessage={`No ${genre.label.toLowerCase()} titles ${ctx.providers.length ? "on your services" : "in your region"}.`}
         />
       ) : (
-        <p className="text-label-secondary">Start typing in the search bar above.</p>
+        <p className="text-label-secondary">Type in the search bar above, or pick a genre to browse.</p>
       )}
     </div>
   );

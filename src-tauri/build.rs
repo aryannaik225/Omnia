@@ -37,6 +37,7 @@ const COMMANDS: &[&str] = &[
     "clear_provider_history",
     "mark_watched",
     "unmark_watched",
+    "mark_episodes_watched",
     "set_favorite",
     "is_favorite",
     "get_favorites",

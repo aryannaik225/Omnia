@@ -1787,7 +1787,7 @@ pub fn list_watchlist(c: &Connection, app_profile_id: i64) -> rusqlite::Result<V
          FROM watchlist wl
          LEFT JOIN media_catalog mc ON mc.tmdb_id = wl.tmdb_id AND mc.media_type = wl.media_type
          WHERE wl.app_profile_id = ?1
-         ORDER BY wl.added_at DESC",
+         ORDER BY wl.added_at DESC, wl.rowid DESC",
         [app_profile_id],
         |r| {
             Ok(WatchlistItem {
@@ -1912,6 +1912,49 @@ pub fn mark_watched_manually(
     episode_title: Option<&str>,
     duration_seconds: Option<f64>,
 ) -> rusqlite::Result<WatchHistoryEntry> {
+    mark_watched_manually_at(c, app_profile_id, tmdb_id, media_type, season_number, episode_number, episode_title, duration_seconds, 0)
+}
+
+/// One episode of a bulk "Mark season as watched".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeMark {
+    pub season_number: i64,
+    pub episode_number: i64,
+    #[serde(default)]
+    pub episode_title: Option<String>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+}
+
+/// "Mark season as watched" in one transaction. Episodes are stamped a second apart in episode
+/// order (the last one now), so "latest watched" and the next-episode pick stay in story order.
+pub fn mark_episodes_watched_manually(c: &mut Connection, app_profile_id: i64, tmdb_id: i64, episodes: &[EpisodeMark]) -> rusqlite::Result<usize> {
+    let mut sorted: Vec<&EpisodeMark> = episodes.iter().filter(|e| e.season_number > 0 && e.episode_number > 0).collect();
+    sorted.sort_by_key(|e| (e.season_number, e.episode_number));
+    sorted.dedup_by_key(|e| (e.season_number, e.episode_number));
+    let tx = c.transaction()?;
+    let n = sorted.len();
+    for (i, e) in sorted.iter().enumerate() {
+        let seconds_ago = (n - 1 - i) as i64;
+        mark_watched_manually_at(&tx, app_profile_id, tmdb_id, "tv", e.season_number, e.episode_number, e.episode_title.as_deref(), e.duration_seconds, seconds_ago)?;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_watched_manually_at(
+    c: &Connection,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+    season_number: i64,
+    episode_number: i64,
+    episode_title: Option<&str>,
+    duration_seconds: Option<f64>,
+    seconds_ago: i64,
+) -> rusqlite::Result<WatchHistoryEntry> {
     let (season, episode) = if media_type == "tv" { (season_number.max(0), episode_number.max(0)) } else { (0, 0) };
     let duration = duration_seconds.filter(|d| d.is_finite() && *d > 1.0).unwrap_or(1.0);
     c.execute(
@@ -1919,7 +1962,7 @@ pub fn mark_watched_manually(
             (app_profile_id, tmdb_id, media_type, season_number, episode_number, episode_title, provider_name,
              progress_seconds, duration_seconds, is_completed, watch_count, abandoned, last_watched_at,
              time_of_day_bucket, is_imported, is_manual)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1, 1, 0, datetime('now'), ?8, 0, 1)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, 1, 1, 0, datetime('now', ?9), ?8, 0, 1)
          ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
             watch_count = watch_history.watch_count + CASE WHEN watch_history.is_completed = 1 THEN 1 ELSE 0 END,
             duration_seconds = MAX(watch_history.duration_seconds, excluded.duration_seconds),
@@ -1927,11 +1970,11 @@ pub fn mark_watched_manually(
             is_completed = 1,
             abandoned = 0,
             episode_title = COALESCE(watch_history.episode_title, excluded.episode_title),
-            last_watched_at = datetime('now'),
+            last_watched_at = excluded.last_watched_at,
             time_of_day_bucket = excluded.time_of_day_bucket,
             is_imported = 0,
             is_manual = 1",
-        params![app_profile_id, tmdb_id, media_type, season, episode, episode_title, duration, current_time_of_day_bucket()],
+        params![app_profile_id, tmdb_id, media_type, season, episode, episode_title, duration, current_time_of_day_bucket(), format!("-{} seconds", seconds_ago.max(0))],
     )?;
     get_history_entry(c, app_profile_id, tmdb_id, media_type, season, episode)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -2801,6 +2844,23 @@ mod tests {
         // Nothing new any more: it leaves again.
         record_airing_check(&c, 1, 94997, None).unwrap();
         assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn season_marked_watched_in_one_go_keeps_episode_order() {
+        let mut c = test_db();
+        let ep = |e: i64| EpisodeMark { season_number: 1, episode_number: e, episode_title: None, duration_seconds: Some(1500.0) };
+        // Out of order and with a duplicate: stored once each, stamped in episode order.
+        assert_eq!(mark_episodes_watched_manually(&mut c, 1, 1668, &[ep(3), ep(1), ep(2), ep(2)]).unwrap(), 3);
+        let rows = get_title_history(&c, 1, 1668, "tv").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.is_completed));
+        let at = |e: i64| rows.iter().find(|r| r.episode_number == e).unwrap().last_watched_at.clone();
+        assert!(at(1) < at(2) && at(2) < at(3), "{} {} {}", at(1), at(2), at(3));
+        // Watchlist entries are never touched by watching.
+        add_to_watchlist(&c, 1, 1668, "tv").unwrap();
+        mark_episodes_watched_manually(&mut c, 1, 1668, &[ep(4)]).unwrap();
+        assert!(is_in_watchlist(&c, 1, 1668, "tv").unwrap());
     }
 
     #[test]

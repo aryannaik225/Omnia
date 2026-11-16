@@ -147,12 +147,86 @@ export async function loadHubPage(h: CustomHub, ctx: CatalogContext, facets: Hub
 }
 
 // ---------------------------------------------------------------------------------------------
+// Ordered hubs (franchises): the whole hub at once, in release or story order
+// ---------------------------------------------------------------------------------------------
+
+export type HubOrder = "release" | "timeline";
+
+/** Orders a hub page offers; empty = the regular popularity feed. */
+export function hubOrders(h: CustomHub): HubOrder[] {
+  const rule = hubRule(h);
+  if (rule.order !== "release") return [];
+  return rule.timeline?.length ? ["release", "timeline"] : ["release"];
+}
+
+/** Discover pages read per media type for an ordered hub (20 titles each). */
+const ORDERED_MAX_PAGES = 10;
+
+const dateKey = (m: MediaSummary) => m.releaseDate ?? (m.year ? `${m.year}-12-31` : "");
+
+/** Oldest release first; undated (announced) titles last. */
+export function byRelease(a: MediaSummary, b: MediaSummary): number {
+  const da = dateKey(a);
+  const db = dateKey(b);
+  if (da !== db) return !da ? 1 : !db ? -1 : da.localeCompare(db);
+  return a.title.localeCompare(b.title);
+}
+
+/** Story order from `timeline` ("movie:<id>" keys); other titles follow in release order. */
+export function byTimeline(timeline: string[]): (a: MediaSummary, b: MediaSummary) => number {
+  const index = new Map(timeline.map((k, i) => [k, i]));
+  return (a, b) => {
+    const ia = index.get(`${a.mediaType}:${a.id}`);
+    const ib = index.get(`${b.mediaType}:${b.id}`);
+    if (ia !== undefined && ib !== undefined) return ia - ib;
+    if (ia !== undefined) return -1;
+    if (ib !== undefined) return 1;
+    return byRelease(a, b);
+  };
+}
+
+async function discoverAll(mt: MediaType, ctx: CatalogContext, params: Record<string, string>): Promise<MediaSummary[]> {
+  const first = await discover(mt, ctx, params, 1).catch(() => null);
+  if (!first) return [];
+  const last = Math.min(first.totalPages, ORDERED_MAX_PAGES);
+  const rest = await Promise.all(Array.from({ length: Math.max(0, last - 1) }, (_, i) => discover(mt, ctx, params, i + 2).catch(() => null)));
+  return [first, ...rest].flatMap((p) => p?.results ?? []);
+}
+
+/** Every title of an ordered hub (collections + discover), sorted by `order`. */
+export async function loadOrderedHub(h: CustomHub, ctx: CatalogContext, facets: HubFacets, order: HubOrder): Promise<MediaSummary[]> {
+  const rule = hubRule(h);
+  const effectiveCtx = { ...ctx, kids: ctx.kids || facets.kidsSafe || !!rule.kidsSafe };
+  const types: MediaType[] = facets.mediaType === "all" ? ["movie", "tv"] : [facets.mediaType];
+  const [pinned, ...found] = await Promise.all([
+    facets.mediaType !== "tv" && rule.collections?.length
+      ? Promise.all(rule.collections.map((c) => collectionParts(c).catch(() => []))).then((x) => x.flat())
+      : Promise.resolve([] as MediaSummary[]),
+    ...types.map(async (mt) => {
+      const params = await hubDiscoverParams(h, mt);
+      if (!params || (mt === "tv" && facets.runtime !== "any")) return [];
+      return discoverAll(mt, effectiveCtx, { ...params, ...facetParams(mt, facets) });
+    }),
+  ]);
+  const seen = new Set<string>();
+  const all = [...pinned, ...found.flat()].filter((m) => {
+    const k = `${m.mediaType}-${m.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return all.sort(order === "timeline" && rule.timeline?.length ? byTimeline(rule.timeline) : byRelease);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Hub artwork (TMDB collection / network / company images)
 // ---------------------------------------------------------------------------------------------
 
 export interface HubArtwork {
-  /** 16:9 still for the card background. */
+  /** 16:9 still for the card background and hero (the first collection's own, when it has one). */
   backdropPath: string | null;
+  /** A few backdrops of the hub's collections / most popular titles; cards pick one per mount. */
+  backdrops: string[];
   /** Brand mark (network or studio logo); usually dark-on-transparent, so render it inverted. */
   logoPath: string | null;
 }
@@ -173,11 +247,14 @@ export function hubArtwork(h: CustomHub, region: string): Promise<HubArtwork> {
   const key = `${h.hubSlug}|${region}`;
   let hit = artworkCache.get(key);
   if (!hit) {
-    hit = resolveHubArtwork(h, region).catch(() => ({ backdropPath: null, logoPath: null }));
+    hit = resolveHubArtwork(h, region).catch(() => ({ backdropPath: null, backdrops: [], logoPath: null }));
     artworkCache.set(key, hit);
   }
   return hit;
 }
+
+/** Backdrops kept per hub for the rotating card artwork. */
+const ARTWORK_POOL = 6;
 
 async function resolveHubArtwork(h: CustomHub, region: string): Promise<HubArtwork> {
   const rule = hubRule(h);
@@ -185,10 +262,16 @@ async function resolveHubArtwork(h: CustomHub, region: string): Promise<HubArtwo
   const companyId = firstId(rule.movie?.with_companies) ?? firstId(rule.tv?.with_companies);
   const logo = (networkId ? brandLogo("network", networkId) : companyId ? brandLogo("company", companyId) : Promise.resolve(null)).catch(() => null);
 
-  let backdropPath: string | null = null;
-  const collectionId = rule.collections?.[0];
-  if (collectionId) backdropPath = (await collectionArt(collectionId).catch(() => null))?.backdropPath ?? null;
-  if (!backdropPath) {
+  const pool: string[] = [];
+  const add = (p: string | null | undefined) => {
+    if (p && !pool.includes(p) && pool.length < ARTWORK_POOL) pool.push(p);
+  };
+  // The collections' own key art first (also the hero image), then their films.
+  const collections = rule.collections ?? [];
+  (await Promise.all(collections.map((c) => collectionArt(c).catch(() => null)))).forEach((a) => add(a?.backdropPath));
+  const parts = (await Promise.all(collections.map((c) => collectionParts(c).catch(() => [])))).flat();
+  [...parts].sort((a, b) => b.popularity - a.popularity).forEach((m) => add(m.backdropPath));
+  if (pool.length < ARTWORK_POOL) {
     const ctx: CatalogContext = { region, providers: [], kids: !!rule.kidsSafe };
     // Movies first for studios/franchises, series first for networks.
     const order: MediaType[] = networkId ? ["tv", "movie"] : ["movie", "tv"];
@@ -196,14 +279,11 @@ async function resolveHubArtwork(h: CustomHub, region: string): Promise<HubArtwo
       const params = await hubDiscoverParams(h, mt);
       if (!params) continue;
       const page = await discover(mt, ctx, params).catch(() => null);
-      backdropPath = page?.results.find((m) => m.backdropPath)?.backdropPath ?? null;
-      if (backdropPath) break;
-    }
-    if (!backdropPath && collectionId) {
-      backdropPath = (await collectionParts(collectionId).catch(() => [])).find((m) => m.backdropPath)?.backdropPath ?? null;
+      page?.results.forEach((m) => add(m.backdropPath));
+      if (pool.length >= ARTWORK_POOL) break;
     }
   }
-  return { backdropPath, logoPath: await logo };
+  return { backdropPath: pool[0] ?? null, backdrops: pool, logoPath: await logo };
 }
 
 // ---------------------------------------------------------------------------------------------

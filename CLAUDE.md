@@ -63,7 +63,8 @@ Dedicated visual "Brand & Franchise Pills" (styled like Apple TV Channels / Disn
 - **Franchise & Universe Hubs:**
   - **Marvel Cinematic Universe (MCU) & Marvel Legacy** (mapped via TMDB Company IDs `420`, `7505`, `19551` & Keyword IDs `180547`)
   - **DC Universe (DCU / DC Elseworlds)** (mapped via TMDB Company IDs `9993`, `128064`, `429` & Keyword `dc extended universe` / `dc comics`)
-  - **Star Wars, Wizarding World (Harry Potter), Fast & Furious, MonsterVerse, Middle-earth, James Bond, Anime Hub, Studio Ghibli**
+  - **Star Wars, Wizarding World (Harry Potter), Fast & Furious, MonsterVerse, Middle-earth, James Bond, Mission: Impossible (Collection `87359`), The Conjuring Universe (Collections `313086`, `402074`, `968052`), Pokémon (Company `12654` + its movie collections), Anime Hub, Studio Ghibli**
+  - Franchise hubs (`order: "release"`) list every title oldest release first; the MCU hub also has a hard-coded `timeline` for a "Timeline Order" toggle.
 - **Studio & Network Exclusives / Originals Hubs:**
   - **Apple Originals** (Network `2552` / Provider `350`)
   - **Netflix Exclusives & Originals** (Network `213`)

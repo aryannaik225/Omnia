@@ -714,6 +714,25 @@ async fn mark_watched(
     Ok(row)
 }
 
+/// "Mark season as watched": every listed episode in one transaction.
+#[tauri::command]
+async fn mark_episodes_watched(
+    state: State<'_, AppState>,
+    app_profile_id: i64,
+    tmdb_id: i64,
+    episodes: Vec<queries::EpisodeMark>,
+) -> AppResult<usize> {
+    if episodes.is_empty() {
+        return Ok(0);
+    }
+    let n = state
+        .db
+        .run(move |c| queries::mark_episodes_watched_manually(c, app_profile_id, tmdb_id, &episodes))
+        .await?;
+    state.recommender.invalidate(app_profile_id);
+    Ok(n)
+}
+
 #[tauri::command]
 async fn unmark_watched(
     state: State<'_, AppState>,
@@ -1300,6 +1319,7 @@ pub fn run() {
             clear_provider_history,
             mark_watched,
             unmark_watched,
+            mark_episodes_watched,
             set_favorite,
             is_favorite,
             get_favorites,

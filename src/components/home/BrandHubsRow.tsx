@@ -20,10 +20,13 @@ export function HubPill({ hub, width = 236, onClick }: { hub: CustomHub; width?:
   const tmdbReady = useAppStore((s) => s.tmdbReady);
   const [ref, inView] = useInView<HTMLButtonElement>("400px");
   const art = useAsync(() => hubArtwork(hub, region), [hub.hubSlug, region], inView && tmdbReady);
+  // A different still of the franchise each time the card mounts (app start, page visit).
+  const [pick] = useState(() => Math.random());
   const [backdropLoaded, setBackdropLoaded] = useState(false);
   const [logoFailed, setLogoFailed] = useState(false);
   // A logo asset set on the hub row (user-added hubs) wins over the TMDB one.
-  const backdrop = img(art.data?.backdropPath, "w780");
+  const pool = art.data?.backdrops ?? [];
+  const backdrop = img(pool.length ? pool[Math.floor(pick * pool.length)] : art.data?.backdropPath, "w780");
   const logo = hub.logoAsset ?? img(art.data?.logoPath, "w300");
 
   return (
