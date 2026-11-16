@@ -203,7 +203,7 @@ export function HomeView() {
   return (
     <div>
       <HeroBillboard items={heroItems} />
-      <div className="relative z-10 -mt-16 flex flex-col gap-11 pb-16 pr-8" style={{ paddingLeft: "var(--content-left)" }}>
+      <div className="relative z-10 -mt-16 flex flex-col gap-11 pb-16 max-md:mt-2 max-md:gap-9" style={{ paddingLeft: "var(--content-left)", paddingRight: "var(--content-right)" }}>
         <ContinueWatchingRow />
         <YourListRow />
         <BrandHubsRow />

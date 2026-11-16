@@ -38,7 +38,9 @@ function ProfileEditor({ profile, onClose }: { profile: AppProfile | null; onClo
         animate={{ scale: 1, y: 0 }}
         exit={{ scale: 0.96, y: 16 }}
         transition={{ type: "spring", stiffness: 300, damping: 28 }}
-        className="glass-panel glass-strong relative w-[440px] p-8 text-center"
+        role="dialog"
+        aria-label={profile ? "Edit profile" : "Add profile"}
+        className="glass-panel glass-strong relative max-h-[calc(100vh-32px)] w-[min(440px,calc(100vw-32px))] overflow-y-auto p-8 text-center max-md:p-5"
       >
         <h2 className="text-[24px] font-bold">{profile ? "Edit profile" : "Add profile"}</h2>
         <div className="my-6 flex justify-center">
@@ -87,16 +89,16 @@ export function ProfileGate() {
   const [editing, setEditing] = useState<AppProfile | null | "new">(null);
 
   return (
-    <div className="fixed inset-0 z-[65] flex flex-col items-center justify-center">
+    <div className="fixed inset-0 z-[65] flex flex-col items-center justify-center overflow-y-auto py-10">
       <m.h1
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ type: "spring", stiffness: 200, damping: 24 }}
-        className="text-[44px] font-bold tracking-tight"
+        className="text-[44px] max-md:text-[30px] font-bold tracking-tight"
       >
         {managing ? "Manage profiles" : "Who's watching?"}
       </m.h1>
-      <div className="mt-12 flex flex-wrap justify-center gap-10">
+      <div className="mt-12 flex flex-wrap justify-center gap-10 px-4 max-md:mt-8 max-md:gap-6">
         {profiles.map((p, i) => (
           <m.button
             key={p.profileId}

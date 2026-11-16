@@ -74,7 +74,7 @@ function HubDetail({ hub, onBack }: { hub: CustomHub; onBack: () => void }) {
   return (
     <div className="pb-16">
       <div
-        className="relative mb-8 mt-8 flex min-h-[340px] flex-col justify-end overflow-hidden rounded-panel px-10 pb-10 pt-8"
+        className="relative mb-8 mt-8 flex min-h-[340px] flex-col justify-end overflow-hidden rounded-panel px-10 pb-10 pt-8 max-md:min-h-[260px] max-md:px-5 max-md:pb-6"
         style={{ background: `linear-gradient(120deg, ${rule.theme.from} 0%, ${rule.theme.to} 100%)` }}
       >
         {hero && (
@@ -93,11 +93,11 @@ function HubDetail({ hub, onBack }: { hub: CustomHub; onBack: () => void }) {
           }}
         />
         <div className="pointer-events-none absolute -right-20 -top-24 h-72 w-72 rounded-full blur-3xl" style={{ background: `${rule.theme.accent}40` }} />
-        <button className="chip absolute left-10 top-8 !bg-black/40 !text-white backdrop-blur-md" onClick={onBack}>
+        <button className="chip absolute left-10 top-8 max-md:left-5 max-md:top-5 !bg-black/40 !text-white backdrop-blur-md" onClick={onBack}>
           <ChevronLeftIcon size={14} /> All hubs
         </button>
         <div className="relative">
-          <h1 className="text-[48px] font-bold tracking-tight drop-shadow-lg" style={{ textShadow: `0 0 40px ${rule.theme.accent}55` }}>
+          <h1 className="text-[48px] max-md:text-[32px] font-bold tracking-tight drop-shadow-lg" style={{ textShadow: `0 0 40px ${rule.theme.accent}55` }}>
             {hub.displayName}
           </h1>
           {rule.tagline && <p className="mt-1 text-[17px] text-white/85 drop-shadow">{rule.tagline}</p>}

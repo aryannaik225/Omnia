@@ -38,7 +38,7 @@ export function HubPill({ hub, width = 236, onClick }: { hub: CustomHub; width?:
       whileTap={{ scale: 0.98 }}
       transition={{ type: "spring", stiffness: 320, damping: 24 }}
       className="media-card group relative shrink-0 overflow-hidden text-left outline-none"
-      style={{ width: width === "fill" ? "100%" : width, aspectRatio: "16 / 9", background: `linear-gradient(135deg, ${from} 0%, ${to} 100%)` }}
+      style={{ width: width === "fill" ? "100%" : `min(${width}px, var(--landscape-max, ${width}px))`, aspectRatio: "16 / 9", background: `linear-gradient(135deg, ${from} 0%, ${to} 100%)` }}
       aria-label={`${hub.displayName} hub`}
     >
       {backdrop && (

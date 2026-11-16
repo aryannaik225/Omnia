@@ -1441,6 +1441,37 @@ pub async fn close_player_for_profile(app: &AppHandle, app_profile_id: i64) {
     }
 }
 
+/// Phone remote → the open player: OK / Play-Pause toggle, Left / Right seek 10 s, Back closes
+/// it like the pill. Returns false when no player is open (the key then goes to the catalog).
+pub async fn remote_control_player(app: &AppHandle, key: &str) -> bool {
+    let label = match app.state::<AppState>().player.lock().as_ref() {
+        Some(s) => s.label.clone(),
+        None => return false,
+    };
+    if key == "back" || key == "home" {
+        back_to_hub(app.clone()).await;
+        return true;
+    }
+    let Some(window) = app.get_webview_window(&label) else { return false };
+    let action = match key {
+        "ok" | "playpause" => "toggle",
+        "left" => "back",
+        "right" => "fwd",
+        _ => return true, // Up / Down: nothing to do in a player
+    };
+    // Netflix's player rejects direct `currentTime` writes, so seek through its own API there.
+    let js = format!(
+        r#"(function(a){{try{{var vs=Array.prototype.slice.call(document.querySelectorAll("video"));
+vs.sort(function(x,y){{return y.clientWidth*y.clientHeight-x.clientWidth*x.clientHeight}});var v=vs[0];if(!v)return;
+if(a==="toggle"){{if(v.paused)v.play();else v.pause();return}}
+var d=a==="fwd"?10:-10;var nf=window.netflix&&window.netflix.appContext;
+if(nf){{var api=nf.state.playerApp.getAPI().videoPlayer;var p=api.getVideoPlayerBySessionId(api.getAllPlayerSessionIds()[0]);p.seek(p.getCurrentTime()+d*1000);return}}
+v.currentTime=Math.max(0,v.currentTime+d)}}catch(e){{}}}})("{action}")"#
+    );
+    let _ = window.eval(&js);
+    true
+}
+
 #[tauri::command]
 pub async fn close_player(app: AppHandle) -> AppResult<()> {
     back_to_hub(app).await;

@@ -82,6 +82,16 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 ### A proper desktop app
 - A system-tray icon, close-to-tray, a single running instance, and the window's size and position remembered between launches.
 
+### On your iPhone and Android TV, still without a cloud
+- **Settings → Linked Devices** turns on a small server inside the desktop app, reachable only on your home Wi-Fi. Pair a device once with a **6-digit PIN** or a **QR code**; unpaired devices only ever see the pairing screen, and you can **revoke** any device.
+- **iPhone:** open it in Safari (no App Store). The layout adapts to the phone, and **Play** opens the title in the Netflix / Prime / Hotstar app.
+- **Android TV / Fire TV:** a thin-client APK finds the PC by itself, is driven entirely with the **D-pad** (with an on-screen keyboard), and hands **Play** to the installed OTT app with an Android intent.
+- **Phone as a remote:** the phone's **Remote** tab (D-pad, OK, Back, Home, Play/Pause) drives Omnia on the TV, or on the PC. On the PC it also pauses, plays and skips in Omnia's player.
+- What you watch in those apps syncs back to the PC through the background delta sync. See **[docs/PHONE_AND_TV.md](docs/PHONE_AND_TV.md)** for setup and the APK build.
+
+### Hidden developer tools
+- Tap the version number at the bottom of Settings **7 times** to unlock **Developer Options**. **Direct Stream Testing** adds a **Stream (Dev)** button to title pages, which opens a plain HLS (`.m3u8`) / MP4 test player.
+
 ---
 
 ## Privacy model
@@ -93,6 +103,7 @@ Built with **Tauri 2 (Rust)**, **React 19 + TypeScript**, **Tailwind CSS** and *
 | Streaming-service cookies and sign-ins | WebView2's own store, one folder per Omnia profile; Rust never reads them | Only to that service's own website, never logged |
 | Profile pictures | Local SQLite (uploaded / linked images are stored as a small local copy) | Never |
 | Title names, for catalog/metadata lookups | — | Sent to TMDB and JustWatch as **anonymous public title strings** |
+| Your library, read by a paired phone / TV (Linked Devices, off by default) | Stays in the PC's SQLite | Only to devices you paired, over your local network (plain HTTP) |
 
 The only network calls Omnia makes:
 
@@ -238,29 +249,38 @@ Schema: 18 tables (`ott_sync_state`, `app_profiles`, `ott_profile_mappings`, `ap
 ├── src/                          React 19 + TypeScript frontend
 │   ├── App.tsx                   shell: boot → profile gate → catalog
 │   ├── components/
-│   │   ├── layout/               LiquidSidebar, TopFilterBar, AmbientBackground
+│   │   ├── layout/               LiquidSidebar, MobileTabBar, TopFilterBar, AmbientBackground
 │   │   ├── home/                 HeroBillboard, ContinueWatchingRow, BrandHubsRow, MediaCarouselRow
-│   │   ├── modals/               MediaDetailModal, AccountSyncModal, OttPickerModal
-│   │   ├── settings/             SettingsView
+│   │   ├── modals/               MediaDetailModal, AccountSyncModal, OttPickerModal, HandoffSheet, DevStreamPlayer
+│   │   ├── settings/             SettingsView, LinkedDevices (PIN, QR, revoke)
+│   │   ├── tv/                   TvConnect (discover / pair / reconnect), VirtualKeyboard
 │   │   ├── profile/              ProfileGate ("Who's watching?")
 │   │   ├── views/                Home, Search, Watching Now, My OTTs, Hubs, Watchlist, Collections
 │   │   └── common/               cards (3D specular hover), grid, toasts, icons, avatars, library actions
 │   ├── config/hubsRegistry.ts    franchise / studio / originals hub definitions
-│   ├── lib/                      colour extraction, provider families, hooks, formatting
-│   ├── services/                 tauriBridge (typed IPC), tmdbClient, catalog helpers
+│   ├── lib/                      colour extraction, provider families, hooks, formatting, spatialNav (D-pad)
+│   ├── services/                 tauriBridge (typed IPC), platform (desktop / LAN / TV transport),
+│   │                             handoff (OTT app hand-off), devMode, tmdbClient, catalog helpers
 │   ├── store/                    useAppStore, usePlayerStore (Zustand)
 │   └── styles/liquid-glass.css   design tokens & glass components
 │
-└── src-tauri/                    Rust backend
-    ├── capabilities/             per-window permissions (catalog vs. remote player)
-    ├── permissions/omnia.toml    permission sets
-    └── src/
-        ├── lib.rs                state, commands, hotkeys, startup maintenance
-        ├── db/                   connection, migrations, queries
-        ├── resolver/justwatch.rs deep-link resolver
-        ├── player/               window_manager.rs, telemetry_injector.js
-        ├── sync/                 history_importer.rs, background.rs, airing.rs
-        └── ml/                   embeddings.rs, recommender.rs
+├── src-tauri/                    Rust backend
+│   ├── capabilities/             per-window permissions (catalog vs. remote player)
+│   ├── permissions/omnia.toml    permission sets
+│   ├── tauri.android.conf.json   Android TV build (thin-client frontend)
+│   └── src/
+│       ├── lib.rs                picks the desktop backend or the Android thin client
+│       ├── desktop.rs            state, commands, hotkeys, startup maintenance
+│       ├── tv_client.rs          Android: LAN discovery + OTT app intents (no database)
+│       ├── lan/mobile_server.rs  axum LAN companion: pairing, allow-listed command bridge, static app
+│       ├── db/                   connection, migrations, queries
+│       ├── resolver/justwatch.rs deep-link resolver
+│       ├── player/               window_manager.rs, telemetry_injector.js
+│       ├── sync/                 history_importer.rs, background.rs, airing.rs
+│       └── ml/                   embeddings.rs, recommender.rs
+│
+├── docs/PHONE_AND_TV.md          iPhone / Android TV setup and the APK build
+└── web-export/                   optional Next.js + Supabase cloud edition (separate project)
 ```
 
 ---
@@ -295,10 +315,11 @@ hub("a24", "A24", "studio", {
 ```
 
 ### Adding a backend command
-1. Add a `#[tauri::command]` and register it in `generate_handler!` (`src-tauri/src/lib.rs`).
+1. Add a `#[tauri::command]` and register it in `generate_handler!` (`src-tauri/src/desktop.rs`).
 2. Add its name to `COMMANDS` in `src-tauri/build.rs`.
 3. Grant `allow-<command-name>` in `src-tauri/permissions/omnia.toml`.
 4. Add a typed wrapper to `src/services/tauriBridge.ts`.
+5. To make it usable from paired phones / TVs, add it to the allow-list in `dispatch` (`src-tauri/src/lan/mobile_server.rs`). Commands not listed there are refused over the LAN.
 
 ---
 
@@ -313,6 +334,7 @@ hub("a24", "A24", "studio", {
 | Netflix import fails | The log line `Netflix history read: …` shows which source worked (Netflix's API, captured requests, or the rendered page). Profile errors abort the import on purpose, so histories never mix. |
 | Another service imports nothing | Look for `<service> history read: N entries (page: …, trays found: …, json responses: …)` in the log. It shows where the hidden window ended up (e.g. a sign-in page) and what data it saw. |
 | Old imports show "Just now" or are missing shows | They predate the date and season fixes. Clear that service's history in Connect Accounts and import again. |
+| A phone / TV can't connect | Settings → Linked Devices must be on, and Windows must allow Omnia on private networks (TCP 8765, UDP 8766). The phone or TV needs to be on the same Wi-Fi, not a guest network. `The Omnia web app isn't built yet` in `tauri dev`: run `npm run build` once (dev builds serve `dist/`). |
 | A hotkey doesn't work | Another app may own it (check the logs for `could not register global shortcut`). The other hotkey and the pill still work. |
 
 **After upgrading:** Netflix links made before the `guid::name` identity format are removed on first launch (`removed a legacy Netflix link…` in the logs). Re-link Netflix once per Omnia profile.
@@ -325,7 +347,7 @@ hub("a24", "A24", "studio", {
 - **Automatic profile switching is Netflix-only.** For other services, Omnia verifies the active profile and refuses to record viewing from the wrong one, but you switch profiles yourself.
 - **Not available from TMDB:** 4K HDR / Dolby Atmos filters, "Leaving Soon", and IMDb / Rotten Tomatoes ratings. Only TMDB ratings are shown.
 - **Windows only for now.** The player relies on WebView2, and the ONNX Runtime auto-download targets Windows x64.
-- **No mobile companion.** The planned local-network server for phones is not implemented.
+- **Phones and TVs need the PC running.** They read the PC's library over Wi-Fi; they can't link OTT accounts or import history themselves. The Android TV build hasn't been compiled or tested on a device yet.
 
 ---
 

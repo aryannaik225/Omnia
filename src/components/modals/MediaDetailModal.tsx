@@ -27,6 +27,7 @@ import { CollectionMenu, EpisodeWatchedToggle, FavoriteButton, MarkWatchedButton
 import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon, StarIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
 import { fromSummary, MediaCarouselRow } from "../home/MediaCarouselRow";
+import { useDevMode } from "../../services/devMode";
 
 // ---------------------------------------------------------------------------------------------
 // Provider / deep-link selector
@@ -212,7 +213,7 @@ function Episodes({
               onClick={() => onPlay(ep.seasonNumber, ep.episodeNumber, ep.name)}
               className="group flex min-w-0 flex-1 items-center gap-4 rounded-card p-2 text-left"
             >
-              <span className="relative aspect-video w-[168px] shrink-0 overflow-hidden rounded-[12px] bg-white/5">
+              <span className="relative aspect-video w-[168px] max-md:w-[116px] shrink-0 overflow-hidden rounded-[12px] bg-white/5">
                 {still && <img src={still} alt="" loading="lazy" className="h-full w-full object-cover" />}
                 <span className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
                   <PlayIcon size={26} />
@@ -266,6 +267,10 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
   const inContinueWatching = useAppStore((s) => s.continueWatching.some((c) => c.tmdbId === entry.id && c.mediaType === entry.mediaType));
   const inWatchlist = useAppStore((s) => s.isInWatchlist);
   useAppStore((s) => s.watchlistKeys);
+  const devStream = useDevMode((s) => s.unlocked && s.directStream);
+  const openDevPlayer = useDevMode((s) => s.openPlayer);
+  const loadDev = useDevMode((s) => s.load);
+  useEffect(() => void loadDev(), [loadDev]);
   const kids = useAppStore((s) => s.isKids());
   const playTitle = usePlayerStore((s) => s.playTitle);
   const launching = usePlayerStore((s) => s.launching);
@@ -302,12 +307,12 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
 
   return (
     <div>
-      <div className="relative h-[56vh] min-h-[420px] w-full overflow-hidden rounded-t-panel">
+      <div className="relative h-[56vh] min-h-[420px] w-full overflow-hidden rounded-t-panel max-md:h-[44vh] max-md:min-h-[300px] max-md:rounded-none">
         {seed.backdropPath && <img src={img(seed.backdropPath, "w1280")!} alt="" className="hero-mask absolute inset-0 h-full w-full object-cover" />}
         <div className="hero-scrim absolute inset-0" />
-        <div className="absolute bottom-8 left-10 right-10 max-w-[760px]">
+        <div className="absolute bottom-8 left-10 right-10 max-w-[760px] max-md:bottom-5 max-md:left-4 max-md:right-4">
           {badge && <p className="mb-2 text-[13px] font-semibold uppercase tracking-[0.12em] text-white/80">{badge}</p>}
-          <h1 className="text-[46px] font-bold leading-[1.04] tracking-tight drop-shadow-lg">{seed.title}</h1>
+          <h1 className="text-[46px] max-md:text-[30px] font-bold leading-[1.04] tracking-tight drop-shadow-lg">{seed.title}</h1>
           <div className="mt-3 flex flex-wrap items-center gap-2.5 text-[14px] text-white/85">
             {d?.certification && <span className="badge">{d.certification}</span>}
             {ratingLabel(seed.voteAverage) && (
@@ -323,7 +328,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
         </div>
       </div>
 
-      <div className="flex flex-col gap-10 px-10 pb-12 pt-6">
+      <div className="flex flex-col gap-10 px-10 pb-12 pt-6 max-md:gap-8 max-md:px-4">
         <div className="grid gap-8 lg:grid-cols-[1fr_320px]">
           <div>
             {d?.tagline && <p className="mb-2 text-[15px] italic text-label-secondary">{d.tagline}</p>}
@@ -340,6 +345,11 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
               <button className="glass-button !py-3" onClick={() => void toggleWatchlist(seed)}>
                 {listed ? <CheckIcon size={18} /> : <PlusIcon size={18} />} Up Next
               </button>
+              {devStream && (
+                <button className="glass-button !py-3" onClick={() => openDevPlayer(seed.title)} title="Developer Options: open the HLS / MP4 test player">
+                  <PlayIcon size={16} /> Stream (Dev)
+                </button>
+              )}
               <FavoriteButton tmdbId={seed.id} mediaType={seed.mediaType} title={seed.title} />
               {seed.mediaType === "movie" && (
                 <MarkWatchedButton tmdbId={seed.id} title={seed.title} runtimeMins={d?.runtimeMins} progress={progress.data ?? []} onChanged={reloadProgress} />
@@ -451,13 +461,13 @@ function PersonView({ id }: { id: number }) {
   const person = p.data;
   const credits = kids ? person.credits.filter((c) => c.genreIds.some((g) => [16, 10751, 10762].includes(g))) : person.credits;
   return (
-    <div className="px-10 pb-12 pt-16">
+    <div className="px-10 pb-12 pt-16 max-md:px-4">
       <div className="flex gap-8">
-        <span className="h-[180px] w-[180px] shrink-0 overflow-hidden rounded-full bg-white/10 shadow-lift">
+        <span className="h-[180px] w-[180px] max-md:h-[120px] max-md:w-[120px] shrink-0 overflow-hidden rounded-full bg-white/10 shadow-lift">
           {person.profilePath && <img src={img(person.profilePath, "h632")!} alt="" className="h-full w-full object-cover" />}
         </span>
         <div className="min-w-0">
-          <h1 className="text-[40px] font-bold tracking-tight">{person.name}</h1>
+          <h1 className="text-[40px] max-md:text-[28px] font-bold tracking-tight">{person.name}</h1>
           {person.knownFor && <p className="text-label-secondary">{person.knownFor}</p>}
           {person.biography && (
             <p className={`mt-3 max-w-3xl text-[15px] leading-relaxed text-white/80 ${bioOpen ? "" : "line-clamp-4"}`}>{person.biography}</p>
@@ -535,7 +545,7 @@ export function MediaDetailModal() {
             initial={{ opacity: 0, y: 30, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ type: "spring", stiffness: 260, damping: 30 }}
-            className="glass-panel glass-strong relative my-6 w-[min(1200px,94vw)] overflow-y-auto overflow-x-hidden"
+            className="glass-panel glass-strong relative my-6 w-[min(1200px,94vw)] overflow-y-auto overflow-x-hidden max-md:my-0 max-md:w-full max-md:rounded-none"
           >
             <div className="sticky top-0 z-20 flex h-0 justify-between px-5">
               <div className="pt-5">

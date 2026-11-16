@@ -32,7 +32,7 @@ export function RegionSwitcher({ onClose }: { onClose: () => void }) {
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: -8, scale: 0.98 }}
       transition={{ type: "spring", stiffness: 420, damping: 32 }}
-      className="glass-panel glass-strong absolute right-0 top-14 z-50 w-[320px] p-3"
+      className="glass-panel glass-strong absolute right-0 top-14 z-50 w-[min(320px,calc(100vw-32px))] p-3"
     >
       <div className="mb-2 flex items-center justify-between px-1">
         <p className="text-[13px] text-label-secondary">
@@ -91,8 +91,8 @@ export function TopFilterBar() {
   }, [regionOpen]);
 
   return (
-    <div className="glass-panel relative flex items-center gap-3 rounded-[20px] px-3 py-2.5">
-      <label className="relative w-[300px] shrink-0">
+    <div className="glass-panel relative flex items-center gap-3 rounded-[20px] px-3 py-2.5 max-md:gap-2 max-md:px-2">
+      <label className="relative w-[300px] shrink-0 max-md:w-auto max-md:min-w-0 max-md:flex-1">
         <SearchIcon size={17} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-label-tertiary" />
         <input
           className="glass-input !py-2 pl-10"
@@ -103,7 +103,7 @@ export function TopFilterBar() {
         />
       </label>
 
-      <div className="segmented shrink-0" role="tablist" aria-label="Availability">
+      <div className="segmented shrink-0 max-md:hidden" role="tablist" aria-label="Availability">
         <button
           data-active={subscriptionsOnly}
           onClick={() => {
@@ -122,7 +122,7 @@ export function TopFilterBar() {
         </button>
       </div>
 
-      <div className="flex-1" />
+      <div className="flex-1 max-md:hidden" />
 
       <div ref={popRef} className="relative shrink-0">
         <button className="chip !py-2" onClick={() => setRegionOpen((o) => !o)} aria-expanded={regionOpen} aria-label="Change region">

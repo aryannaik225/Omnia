@@ -71,7 +71,8 @@ export const PosterCard = memo(function PosterCard({
   const { ref, rx, ry, onMove, reset } = useSpecular();
   const src = img(posterPath, "w342");
   return (
-    <div className="shrink-0" style={{ width: width === "fill" ? "100%" : width }}>
+    // Phones cap row posters via `--poster-max` (liquid-glass.css) so ~3 fit per screen.
+    <div className="shrink-0" style={{ width: width === "fill" ? "100%" : `min(${width}px, var(--poster-max, ${width}px))` }}>
       <m.button
         ref={ref}
         type="button"
@@ -136,7 +137,7 @@ export const LandscapeCard = memo(function LandscapeCard({ title, imagePath, sub
   const { ref, rx, ry, onMove, reset } = useSpecular();
   const src = img(imagePath, "w780");
   return (
-    <div className="shrink-0" style={{ width }}>
+    <div className="shrink-0" style={{ width: `min(${width}px, var(--landscape-max, ${width}px))` }}>
       <m.button
         ref={ref}
         type="button"

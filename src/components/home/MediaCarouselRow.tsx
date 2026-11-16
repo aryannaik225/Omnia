@@ -41,7 +41,7 @@ export function RowShell({ title, subtitle, children, onScroll }: { title: React
           {subtitle && <p className="mt-0.5 truncate text-[13px] text-label-tertiary">{subtitle}</p>}
         </div>
         {onScroll && (
-          <div className="flex shrink-0 gap-2 opacity-0 transition-opacity duration-200 group-hover/row:opacity-100">
+          <div data-nav-skip className="flex shrink-0 gap-2 opacity-0 transition-opacity duration-200 group-hover/row:opacity-100">
             <button className="icon-button !h-8 !w-8" onClick={() => onScroll(-1)} aria-label="Scroll left">
               <ChevronLeftIcon size={16} />
             </button>

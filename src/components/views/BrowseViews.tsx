@@ -16,9 +16,9 @@ import { LazyTmdbRow } from "../home/MediaCarouselRow";
 
 export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: string; actions?: ReactNode }) {
   return (
-    <header className="mb-8 mt-10 flex items-end justify-between gap-6">
+    <header className="mb-8 mt-10 flex items-end justify-between gap-6 max-md:mt-6 max-md:flex-wrap max-md:gap-3">
       <div>
-        <h1 className="text-[34px] font-bold tracking-tight">{title}</h1>
+        <h1 className="text-[34px] max-md:text-[28px] font-bold tracking-tight">{title}</h1>
         {subtitle && <p className="mt-1 text-label-secondary">{subtitle}</p>}
       </div>
       {actions}

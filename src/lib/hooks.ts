@@ -89,3 +89,19 @@ export function useRafCallback<A extends unknown[]>(fn: (...args: A) => void) {
     });
   }, []);
 }
+
+/** Live `matchMedia` result (e.g. the phone layout below 768 px). */
+export function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const on = () => setMatches(mq.matches);
+    on();
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, [query]);
+  return matches;
+}
+
+/** Phone-width layout (bottom tab bar, tighter gutters). */
+export const PHONE_QUERY = "(max-width: 767px)";

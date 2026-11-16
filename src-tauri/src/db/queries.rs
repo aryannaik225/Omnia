@@ -2380,6 +2380,52 @@ pub fn latest_provider_activity(c: &Connection, app_profile_id: i64, provider_na
     )
 }
 
+// ---------------------------------------------------------------------------------------------
+// LAN companion: paired devices (migration v7)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LanDevice {
+    pub device_id: i64,
+    pub device_name: String,
+    pub paired_at: String,
+    pub last_seen_at: Option<String>,
+}
+
+pub fn add_lan_device(c: &Connection, device_name: &str, token_hash: &str) -> rusqlite::Result<i64> {
+    c.execute("INSERT INTO lan_devices (device_name, token_hash) VALUES (?1, ?2)", params![device_name, token_hash])?;
+    Ok(c.last_insert_rowid())
+}
+
+/// The paired device holding the token with this hash (also stamps it as seen, at most once a minute).
+pub fn touch_lan_device(c: &Connection, token_hash: &str) -> rusqlite::Result<Option<i64>> {
+    let id: Option<i64> = c
+        .query_row("SELECT device_id FROM lan_devices WHERE token_hash = ?1", [token_hash], |r| r.get(0))
+        .optional()?;
+    if let Some(id) = id {
+        c.execute(
+            "UPDATE lan_devices SET last_seen_at = datetime('now')
+             WHERE device_id = ?1 AND (last_seen_at IS NULL OR last_seen_at < datetime('now', '-1 minute'))",
+            [id],
+        )?;
+    }
+    Ok(id)
+}
+
+pub fn list_lan_devices(c: &Connection) -> rusqlite::Result<Vec<LanDevice>> {
+    collect_rows(
+        c,
+        "SELECT device_id, device_name, paired_at, last_seen_at FROM lan_devices ORDER BY paired_at DESC, device_id DESC",
+        [],
+        |r| Ok(LanDevice { device_id: r.get(0)?, device_name: r.get(1)?, paired_at: r.get(2)?, last_seen_at: r.get(3)? }),
+    )
+}
+
+pub fn revoke_lan_device(c: &Connection, device_id: i64) -> rusqlite::Result<bool> {
+    Ok(c.execute("DELETE FROM lan_devices WHERE device_id = ?1", [device_id])? > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2844,6 +2890,19 @@ mod tests {
         // Nothing new any more: it leaves again.
         record_airing_check(&c, 1, 94997, None).unwrap();
         assert!(continue_watching(&c, 1, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lan_devices_pair_touch_and_revoke() {
+        let c = test_db();
+        let id = add_lan_device(&c, "iPhone", "hash-a").unwrap();
+        assert_eq!(touch_lan_device(&c, "hash-a").unwrap(), Some(id));
+        assert_eq!(touch_lan_device(&c, "nope").unwrap(), None);
+        let list = list_lan_devices(&c).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].last_seen_at.is_some());
+        assert!(revoke_lan_device(&c, id).unwrap());
+        assert_eq!(touch_lan_device(&c, "hash-a").unwrap(), None);
     }
 
     #[test]

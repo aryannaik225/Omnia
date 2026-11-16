@@ -1,10 +1,12 @@
 /**
  * Typed wrappers for every Rust `#[tauri::command]` in `src-tauri/src/lib.rs`.
  * Argument keys are camelCase (Tauri maps them to the Rust snake_case parameters).
- * All data stays on-device: these calls only cross the in-process IPC boundary.
+ * All data stays on-device: on the desktop these calls only cross the in-process IPC boundary;
+ * on a paired phone / TV they go to the desktop over the local network (see `platform.ts`).
  */
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { handOffPlayback } from "./handoff";
+import { invoke, isRemote, platformMode } from "./platform";
 
 export type MediaType = "movie" | "tv";
 export type MonetizationType = "flatrate" | "free" | "ads" | "rent" | "buy" | "search";
@@ -354,8 +356,8 @@ export type ImportFinishedEvent =
   | { ok: false; appProfileId: number; providerId: number; providerName: string; error: string };
 
 /** True when running inside the Tauri shell (false in a plain browser / LAN companion). */
-export const isTauri = (): boolean =>
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+/** A backend is reachable: the desktop app itself, or a paired phone / TV (see `platform.ts`). */
+export const isTauri = (): boolean => platformMode !== "desktop" || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window);
 
 // ---------------------------------------------------------------------------------------------
 // Commands
@@ -548,7 +550,9 @@ export const collections = {
 };
 
 export const player = {
-  open: (request: OpenPlayerRequest) => invoke<PlayerOpened>("open_player", { request }),
+  /** Desktop: Omnia's player window. Phone / TV: hands the title to the installed OTT app. */
+  open: (request: OpenPlayerRequest) =>
+    isRemote ? (handOffPlayback(request) as Promise<unknown> as Promise<PlayerOpened>) : invoke<PlayerOpened>("open_player", { request }),
   /** Profile handshake: opens the provider's sign-in / "Who's watching?" page. */
   connect: (appProfileId: number, providerId: number, providerName: string, region?: string) =>
     invoke<PlayerOpened>("open_player", {
@@ -575,7 +579,8 @@ type Payload<T> = (payload: T) => void;
 const on =
   <T>(name: string) =>
   (handler: Payload<T>): Promise<UnlistenFn> =>
-    listen<T>(name, (e) => handler(e.payload));
+    // Phones / TVs get no desktop events: their views refresh when they are opened.
+    isRemote ? Promise.resolve(() => {}) : listen<T>(name, (e) => handler(e.payload));
 
 export const events = {
   onBackToHub: on<{ tmdbId: number | null; mediaType: MediaType | null }>(OmniaEvents.backToHub),
@@ -595,6 +600,8 @@ export const events = {
   onHistoryImportFinished: on<ImportFinishedEvent>(OmniaEvents.historyImportFinished),
   /** A quiet background delta sync stored new activity (e.g. watched on another device). */
   onBackgroundSync: on<{ appProfileId: number; providerName: string; updated: number }>(OmniaEvents.backgroundSync),
+  /** A key from the phone remote aimed at this PC (the open player handles its own keys). */
+  onRemoteKey: on<{ key: string }>("omnia://remote-key"),
 };
 
 /** Background delta sync status of one linked account (mirrors `queries::OttSyncState`). */
@@ -691,4 +698,39 @@ export const recommendations = {
   tasteSummary: (appProfileId: number, limit = 50) =>
     invoke<TasteSummary>("get_taste_summary", { appProfileId, limit }),
   embeddingStatus: () => invoke<EmbeddingStatus>("get_embedding_status"),
+};
+
+// ---------------------------------------------------------------------------------------------
+// LAN companion server (desktop Settings → Linked Devices; never callable from a LAN device)
+// ---------------------------------------------------------------------------------------------
+
+export interface LanDevice {
+  deviceId: number;
+  deviceName: string;
+  pairedAt: string;
+  lastSeenAt: string | null;
+}
+
+export interface LanStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  address: string | null;
+  /** `http://<address>:8765/pair?pin=<pin>`, the QR code's content. */
+  pairUrl: string | null;
+  pin: string | null;
+  pinExpiresInSecs: number | null;
+  devices: LanDevice[];
+  error: string | null;
+}
+
+export const LAN_CHANGED_EVENT = "omnia://lan-changed";
+
+export const lan = {
+  status: () => invoke<LanStatus>("lan_status"),
+  setEnabled: (enabled: boolean) => invoke<LanStatus>("lan_set_enabled", { enabled }),
+  newPin: () => invoke<LanStatus>("lan_new_pin"),
+  revoke: (deviceId: number) => invoke<LanStatus>("lan_revoke_device", { deviceId }),
+  /** A device paired (refresh the list). */
+  onChanged: on<null>(LAN_CHANGED_EVENT),
 };

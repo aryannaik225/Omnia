@@ -124,7 +124,21 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
   // A new slide may play its trailer again.
   useEffect(() => setEndedKey(null), [safeIndex]);
 
-  // Player events: listen for "ended" (state 0) and keep the mute state in sync.
+  /** The trailer only becomes visible once YouTube reports it playing (never its error screen). */
+  const [trailerPlaying, setTrailerPlaying] = useState(false);
+  useEffect(() => setTrailerPlaying(false), [showTrailer, trailerKey]);
+  const giveUpOnTrailer = useCallback(() => {
+    if (trailerKey) setEndedKey(trailerKey);
+    setShowTrailer(false);
+  }, [trailerKey]);
+  // No playback within 8 s (blocked embed, offline, configuration error): back to the artwork.
+  useEffect(() => {
+    if (!showTrailer || trailerPlaying) return;
+    const t = setTimeout(giveUpOnTrailer, 8000);
+    return () => clearTimeout(t);
+  }, [showTrailer, trailerPlaying, giveUpOnTrailer]);
+
+  // Player events: "playing" (1) reveals it, "ended" (0) or any error falls back to the artwork.
   useEffect(() => {
     if (!showTrailer || !trailerKey) return;
     const onMessage = (e: MessageEvent) => {
@@ -135,21 +149,24 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
       } catch {
         return;
       }
+      if (msg.event === "onError") {
+        giveUpOnTrailer();
+        return;
+      }
       const info = msg.info as { playerState?: number } | number | undefined;
       const state = msg.event === "onStateChange" ? info : typeof info === "object" ? info?.playerState : undefined;
-      if (state === 0) {
-        setEndedKey(trailerKey);
-        setShowTrailer(false);
-      }
+      if (state === 1) setTrailerPlaying(true);
+      if (state === 0) giveUpOnTrailer();
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [showTrailer, trailerKey]);
+  }, [showTrailer, trailerKey, giveUpOnTrailer]);
 
   const onTrailerLoad = () => {
     // Subscribe to player events, then apply the current mute choice.
     frame.current?.contentWindow?.postMessage(JSON.stringify({ event: "listening", id: "omnia-hero" }), "*");
     ytCommand(frame.current, "addEventListener", ["onStateChange"]);
+    ytCommand(frame.current, "addEventListener", ["onError"]);
     if (!muted) ytCommand(frame.current, "unMute");
   };
   const toggleMute = () => {
@@ -160,7 +177,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
   };
 
   if (!current) {
-    return <div className="skeleton h-[68vh] min-h-[520px] w-full" />;
+    return <div className="skeleton h-[68vh] min-h-[520px] w-full max-md:h-[60vh] max-md:min-h-[420px]" />;
   }
 
   const badge = providerBadge(d, region, subs);
@@ -174,7 +191,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
   return (
     <section
-      className={`relative h-[68vh] min-h-[520px] w-full overflow-hidden ${showTrailer && trailerKey ? "hero-trailer-on" : ""}`}
+      className={`relative h-[68vh] min-h-[520px] w-full overflow-hidden max-md:h-[60vh] max-md:min-h-[420px] ${showTrailer && trailerKey && trailerPlaying ? "hero-trailer-on" : ""}`}
       onPointerEnter={() => setEngaged(true)}
       onPointerLeave={() => setEngaged(false)}
       onFocusCapture={() => setEngaged(true)}
@@ -200,9 +217,9 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
           <m.div
             key={trailerKey}
             // Fully opaque: no mask, no inherited fade (only the bottom edge blends into the rows).
-            className="hero-trailer-mask pointer-events-none absolute inset-0 overflow-hidden opacity-100"
+            className="hero-trailer-mask pointer-events-none absolute inset-0 overflow-hidden"
             initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
+            animate={{ opacity: trailerPlaying ? 1 : 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.8 }}
           >
@@ -211,6 +228,10 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
               title={`${current.title} trailer`}
               src={`https://www.youtube-nocookie.com/embed/${trailerKey}?autoplay=1&mute=1&controls=0&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}&modestbranding=1&playsinline=1&rel=0&iv_load_policy=3&disablekb=1`}
               allow="autoplay; encrypted-media"
+              // YouTube refuses embeds that arrive without a referrer ("player configuration
+              // error"), e.g. under the LAN companion's strict policy: always send the origin.
+              referrerPolicy="strict-origin-when-cross-origin"
+              tabIndex={-1}
               onLoad={onTrailerLoad}
               className="absolute left-1/2 top-1/2 h-[140%] w-[140%] -translate-x-1/2 -translate-y-1/2 scale-[1.02]"
             />
@@ -220,7 +241,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
 
       <div className="hero-scrim absolute inset-0" />
 
-      <div className="hero-copy absolute bottom-[19%] left-[calc(var(--content-left)+8px)] z-20 max-w-[620px] pr-8 transition-[left,opacity] duration-500">
+      <div className="hero-copy absolute bottom-[19%] left-[calc(var(--content-left)+8px)] z-20 max-w-[620px] pr-8 max-md:bottom-[13%] max-md:left-4 max-md:pr-4 transition-[left,opacity] duration-500">
         <AnimatePresence mode="wait">
           <m.div
             key={current.id}
@@ -230,7 +251,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
             transition={{ duration: 0.5, ease: [0.32, 0.72, 0, 1] }}
           >
             {badge && <p className="mb-3 text-[13px] font-semibold uppercase tracking-[0.12em] text-white/80">{badge}</p>}
-            <h1 className="text-balance text-[56px] font-bold leading-[1.02] tracking-tight drop-shadow-lg">{current.title}</h1>
+            <h1 className="text-balance text-[56px] max-md:text-[32px] font-bold leading-[1.02] tracking-tight drop-shadow-lg">{current.title}</h1>
             <div className="mt-4 flex flex-wrap items-center gap-2.5 text-[14px] text-white/85">
               {d?.certification && <span className="badge">{d.certification}</span>}
               {ratingLabel(current.voteAverage) && <span className="badge !bg-[#01b4e4]/25">TMDB {ratingLabel(current.voteAverage)}</span>}
@@ -238,15 +259,15 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
                 <span key={i}>{x}</span>
               ))}
             </div>
-            <p className="mt-4 line-clamp-3 text-[16px] leading-relaxed text-white/80">{d?.tagline || current.overview}</p>
-            <div className="mt-7 flex items-center gap-3">
-              <button className="glass-button-primary !px-7 !py-3 !text-[15px]" disabled={!d || isLaunching} onClick={() => d && void playTitle(d)}>
+            <p className="mt-4 line-clamp-3 text-[16px] max-md:line-clamp-2 max-md:text-[14px] leading-relaxed text-white/80">{d?.tagline || current.overview}</p>
+            <div className="mt-7 flex flex-wrap items-center gap-3 max-md:mt-4 max-md:gap-2">
+              <button className="glass-button-primary !px-7 !py-3 !text-[15px] max-md:!px-5 max-md:!py-2.5" disabled={!d || isLaunching} onClick={() => d && void playTitle(d)}>
                 <PlayIcon size={18} /> {isLaunching ? "Opening…" : "Play Now"}
               </button>
-              <button className="glass-button !py-3" onClick={() => void toggleWatchlist(current)}>
+              <button className="glass-button !py-3 max-md:!px-4 max-md:!py-2.5" onClick={() => void toggleWatchlist(current)}>
                 {listed ? <CheckIcon size={18} /> : <PlusIcon size={18} />} Up Next
               </button>
-              <button className="glass-button !py-3" onClick={() => openTitle({ id: current.id, mediaType: current.mediaType, seed: current })}>
+              <button className="glass-button !py-3 max-md:!px-4 max-md:!py-2.5" onClick={() => openTitle({ id: current.id, mediaType: current.mediaType, seed: current })}>
                 More Info
               </button>
             </div>
@@ -254,7 +275,7 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
         </AnimatePresence>
       </div>
 
-      <div className="absolute bottom-[19%] right-8 z-20 flex items-center gap-3">
+      <div className="absolute bottom-[19%] right-8 z-20 flex items-center gap-3 max-md:bottom-[4%] max-md:right-4">
       <AnimatePresence>
         {showTrailer && trailerKey && (
           <m.button

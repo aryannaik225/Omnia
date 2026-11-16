@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-new-pin"
+description = "Enables the lan_new_pin command without any pre-configured scope."
+commands.allow = ["lan_new_pin"]
+
+[[permission]]
+identifier = "deny-lan-new-pin"
+description = "Denies the lan_new_pin command without any pre-configured scope."
+commands.deny = ["lan_new_pin"]

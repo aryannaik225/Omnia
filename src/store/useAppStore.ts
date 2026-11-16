@@ -3,6 +3,7 @@
  * owned by the Rust backend (Continue Watching, watchlist, recommendations) and toasts.
  * Every backend call goes through the typed bridge; per-profile data is reset on profile switch.
  */
+import { isRemote } from "../services/platform";
 import { create } from "zustand";
 import { registryAsCustomHubs } from "../config/hubsRegistry";
 import { detectRegionByIp } from "../services/catalog";
@@ -28,7 +29,7 @@ import {
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
 import { providerFamily } from "../lib/providers";
 
-export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings";
+export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote";
 
 export type ModalEntry =
   | { kind: "title"; id: number; mediaType: MediaType; seed?: MediaSummary; autoplay?: boolean }
@@ -230,7 +231,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   selectProfile: async (p) => {
-    await settingsApi.set(SettingKeys.activeProfileId, String(p.profileId));
+    // A phone / TV picks its own profile: the PC's "active profile" setting stays the PC's.
+    if (!isRemote) await settingsApi.set(SettingKeys.activeProfileId, String(p.profileId));
     set({
       activeProfile: p,
       profileGateOpen: false,

@@ -40,7 +40,7 @@ export function HorizontalScroller({ children, className = "row-scroller", label
   // The wrapper owns positioning: `.icon-button:hover` sets `transform`, which would clobber a
   // translate-based vertical centring on the button itself.
   const arrow = (dir: -1 | 1, hidden: boolean) => (
-    <span className={`pointer-events-none absolute inset-y-0 z-10 flex items-center ${dir < 0 ? "left-1" : "right-1"}`}>
+    <span data-nav-skip className={`pointer-events-none absolute inset-y-0 z-10 flex items-center ${dir < 0 ? "left-1" : "right-1"}`}>
       <button
         type="button"
         onClick={() => scroll(dir)}

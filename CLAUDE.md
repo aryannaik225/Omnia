@@ -309,6 +309,14 @@ Migration v5 also adds (all isolated by profile, `ON DELETE CASCADE`): `favorite
 
 Migration v6 adds `ott_sync_state (app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows)` (isolated by profile): the headless background delta sync (on startup and tray wake) reads only provider activity newer than `last_success_at` (48 h overlap); fresh activity is stored live (`is_imported = 0`) so viewing on other devices reaches Continue Watching.
 
+Migration v7 adds `lan_devices (device_id, device_name, token_hash UNIQUE, paired_at, last_seen_at)`: phones / TVs paired with the LAN companion server. Only the SHA-256 of each device's random 256-bit token is stored.
+
+**LAN companion & Android TV (Settings → Linked Devices, off by default):** `lan/mobile_server.rs` (axum, `0.0.0.0:8765`) serves the built React app plus `POST /api/invoke/{command}`, an **allow-list** bridge to desktop commands (no profile deletion, history wipes, OTT linking, player, importer or `lan_*` controls; `lan_*` settings are hidden from devices). Unpaired devices only get the pairing page; pairing takes a 6-digit PIN (10-min TTL, rotated after each pairing and after 5 wrong guesses) and returns an `HttpOnly; SameSite=Lax` cookie (browsers; Strict cookies are dropped by Safari on restored tabs) or bearer token (TV). Hosts other than IP literals / `localhost` / `.local` are refused (DNS rebinding); cross-site requests are refused except from the TV app's origin (`http://tauri.localhost`, CORS). UDP `8766` answers `OMNIA_DISCOVER` with the PC's name and port only. On Android, `lib.rs` compiles only `tv_client.rs` (no SQLite / ONNX / axum): the frontend is built with `VITE_OMNIA_THIN_CLIENT=1` (`npm run build:tv`, `tauri.android.conf.json`), talks to the PC over HTTP, and hands "Play" to the installed OTT app via Android intents (`open_in_app`). On iPhone, Play shows a tap-to-open link (Universal Links). `src/services/platform.ts` picks the transport (Tauri IPC / same-origin HTTP / HTTP + bearer); phones and TVs keep their own active profile. See `docs/PHONE_AND_TV.md`.
+
+**Developer Options:** tapping the version in Settings 7 times sets `dev_options_unlocked`; `dev_direct_stream` adds a "Stream (Dev)" button that opens a plain HLS / MP4 test player (hls.js, lazy-loaded). Test streams are never recorded.
+
+**`web-export/`** is a separate, optional Next.js + Supabase cloud edition (RLS on every table). It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to it by design.
+
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 
 ---
@@ -356,7 +364,9 @@ Maintain this exact repository structure:
 │   ├── tauri.conf.json
 │   └── src/
 │       ├── main.rs
-│       ├── lib.rs                        # Command registration & global shortcut initialization
+│       ├── lib.rs                        # Desktop backend or Android thin client (cfg)
+│       ├── desktop.rs                    # Command registration & global shortcut initialization
+│       ├── tv_client.rs                  # Android TV: LAN discovery + OTT app intents
 │       ├── db/
 │       │   ├── mod.rs                    # SQLite connection pool & schema migrations
 │       │   └── queries.rs                # CRUD for watch_history, deep_links, settings
@@ -372,6 +382,8 @@ Maintain this exact repository structure:
 │       │   └── recommender.rs            # Behavioral affinity weights, time-of-day centroids, Cosine + MMR
 │       └── lan/
 │           └── mobile_server.rs          # Optional local Axum server for zero-install iPhone Safari access
+├── docs/PHONE_AND_TV.md                  # LAN pairing, iPhone, Android TV APK build
+└── web-export/                           # Optional Next.js + Supabase cloud edition (separate project)
 ```
 
 ---

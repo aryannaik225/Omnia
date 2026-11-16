@@ -4,8 +4,11 @@
  */
 import { AnimatePresence, domMax, LazyMotion, m, MotionConfig } from "framer-motion";
 import { lazy, Suspense, useEffect, useRef, type CSSProperties } from "react";
-import { useRafCallback } from "./lib/hooks";
-import { isTauri } from "./services/tauriBridge";
+import { PHONE_QUERY, useMediaQuery, useRafCallback } from "./lib/hooks";
+import { handleNavKey, setBackHandler, setHomeHandler, startSpatialNavigation, type NavKey } from "./lib/spatialNav";
+import { useHandoff } from "./services/handoff";
+import { NotPairedError, platformMode, remoteControl, tvNavigation, UNPAIRED_EVENT } from "./services/platform";
+import { events, isTauri } from "./services/tauriBridge";
 import { useAppStore, type View } from "./store/useAppStore";
 import { usePlayerStore } from "./store/usePlayerStore";
 import { Toasts } from "./components/common/Toasts";
@@ -17,12 +20,18 @@ import { OttPickerModal } from "./components/modals/OttPickerModal";
 import { ProfileGate } from "./components/profile/ProfileGate";
 import { ContinueWatchingView, MyOttsView, SearchView, WatchlistView } from "./components/views/BrowseViews";
 import { HomeView } from "./components/views/HomeView";
+import { HandoffSheet } from "./components/modals/HandoffSheet";
+import { MobileTabBar } from "./components/layout/MobileTabBar";
+import { TvConnecting, TvPairing, useTvConnection } from "./components/tv/TvConnect";
+import { isVirtualKeyboardOpen, VirtualKeyboard, VK_CLOSE_EVENT } from "./components/tv/VirtualKeyboard";
 import wordmark from "./assets/omnia-wordmark.png";
 
 // Secondary screens load on demand to keep the startup bundle small.
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
 const CollectionsView = lazy(() => import("./components/views/CollectionsView").then((mod) => ({ default: mod.CollectionsView })));
 const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
+const RemoteView = lazy(() => import("./components/views/RemoteView").then((mod) => ({ default: mod.RemoteView })));
+const DevStreamPlayer = lazy(() => import("./components/modals/DevStreamPlayer").then((mod) => ({ default: mod.DevStreamPlayer })));
 const AccountSyncModal = lazy(() => import("./components/modals/AccountSyncModal").then((mod) => ({ default: mod.AccountSyncModal })));
 
 function CurrentView({ view }: { view: View }) {
@@ -43,6 +52,8 @@ function CurrentView({ view }: { view: View }) {
       return <CollectionsView />;
     case "settings":
       return <SettingsView />;
+    case "remote":
+      return <RemoteView />;
   }
 }
 
@@ -68,18 +79,20 @@ function Shell() {
   }, [view, activeHub]);
 
   const onScroll = useRafCallback(() => rememberScroll(view, main.current?.scrollTop ?? 0));
+  const phone = useMediaQuery(PHONE_QUERY);
 
   // Hover-expansion floats over the content; only a pinned sidebar reserves its full width.
-  const contentLeft = (pinned ? SIDEBAR_EXPANDED : SIDEBAR_COLLAPSED) + 32;
-  const style = { "--content-left": `${contentLeft}px` } as CSSProperties;
+  // Phones: no sidebar (bottom tab bar instead) and a 16 px gutter.
+  const contentLeft = phone ? 16 : (pinned ? SIDEBAR_EXPANDED : SIDEBAR_COLLAPSED) + 32;
+  const style = { "--content-left": `${contentLeft}px`, "--content-right": phone ? "16px" : "32px" } as CSSProperties;
   const fullBleed = view === "home";
 
   return (
     <>
-      <LiquidSidebar />
-      <main ref={main} onScroll={onScroll} className="h-full overflow-y-auto overflow-x-hidden" style={style}>
+      {phone ? <MobileTabBar /> : <LiquidSidebar />}
+      <main ref={main} onScroll={onScroll} className={`h-full overflow-y-auto overflow-x-hidden ${phone ? "pb-[calc(84px+env(safe-area-inset-bottom))]" : ""}`} style={style}>
         {/* In-flow sticky header: 16px from the top like the sidebar, so it never covers the hero. */}
-        <header className="sticky top-4 z-30 mt-4 pr-8 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)" }}>
+        <header className="sticky top-4 z-30 mt-4 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)", paddingRight: "var(--content-right)", marginTop: phone ? "max(16px, env(safe-area-inset-top))" : undefined }}>
           <TopFilterBar />
         </header>
         <AnimatePresence mode="wait">
@@ -89,8 +102,8 @@ function Shell() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-            className={fullBleed ? "pt-4" : "pr-8 pt-6 transition-[padding] duration-500"}
-            style={fullBleed ? undefined : { paddingLeft: "var(--content-left)" }}
+            className={fullBleed ? "pt-4" : "pt-6 transition-[padding] duration-500"}
+            style={fullBleed ? undefined : { paddingLeft: "var(--content-left)", paddingRight: "var(--content-right)" }}
           >
             <Suspense fallback={<div className="skeleton mt-10 h-[40vh] rounded-panel" />}>
               <CurrentView view={view} />
@@ -102,7 +115,9 @@ function Shell() {
       <OttPickerModal />
       <Suspense fallback={null}>
         <AccountSyncModal />
+        <DevStreamPlayer />
       </Suspense>
+      <HandoffSheet />
     </>
   );
 }
@@ -110,7 +125,7 @@ function Shell() {
 function Splash({ message, error = false }: { message: string; error?: boolean }) {
   return (
     <div className="flex h-full items-center justify-center">
-      <m.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="glass-panel w-[420px] px-8 py-7 text-center">
+      <m.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="glass-panel w-[min(420px,calc(100vw-32px))] px-8 py-7 text-center">
         <h1>
           <img src={wordmark} alt="Omnia" draggable={false} className="mx-auto h-12 w-auto" />
         </h1>
@@ -120,13 +135,124 @@ function Splash({ message, error = false }: { message: string; error?: boolean }
   );
 }
 
+/** The remote's / phone's Back: close the top layer, else go Home; false at the root. */
+function appBack(): boolean {
+  if (isVirtualKeyboardOpen()) {
+    window.dispatchEvent(new Event(VK_CLOSE_EVENT));
+    return true;
+  }
+  if (useHandoff.getState().pending) {
+    useHandoff.getState().clear();
+    return true;
+  }
+  const player = usePlayerStore.getState();
+  if (player.picker) {
+    player.closePicker();
+    return true;
+  }
+  const s = useAppStore.getState();
+  if (s.accountSyncOpen) {
+    s.setAccountSyncOpen(false);
+    return true;
+  }
+  if (s.modalStack.length) {
+    s.popModal();
+    return true;
+  }
+  if (s.view === "hubs" && s.activeHub) {
+    s.navigate("hubs", { hub: null });
+    return true;
+  }
+  if (s.view !== "home" && !s.profileGateOpen) {
+    s.navigate("home");
+    return true;
+  }
+  return false;
+}
+
 export default function App() {
+  const tv = useTvConnection();
+  // The TV client shows its own connect / pair screens until the PC answers.
+  if (platformMode === "tv" && !tv.ready) {
+    return (
+      <LazyMotion features={domMax} strict>
+        <AmbientBackground />
+        {tv.server ? <TvConnecting server={tv.server} onReady={tv.onReady} onForget={tv.forget} /> : <TvPairing onPaired={tv.paired} />}
+        <TvChrome />
+      </LazyMotion>
+    );
+  }
+  return <Main onUnpaired={tv.forget} />;
+}
+
+const goHome = () => {
+  const s = useAppStore.getState();
+  if (s.profileGateOpen) return;
+  s.closeModals();
+  s.setAccountSyncOpen(false);
+  s.navigate("home");
+};
+
+/**
+ * D-pad navigation and the on-screen keyboard (TV mode), and the phone remote's keys: the PC
+ * gets them as a desktop event, the TV picks them up from the PC (long-poll).
+ */
+function TvChrome({ remoteKeys = false }: { remoteKeys?: boolean }) {
+  useEffect(() => {
+    setBackHandler(appBack);
+    setHomeHandler(goHome);
+    if (!tvNavigation) return;
+    return startSpatialNavigation();
+  }, []);
+
+  useEffect(() => {
+    if (!remoteKeys) return;
+    if (platformMode === "desktop") {
+      let off: (() => void) | undefined;
+      let cancelled = false;
+      void events.onRemoteKey(({ key }) => handleNavKey(key as NavKey)).then((fn) => (cancelled ? fn() : (off = fn)));
+      return () => {
+        cancelled = true;
+        off?.();
+      };
+    }
+    if (platformMode !== "tv") return;
+    const ctrl = new AbortController();
+    void (async () => {
+      let failures = 0;
+      while (!ctrl.signal.aborted) {
+        try {
+          const key = await remoteControl.poll(ctrl.signal);
+          failures = 0;
+          if (key) handleNavKey(key);
+        } catch (e) {
+          if (ctrl.signal.aborted || e instanceof NotPairedError) return;
+          failures++;
+          await new Promise((r) => setTimeout(r, Math.min(15000, 1000 * failures)));
+        }
+      }
+    })();
+    return () => ctrl.abort();
+  }, [remoteKeys]);
+
+  return tvNavigation ? <VirtualKeyboard /> : null;
+}
+
+function Main({ onUnpaired }: { onUnpaired: () => void }) {
   const booted = useAppStore((s) => s.booted);
   const bootError = useAppStore((s) => s.bootError);
   const gateOpen = useAppStore((s) => s.profileGateOpen);
   const bootstrap = useAppStore((s) => s.bootstrap);
   const initListeners = usePlayerStore((s) => s.initListeners);
   const inTauri = isTauri();
+
+  // A revoked phone goes back to the pairing screen; a revoked TV forgets the PC.
+  useEffect(() => {
+    if (platformMode === "desktop") return;
+    const on = () => (platformMode === "lan" ? window.location.replace("/pair") : onUnpaired());
+    window.addEventListener(UNPAIRED_EVENT, on);
+    return () => window.removeEventListener(UNPAIRED_EVENT, on);
+  }, [onUnpaired]);
 
   useEffect(() => {
     if (!inTauri) return;
@@ -159,6 +285,7 @@ export default function App() {
           <Shell />
         )}
         <Toasts />
+        <TvChrome remoteKeys={booted && !bootError} />
       </MotionConfig>
     </LazyMotion>
   );
