@@ -7,7 +7,7 @@ import { useAsync, useInView } from "../../lib/hooks";
 import type { MediaSummary } from "../../services/tmdbClient";
 import type { MediaType } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
-import { PosterCard, SkeletonCard } from "../common/Cards";
+import { PosterCard, SkeletonCard, Top10Card, ViewMoreCard } from "../common/Cards";
 import { ChevronLeftIcon, ChevronRightIcon } from "../common/Icons";
 
 export interface CarouselItem {
@@ -32,12 +32,28 @@ export const fromSummary = (m: MediaSummary): CarouselItem => ({
   seed: m,
 });
 
-export function RowShell({ title, subtitle, children, onScroll }: { title: ReactNode; subtitle?: ReactNode; children: ReactNode; onScroll?: (dir: -1 | 1) => void }) {
+export function RowShell({
+  title,
+  subtitle,
+  extra,
+  children,
+  onScroll,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  /** Controls next to the heading (e.g. provider chips). */
+  extra?: ReactNode;
+  children: ReactNode;
+  onScroll?: (dir: -1 | 1) => void;
+}) {
   return (
     <section className="group/row relative">
       <div className="mb-3 flex items-end justify-between gap-4 pr-2">
         <div className="min-w-0">
-          <h2 className="section-title truncate">{title}</h2>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+            <h2 className="section-title truncate">{title}</h2>
+            {extra}
+          </div>
           {subtitle && <p className="mt-0.5 truncate text-[13px] text-label-tertiary">{subtitle}</p>}
         </div>
         {onScroll && (
@@ -56,18 +72,45 @@ export function RowShell({ title, subtitle, children, onScroll }: { title: React
   );
 }
 
-export function MediaCarouselRow({ title, subtitle, items, loading = false }: { title: ReactNode; subtitle?: ReactNode; items: CarouselItem[]; loading?: boolean }) {
+export function MediaCarouselRow({
+  title,
+  subtitle,
+  extra,
+  items,
+  loading = false,
+  variant = "poster",
+  onViewMore,
+  keepEmpty = false,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  extra?: ReactNode;
+  items: CarouselItem[];
+  loading?: boolean;
+  /** "top10": rank numerals overlapping each poster's bottom-left corner. */
+  variant?: "poster" | "top10";
+  /** Renders a "View More" card after the last item. */
+  onViewMore?: () => void;
+  /** Keep the header when there is nothing to show (rows whose controls change the query). */
+  keepEmpty?: boolean;
+}) {
   const openTitle = useAppStore((s) => s.openTitle);
   const scroller = useRef<HTMLDivElement | null>(null);
   const scroll = (dir: -1 | 1) => scroller.current?.scrollBy({ left: dir * scroller.current.clientWidth * 0.85, behavior: "smooth" });
 
-  if (!loading && items.length === 0) return null;
+  if (!loading && items.length === 0 && !keepEmpty) return null;
   return (
-    <RowShell title={title} subtitle={subtitle} onScroll={scroll}>
+    <RowShell title={title} subtitle={subtitle} extra={extra} onScroll={scroll}>
       <div ref={scroller} className="row-scroller">
-        {loading
-          ? Array.from({ length: 8 }, (_, i) => <SkeletonCard key={i} />)
-          : items.map((it) => (
+        {loading ? (
+          Array.from({ length: 8 }, (_, i) => <SkeletonCard key={i} />)
+        ) : items.length === 0 ? (
+          <p className="py-16 text-[14px] text-label-tertiary">Nothing to show here right now.</p>
+        ) : (
+          items.map((it, i) =>
+            variant === "top10" ? (
+              <Top10Card key={`${it.mediaType}-${it.id}`} rank={i + 1} title={it.title} posterPath={it.posterPath} onClick={() => openTitle({ id: it.id, mediaType: it.mediaType, seed: it.seed })} />
+            ) : (
               <PosterCard
                 key={`${it.mediaType}-${it.id}`}
                 title={it.title}
@@ -78,9 +121,25 @@ export function MediaCarouselRow({ title, subtitle, items, loading = false }: { 
                 caption={it.caption}
                 onClick={() => openTitle({ id: it.id, mediaType: it.mediaType, seed: it.seed })}
               />
-            ))}
+            ),
+          )
+        )}
+        {!loading && items.length > 0 && onViewMore && <ViewMoreCard onClick={onViewMore} />}
       </div>
     </RowShell>
+  );
+}
+
+/**
+ * Mounts its children only once the placeholder comes within `margin` of the viewport, so rows
+ * further down never fetch data or decode posters until the user scrolls toward them.
+ */
+export function LazySection({ children, margin = "700px", minHeight = 300 }: { children: ReactNode; margin?: string; minHeight?: number }) {
+  const [ref, inView] = useInView<HTMLDivElement>(margin);
+  return (
+    <div ref={ref} style={inView ? undefined : { minHeight }}>
+      {inView ? children : null}
+    </div>
   );
 }
 

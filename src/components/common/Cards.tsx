@@ -6,7 +6,8 @@ import { m, useMotionValue, useReducedMotion, useSpring } from "framer-motion";
 import { memo, useRef, type ReactNode } from "react";
 import { useRafCallback } from "../../lib/hooks";
 import { img } from "../../services/tmdbClient";
-import { StarIcon } from "./Icons";
+import tmdbLogo from "../../assets/tmdb-logo.svg";
+import { ChevronRightIcon } from "./Icons";
 
 const SPRING = { type: "spring", stiffness: 320, damping: 24, mass: 0.6 } as const;
 
@@ -52,6 +53,8 @@ interface PosterCardProps {
   subtitle?: string | null;
   /** Element shown in the artwork's top-right corner on hover (e.g. remove). */
   cornerAction?: ReactNode;
+  /** Artwork only (no title / year / rating lines), e.g. Top 10 cards. */
+  hideMeta?: boolean;
   onClick: () => void;
 }
 
@@ -66,6 +69,7 @@ export const PosterCard = memo(function PosterCard({
   progress,
   subtitle,
   cornerAction,
+  hideMeta = false,
   onClick,
 }: PosterCardProps) {
   const { ref, rx, ry, onMove, reset } = useSpecular();
@@ -103,20 +107,96 @@ export const PosterCard = memo(function PosterCard({
         )}
         {cornerAction && <span className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100">{cornerAction}</span>}
       </m.button>
-      <div className="mt-2.5 px-0.5">
-        <p className="truncate text-[13px] font-medium text-label-primary">{title}</p>
-        {subtitle && <p className="truncate text-[12px] text-label-secondary">{subtitle}</p>}
-        <p className="flex items-center gap-1.5 truncate text-[12px] text-label-tertiary">
-          {year && <span>{year}</span>}
-          {rating ? (
-            <span className="inline-flex items-center gap-0.5">
-              <StarIcon size={10} className="text-yellow-300" />
-              {rating.toFixed(1)}
-            </span>
-          ) : null}
-          {caption && <span className="truncate">{year || rating ? "· " : ""}{caption}</span>}
-        </p>
+      {!hideMeta && (
+        <div className="mt-2.5 px-0.5">
+          <p className="truncate text-[13px] font-medium text-label-primary">{title}</p>
+          {subtitle && <p className="truncate text-[12px] text-label-secondary">{subtitle}</p>}
+          <p className="flex items-center gap-1.5 truncate text-[12px] text-label-tertiary">
+            {year && <span>{year}</span>}
+            {rating ? <TmdbRating value={rating} /> : null}
+            {caption && <span className="truncate">{year || rating ? "· " : ""}{caption}</span>}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+});
+
+/** The official TMDB logo next to the score ("[TMDB] 8.3"). */
+export function TmdbRating({ value, size = "sm" }: { value: number; size?: "sm" | "md" }) {
+  return (
+    <span className={`inline-flex shrink-0 items-center ${size === "md" ? "gap-1.5" : "gap-1"}`} aria-label={`TMDB rating ${value.toFixed(1)}`}>
+      <img src={tmdbLogo} alt="" draggable={false} className={size === "md" ? "h-[11px] w-auto" : "h-[8px] w-auto"} />
+      <span className="tabular-nums">{value.toFixed(1)}</span>
+    </span>
+  );
+}
+
+/**
+ * Top 10 card: a huge outlined rank numeral whose right edge tucks under the poster's
+ * bottom-left corner (Netflix-style). "10" is wider, so its card reserves more room.
+ */
+export const Top10Card = memo(function Top10Card({ rank, title, posterPath, onClick }: { rank: number; title: string; posterPath: string | null; onClick: () => void }) {
+  return (
+    <div className={`top10-card relative flex shrink-0 items-end ${rank >= 10 ? "top10-card--wide" : ""}`}>
+      <span aria-hidden className="top10-rank">
+        {rank}
+      </span>
+      <div className="top10-poster relative z-[1]">
+        <PosterCard title={`${rank}. ${title}`} posterPath={posterPath} width="fill" hideMeta onClick={onClick} />
       </div>
+    </div>
+  );
+});
+
+/** The 21st slot of a row: opens the full-page grid for that category. */
+export function ViewMoreCard({ onClick, landscape = false, label = "View More" }: { onClick: () => void; landscape?: boolean; label?: string }) {
+  return (
+    <div className="shrink-0" style={{ width: landscape ? "min(300px, var(--landscape-max, 300px))" : "min(168px, var(--poster-max, 168px))" }}>
+      <m.button
+        type="button"
+        onClick={onClick}
+        whileHover={{ scale: 1.06, zIndex: 5 }}
+        whileFocus={{ scale: 1.06, zIndex: 5 }}
+        whileTap={{ scale: 0.98 }}
+        transition={SPRING}
+        className={`view-more-card group flex w-full flex-col items-center justify-center gap-3 outline-none ${landscape ? "aspect-video" : "aspect-[2/3]"}`}
+        aria-label={label}
+      >
+        <span className="flex h-12 w-12 items-center justify-center rounded-full bg-white/12 shadow-[inset_0_1px_0_rgba(255,255,255,0.25)] transition-transform duration-300 group-hover:translate-x-1">
+          <ChevronRightIcon size={22} />
+        </span>
+        <span className="text-[14px] font-semibold tracking-tight">{label}</span>
+      </m.button>
+    </div>
+  );
+}
+
+/** "Browse by Service": the provider's app icon on glass, with its own colours bleeding behind. */
+export const ServiceCard = memo(function ServiceCard({ name, logoPath, onClick }: { name: string; logoPath: string | null; onClick: () => void }) {
+  const src = img(logoPath, "w154");
+  return (
+    <div className="shrink-0" style={{ width: "min(220px, var(--landscape-max, 220px))" }}>
+      <m.button
+        type="button"
+        onClick={onClick}
+        whileHover={{ scale: 1.06, zIndex: 5 }}
+        whileFocus={{ scale: 1.06, zIndex: 5 }}
+        whileTap={{ scale: 0.98 }}
+        transition={SPRING}
+        className="media-card group relative flex aspect-video w-full items-center justify-center overflow-hidden outline-none"
+        aria-label={`Popular on ${name}`}
+      >
+        {src && <img src={src} alt="" aria-hidden className="absolute inset-0 h-full w-full scale-150 object-cover opacity-45 blur-2xl saturate-150" draggable={false} />}
+        <span className="absolute inset-0 bg-[rgba(18,18,22,0.45)]" />
+        {src ? (
+          <img src={src} alt="" loading="lazy" className="relative h-[54%] w-auto rounded-[14px] shadow-[0_8px_24px_rgba(0,0,0,0.45)]" draggable={false} />
+        ) : (
+          <span className="relative text-[18px] font-bold">{name}</span>
+        )}
+        <span className="specular-sheen" />
+        <span className="absolute inset-x-3 bottom-2 truncate text-center text-[12px] font-medium text-white/80">{name}</span>
+      </m.button>
     </div>
   );
 });

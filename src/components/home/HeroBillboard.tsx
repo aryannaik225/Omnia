@@ -6,7 +6,8 @@
 import { AnimatePresence, m } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { extractPalette } from "../../lib/color";
-import { formatRuntime, ratingLabel } from "../../lib/format";
+import { formatRuntime } from "../../lib/format";
+import { TmdbRating } from "../common/Cards";
 import { providerFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
 import { details as tmdbDetails, img, type MediaDetails, type MediaSummary } from "../../services/tmdbClient";
@@ -254,7 +255,11 @@ export function HeroBillboard({ items }: { items: MediaSummary[] }) {
             <h1 className="text-balance text-[56px] max-md:text-[32px] font-bold leading-[1.02] tracking-tight drop-shadow-lg">{current.title}</h1>
             <div className="mt-4 flex flex-wrap items-center gap-2.5 text-[14px] text-white/85">
               {d?.certification && <span className="badge">{d.certification}</span>}
-              {ratingLabel(current.voteAverage) && <span className="badge !bg-[#01b4e4]/25">TMDB {ratingLabel(current.voteAverage)}</span>}
+              {current.voteAverage ? (
+                <span className="badge !bg-black/30">
+                  <TmdbRating value={current.voteAverage} size="md" />
+                </span>
+              ) : null}
               {meta.map((x, i) => (
                 <span key={i}>{x}</span>
               ))}

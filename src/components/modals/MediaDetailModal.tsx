@@ -5,7 +5,7 @@
 import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { extractPalette } from "../../lib/color";
-import { formatRuntime, MONETIZATION_LABEL, ratingLabel } from "../../lib/format";
+import { formatRuntime, MONETIZATION_LABEL } from "../../lib/format";
 import { useAsync } from "../../lib/hooks";
 import { groupLinks, isSubscribedLink, providerLogo } from "../../services/catalog";
 import { providerFamily } from "../../lib/providers";
@@ -21,10 +21,10 @@ import {
 import { catalog, history, type ResolvedLink, type WatchHistoryEntry } from "../../services/tauriBridge";
 import { useAppStore, type ModalEntry } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { PosterCard } from "../common/Cards";
+import { PosterCard, TmdbRating } from "../common/Cards";
 import { HorizontalScroller } from "../common/HorizontalScroller";
 import { CollectionMenu, EpisodeWatchedToggle, FavoriteButton, MarkWatchedButton } from "../common/LibraryActions";
-import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon, StarIcon } from "../common/Icons";
+import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
 import { fromSummary, MediaCarouselRow } from "../home/MediaCarouselRow";
 import { useDevMode } from "../../services/devMode";
@@ -315,12 +315,11 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
           <h1 className="text-[46px] max-md:text-[30px] font-bold leading-[1.04] tracking-tight drop-shadow-lg">{seed.title}</h1>
           <div className="mt-3 flex flex-wrap items-center gap-2.5 text-[14px] text-white/85">
             {d?.certification && <span className="badge">{d.certification}</span>}
-            {ratingLabel(seed.voteAverage) && (
-              <span className="badge !bg-[#01b4e4]/25">
-                <StarIcon size={11} className="mr-1 text-yellow-300" />
-                TMDB {ratingLabel(seed.voteAverage)}
+            {seed.voteAverage ? (
+              <span className="badge !bg-black/30">
+                <TmdbRating value={seed.voteAverage} size="md" />
               </span>
-            )}
+            ) : null}
             {seed.year && <span>{seed.year}</span>}
             {d && <span>{d.mediaType === "tv" ? `${d.numberOfSeasons ?? d.seasons.length} Season${(d.numberOfSeasons ?? 1) > 1 ? "s" : ""}` : formatRuntime(d.runtimeMins)}</span>}
             {d?.genres.slice(0, 3).map((g) => <span key={g.id}>{g.name}</span>)}

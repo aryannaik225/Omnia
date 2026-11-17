@@ -29,7 +29,22 @@ import {
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
 import { providerFamily } from "../lib/providers";
 
-export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote";
+export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote" | "browse";
+
+/** A Home row registry entry (see config/homeRows): `arg` / `label` parameterise it (provider ids, seed titles). */
+export interface RowRef {
+  id: string;
+  arg?: string;
+  label?: string;
+}
+
+/** What the full-page "View More" / "Popular on [Platform]" grid shows. */
+export type BrowseTarget =
+  | { kind: "row"; ref: RowRef; logoPath?: string | null }
+  | { kind: "static"; key: string; title: string; subtitle?: string; items: MediaSummary[] };
+
+export const browseKey = (t: BrowseTarget | null) =>
+  !t ? "" : t.kind === "static" ? `s:${t.key}` : `r:${t.ref.id}:${t.ref.arg ?? ""}`;
 
 export type ModalEntry =
   | { kind: "title"; id: number; mediaType: MediaType; seed?: MediaSummary; autoplay?: boolean }
@@ -65,6 +80,9 @@ interface AppState {
 
   view: View;
   activeHub: string | null;
+  /** Full-page grid target while `view === "browse"`, and the view Back returns to. */
+  browse: BrowseTarget | null;
+  browseFrom: View;
   /** Provider family key (see lib/providers) shown exclusively, or null. */
   providerFilter: string | null;
   searchQuery: string;
@@ -106,7 +124,7 @@ interface AppState {
   setTrailerAutoplay: (on: boolean) => Promise<void>;
   setTmdbKey: (key: string) => Promise<void>;
 
-  navigate: (view: View, opts?: { hub?: string | null }) => void;
+  navigate: (view: View, opts?: { hub?: string | null; browse?: BrowseTarget }) => void;
   rememberScroll: (view: View, top: number) => void;
   setSearchQuery: (q: string) => void;
   setProviderFilter: (familyKey: string | null) => void;
@@ -155,6 +173,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   view: "home",
   activeHub: null,
+  browse: null,
+  browseFrom: "home",
   providerFilter: null,
   searchQuery: "",
   sidebarPinned: false,
@@ -247,6 +267,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       modalStack: [],
       view: "home",
       activeHub: null,
+      browse: null,
       scrollPositions: {},
     });
     await Promise.all([get().refreshContinueWatching(), get().refreshWatchlist()]);
@@ -343,10 +364,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   // ------------------------------------------------------------------------------------------
 
   navigate: (view, opts) =>
-    set((s) => ({
-      view,
-      activeHub: opts?.hub !== undefined ? opts.hub : view === "hubs" ? s.activeHub : null,
-    })),
+    set((s) => {
+      const base = { view, activeHub: opts?.hub !== undefined ? opts.hub : view === "hubs" ? s.activeHub : null };
+      if (view !== "browse") return { ...base, browse: null };
+      // Every grid opens at the top; Back returns to the view (and scroll position) it came from.
+      return {
+        ...base,
+        browse: opts?.browse ?? s.browse,
+        browseFrom: s.view === "browse" ? s.browseFrom : s.view,
+        scrollPositions: { ...s.scrollPositions, browse: 0 },
+      };
+    }),
   rememberScroll: (view, top) => set((s) => ({ scrollPositions: { ...s.scrollPositions, [view]: top } })),
   setSearchQuery: (q) => set((s) => ({ searchQuery: q, view: q.trim() ? "search" : s.view === "search" ? "home" : s.view })),
   setProviderFilter: (familyKey) => set({ providerFilter: familyKey }),

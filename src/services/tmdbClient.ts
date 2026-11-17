@@ -202,8 +202,8 @@ export const isKidsSafe = (m: MediaSummary) =>
 // Endpoints
 // ---------------------------------------------------------------------------------------------
 
-export async function trending(type: "all" | MediaType = "all", window: "day" | "week" = "week") {
-  return toPaged(await request<RawPaged>(`/trending/${type}/${window}`), type === "all" ? undefined : type);
+export async function trending(type: "all" | MediaType = "all", window: "day" | "week" = "week", page = 1) {
+  return toPaged(await request<RawPaged>(`/trending/${type}/${window}`, page > 1 ? { page } : {}), type === "all" ? undefined : type);
 }
 
 export async function discover(mt: MediaType, ctx: CatalogContext, params: Params = {}, page = 1) {
@@ -213,6 +213,25 @@ export async function discover(mt: MediaType, ctx: CatalogContext, params: Param
     page,
   });
   return toPaged(raw, mt);
+}
+
+/** Movies in cinemas now in a region (`/movie/now_playing`). */
+export async function nowPlaying(region: string, page = 1) {
+  return toPaged(await request<RawPaged>("/movie/now_playing", { region, page }), "movie");
+}
+
+/** TMDB's "more like this" for one title; falls back to `/similar` when it has no recommendations. */
+export async function titleRecommendations(mt: MediaType, id: number, page = 1): Promise<Paged<MediaSummary>> {
+  const recs = toPaged(await request<RawPaged>(`/${mt}/${id}/recommendations`, { page }, 6 * 3600_000), mt);
+  if (recs.results.length || page > 1) return recs;
+  return toPaged(await request<RawPaged>(`/${mt}/${id}/similar`, { page }, 6 * 3600_000), mt);
+}
+
+/** A single title as a list summary (long-lived cache; used by curated ID lists). */
+export async function titleSummary(mt: MediaType, id: number): Promise<MediaSummary | null> {
+  const raw = await request<RawListItem & { genres?: { id: number }[] }>(`/${mt}/${id}`, {}, 7 * 24 * 3600_000);
+  const s = toSummary({ ...raw, media_type: mt }, mt);
+  return s ? { ...s, genreIds: (raw.genres ?? []).map((g) => g.id) } : null;
 }
 
 export async function searchMulti(query: string, page = 1) {

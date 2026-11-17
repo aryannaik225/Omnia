@@ -6,7 +6,8 @@ import { useAsync } from "../../lib/hooks";
 import { history, type ContinueWatchingItem } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { LandscapeCard } from "../common/Cards";
+import { LandscapeCard, ViewMoreCard } from "../common/Cards";
+import { ROW_CAP } from "../../config/homeRows";
 import { EmptyState } from "../common/EmptyState";
 import { RowShell } from "./MediaCarouselRow";
 
@@ -38,6 +39,7 @@ export function ContinueWatchingRow() {
   // "My Subscriptions": keep titles last watched on (or streaming on) a subscribed service.
   const { items } = useSubscriptionFilter(all, (it) => ({ id: it.tmdbId, mediaType: it.mediaType, providerName: it.providerName }));
   const openTitle = useAppStore((s) => s.openTitle);
+  const navigate = useAppStore((s) => s.navigate);
   const resume = usePlayerStore((s) => s.resumeItem);
   const launching = usePlayerStore((s) => s.launching);
   const scroller = useRef<HTMLDivElement | null>(null);
@@ -71,7 +73,7 @@ export function ContinueWatchingRow() {
       onScroll={(dir) => scroller.current?.scrollBy({ left: dir * scroller.current.clientWidth * 0.85, behavior: "smooth" })}
     >
       <div ref={scroller} className="row-scroller">
-        {items.map((item) => (
+        {items.slice(0, ROW_CAP).map((item) => (
           <LandscapeCard
             key={`${item.mediaType}-${item.tmdbId}`}
             title={item.title ?? "Untitled"}
@@ -102,6 +104,7 @@ export function ContinueWatchingRow() {
             onClick={() => (item.isManual && item.mediaType === "movie" ? openTitle({ id: item.tmdbId, mediaType: item.mediaType }) : void resume(item))}
           />
         ))}
+        {items.length > ROW_CAP && <ViewMoreCard landscape onClick={() => navigate("continue")} />}
       </div>
     </RowShell>
   );

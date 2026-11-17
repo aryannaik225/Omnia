@@ -9,7 +9,7 @@ import { handleNavKey, setBackHandler, setHomeHandler, startSpatialNavigation, t
 import { useHandoff } from "./services/handoff";
 import { NotPairedError, platformMode, remoteControl, tvNavigation, UNPAIRED_EVENT } from "./services/platform";
 import { events, isTauri } from "./services/tauriBridge";
-import { useAppStore, type View } from "./store/useAppStore";
+import { browseKey, useAppStore, type View } from "./store/useAppStore";
 import { usePlayerStore } from "./store/usePlayerStore";
 import { Toasts } from "./components/common/Toasts";
 import { AmbientBackground } from "./components/layout/AmbientBackground";
@@ -30,6 +30,7 @@ import wordmark from "./assets/omnia-wordmark.png";
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
 const CollectionsView = lazy(() => import("./components/views/CollectionsView").then((mod) => ({ default: mod.CollectionsView })));
 const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
+const BrowseCategoryView = lazy(() => import("./components/views/BrowseCategoryView").then((mod) => ({ default: mod.BrowseCategoryView })));
 const RemoteView = lazy(() => import("./components/views/RemoteView").then((mod) => ({ default: mod.RemoteView })));
 const DevStreamPlayer = lazy(() => import("./components/modals/DevStreamPlayer").then((mod) => ({ default: mod.DevStreamPlayer })));
 const AccountSyncModal = lazy(() => import("./components/modals/AccountSyncModal").then((mod) => ({ default: mod.AccountSyncModal })));
@@ -54,12 +55,15 @@ function CurrentView({ view }: { view: View }) {
       return <SettingsView />;
     case "remote":
       return <RemoteView />;
+    case "browse":
+      return <BrowseCategoryView />;
   }
 }
 
 function Shell() {
   const view = useAppStore((s) => s.view);
   const activeHub = useAppStore((s) => s.activeHub);
+  const browse = useAppStore((s) => browseKey(s.browse));
   const pinned = useAppStore((s) => s.sidebarPinned);
   const rememberScroll = useAppStore((s) => s.rememberScroll);
   const profileId = useAppStore((s) => s.activeProfile?.profileId);
@@ -72,13 +76,32 @@ function Shell() {
     void refreshStatus();
   }, [profileId, refreshMappings, refreshStatus]);
 
-  // Restore the exact scroll position per view (e.g. after "Back to Hub").
+  // Restore the exact scroll position per view (e.g. after "Back to Hub" or a "View More" grid).
+  // While the old view animates out the page is briefly empty and the browser clamps scrollTop
+  // to 0: scroll events are ignored until the new view has mounted, then the position is applied.
+  const restoring = useRef<number | null>(null);
   useEffect(() => {
     const top = useAppStore.getState().scrollPositions[view] ?? 0;
+    restoring.current = top;
     main.current?.scrollTo({ top });
-  }, [view, activeHub]);
+    // No exit animation when only the hub changes (same key): finish on a timer instead.
+    const t = setTimeout(finishRestore, 700);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, activeHub, browse]);
+  function finishRestore() {
+    const top = restoring.current;
+    if (top === null) return;
+    main.current?.scrollTo({ top });
+    requestAnimationFrame(() => {
+      main.current?.scrollTo({ top });
+      restoring.current = null;
+    });
+  }
 
-  const onScroll = useRafCallback(() => rememberScroll(view, main.current?.scrollTop ?? 0));
+  const onScroll = useRafCallback(() => {
+    if (restoring.current === null) rememberScroll(view, main.current?.scrollTop ?? 0);
+  });
   const phone = useMediaQuery(PHONE_QUERY);
 
   // Hover-expansion floats over the content; only a pinned sidebar reserves its full width.
@@ -95,9 +118,9 @@ function Shell() {
         <header className="sticky top-4 z-30 mt-4 transition-[padding] duration-500" style={{ paddingLeft: "var(--content-left)", paddingRight: "var(--content-right)", marginTop: phone ? "max(16px, env(safe-area-inset-top))" : undefined }}>
           <TopFilterBar />
         </header>
-        <AnimatePresence mode="wait">
+        <AnimatePresence mode="wait" onExitComplete={finishRestore}>
           <m.div
-            key={view}
+            key={view === "browse" ? `browse:${browse}` : view}
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
@@ -157,6 +180,10 @@ function appBack(): boolean {
   }
   if (s.modalStack.length) {
     s.popModal();
+    return true;
+  }
+  if (s.view === "browse") {
+    s.navigate(s.browseFrom);
     return true;
   }
   if (s.view === "hubs" && s.activeHub) {

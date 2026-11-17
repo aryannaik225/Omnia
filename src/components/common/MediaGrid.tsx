@@ -3,6 +3,7 @@
  * skip rendering via `content-visibility` (cheap virtualization for long hub/search feeds).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSubscriptionFilter } from "../../lib/availability";
 import { useInView } from "../../lib/hooks";
 import type { MediaSummary } from "../../services/tmdbClient";
 import { useAppStore } from "../../store/useAppStore";
@@ -20,9 +21,13 @@ interface MediaGridProps {
   header?: MediaSummary[];
   emptyMessage?: string;
   filter?: (m: MediaSummary) => boolean;
+  /** The feed doesn't apply "My Subscriptions" itself: verify each title before showing it. */
+  verify?: boolean;
 }
 
-export function MediaGrid({ feedKey, loadPage, header = [], emptyMessage = "Nothing to show here yet.", filter }: MediaGridProps) {
+const NONE: MediaSummary[] = [];
+
+export function MediaGrid({ feedKey, loadPage, header = [], emptyMessage = "Nothing to show here yet.", filter, verify = false }: MediaGridProps) {
   const openTitle = useAppStore((s) => s.openTitle);
   const [items, setItems] = useState<MediaSummary[]>([]);
   const [page, setPage] = useState(0);
@@ -69,7 +74,9 @@ export function MediaGrid({ feedKey, loadPage, header = [], emptyMessage = "Noth
   }, [inView, page, error, loadMore]);
 
   const headerKeys = new Set(header.map((m) => `${m.mediaType}-${m.id}`));
-  const visible = [...header, ...items.filter((m) => !headerKeys.has(`${m.mediaType}-${m.id}`))].filter((m) => !filter || filter(m));
+  const all = [...header, ...items.filter((m) => !headerKeys.has(`${m.mediaType}-${m.id}`))].filter((m) => !filter || filter(m));
+  const verified = useSubscriptionFilter(verify ? all : NONE, (m) => ({ id: m.id, mediaType: m.mediaType }));
+  const visible = verify ? verified.items : all;
 
   return (
     <div>
