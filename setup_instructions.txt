@@ -1,0 +1,213 @@
+===============================================================================
+                    OMNIA - SETUP GUIDE (for everyone)
+       All your streaming services in one app, on your PC, phone and TV
+===============================================================================
+
+This guide walks you through three things:
+
+  PART 1.  Installing Omnia on your Windows PC
+  PART 2.  Finding the PIN and QR code in Omnia's settings
+  PART 3.  Opening Omnia on your phone or TV using a web browser
+
+No technical knowledge is needed. It takes about 5 minutes.
+
+
+-------------------------------------------------------------------------------
+ WHAT YOU NEED
+-------------------------------------------------------------------------------
+
+  * A Windows 10 or Windows 11 PC, connected to the internet.
+  * The Omnia installer file:  Omnia_1.0.0_x64-setup.exe
+  * For phones / TVs: the phone or TV must be on the SAME Wi-Fi as the PC.
+
+
+===============================================================================
+ PART 1 - INSTALL OMNIA ON YOUR PC
+===============================================================================
+
+ 1. Find the file "Omnia_1.0.0_x64-setup.exe" (usually in your Downloads
+    folder) and double-click it.
+
+ 2. Windows might show a blue box that says "Windows protected your PC".
+    This appears for new apps that Windows doesn't know yet.
+      -> Click "More info", then click "Run anyway".
+
+ 3. The Omnia installer opens. Click "Next" / "Install" and wait until it
+    says it has finished. You do NOT need an administrator password; Omnia
+    installs just for your Windows user.
+
+    (On some Windows 10 PCs the installer quietly downloads a small Microsoft
+    component called "WebView2" first. That's normal and needs internet.)
+
+ 4. Click "Finish". Omnia opens automatically. You'll also find it in the
+    Start menu: press the Windows key and type "Omnia".
+
+ 5. FIRST LAUNCH
+      * Omnia shows a "Who's watching?" screen. Click your profile or create
+        one (you can add one for each family member, and kids profiles too).
+      * Omnia works out your country by itself. To change it, click the globe
+        button at the top right (for example "IN" or "US").
+      * In the first minutes Omnia quietly downloads its recommendation
+        engine (about 25 MB). You can keep using the app meanwhile.
+
+ 6. RECOMMENDED: tell Omnia which services you pay for
+      * Open Settings (the gear icon at the bottom of the left-hand menu).
+      * Under "My Subscriptions", tick the services you use (Netflix, Prime
+        Video, JioHotstar, ...).
+      * Then click "My Subscriptions" in the top bar to only see titles you
+        can watch without paying extra.
+
+ Good to know:
+   * Closing the Omnia window keeps it running in the background, as a small
+     icon near the clock at the bottom right of your screen (the "tray"). To
+     fully quit, right-click that icon and choose Quit.
+   * Everything Omnia knows about you stays on THIS PC. Nothing is sent to an
+     Omnia server; there isn't one.
+
+
+===============================================================================
+ PART 2 - FIND THE PIN AND QR CODE (to connect a phone or TV)
+===============================================================================
+
+ Phones and TVs connect to Omnia ON YOUR PC over your home Wi-Fi. First you
+ switch this on and get a pairing PIN:
+
+ 1. In Omnia on your PC, open Settings (gear icon, bottom of the left menu).
+
+ 2. Scroll to the section called  "Linked Devices".
+
+ 3. Turn on the switch:  "Allow phones & TVs on this network".
+
+ 4. If Windows asks whether to allow Omnia on networks, choose
+    "Private networks" (your home Wi-Fi) and click "Allow".
+    Do not choose public networks.
+
+ 5. The Linked Devices section now shows:
+      * a 6-DIGIT PIN             (for example  482 913)
+      * a QR CODE                 (a black-and-white square to scan)
+      * your PC's ADDRESS         (looks like  http://192.168.1.23:8765 )
+      * a list of paired devices, each with a "Revoke" button
+
+ About the PIN:
+   * It changes every 10 minutes and after every successful pairing, so
+     always use the one currently on screen.
+   * Need a fresh one? Click "New PIN".
+   * You only pair each phone or TV ONCE. After that it is remembered.
+   * Lost a phone or want to disconnect a device? Click "Revoke" next to it.
+
+
+===============================================================================
+ PART 3 - OPEN OMNIA ON YOUR PHONE OR TV (web browser, port 8765)
+===============================================================================
+
+ Before you start:
+   * Your PC must be switched on, with Omnia running (the tray icon is fine).
+   * The phone / TV must be on the SAME Wi-Fi as the PC (not a "guest" Wi-Fi).
+   * Keep Settings > Linked Devices open on the PC so you can see the PIN.
+
+ -----------------------------------------------------------------------------
+  OPTION A - PHONE, EASIEST: SCAN THE QR CODE
+ -----------------------------------------------------------------------------
+
+  1. Open your phone's Camera app.
+  2. Point it at the QR code on your PC screen.
+  3. Tap the link that pops up. Omnia opens in your phone's browser and
+     pairs automatically. Done!
+
+ -----------------------------------------------------------------------------
+  OPTION B - PHONE, TABLET OR TV: TYPE THE ADDRESS
+ -----------------------------------------------------------------------------
+
+  1. Open the web browser (Safari on iPhone/iPad, Chrome on Android, or the
+     "Internet" / "Browser" app on a smart TV).
+
+  2. In the ADDRESS BAR at the top (not a Google search box), type your PC's
+     address EXACTLY as shown in Linked Devices, including ":8765" at the end.
+     For example:
+
+            http://192.168.1.23:8765
+
+     * Start with  http://  (NOT https://)
+     * The numbers are different for every home; copy yours from the PC.
+     * 8765 is Omnia's "port". It must be there, after a colon.
+
+  3. A pairing page appears. Type the 6-digit PIN shown on your PC and
+     confirm.
+
+  4. That's it: you're browsing your Omnia library. Pick your profile on
+     the "Who's watching?" screen.
+
+ -----------------------------------------------------------------------------
+  TIPS
+ -----------------------------------------------------------------------------
+
+  * Make it an app icon:
+      - iPhone (Safari):  tap Share -> "Add to Home Screen".
+      - Android (Chrome): tap the three-dot menu -> "Add to Home screen".
+    Next time just tap the icon; no PIN needed.
+
+  * Pressing PLAY on a phone opens the title in the real Netflix / Prime
+    Video / JioHotstar app on that phone (when it's installed). What you
+    watch there syncs back to Omnia on the PC automatically.
+
+  * Use your phone as a REMOTE: open the "Remote" tab on the phone to control
+    Omnia on your PC (or on a TV running Omnia): arrows, OK, Back, Play/Pause.
+
+  * Each phone or TV keeps its own chosen profile, so the kids' tablet can
+    stay on the kids profile.
+
+
+===============================================================================
+ TROUBLESHOOTING
+===============================================================================
+
+ "This site can't be reached" / the page never loads on the phone or TV
+   -> Is the PC on, with Omnia running (check the tray icon near the clock)?
+   -> Is the phone / TV on the SAME Wi-Fi as the PC? Not a guest network,
+      and not mobile data (turn Wi-Fi on, mobile data doesn't reach your PC).
+   -> Is "Allow phones & TVs on this network" switched ON in Linked Devices?
+   -> Did you type  http://  (not https://)  and  :8765  at the end?
+   -> Windows firewall may have blocked it. Open Windows Settings ->
+      "Privacy & security" -> "Windows Security" -> "Firewall & network
+      protection" -> "Allow an app through firewall", find Omnia and tick
+      "Private". Then try again.
+   -> Some routers block devices from talking to each other ("AP isolation"
+      or "client isolation"). If nothing else works, check your router's
+      Wi-Fi settings or try a different Wi-Fi band (2.4 GHz vs 5 GHz).
+
+ "Wrong PIN" or "PIN expired"
+   -> The PIN changes every 10 minutes and after each pairing. Use the one
+      currently on the PC screen, or click "New PIN".
+   -> After 5 wrong tries the PIN is replaced for safety; use the new one.
+
+ The PC's address changed (the phone stopped connecting after a few days)
+   -> Your router may give the PC a new address now and then. Check the
+      address in Linked Devices again and update your phone's bookmark or
+      home-screen icon.
+
+ Windows says "Windows protected your PC" during install
+   -> Click "More info" -> "Run anyway". (Shown for apps that are new to
+      Windows.)
+
+ Omnia on the PC says "Connect TMDB to start browsing"
+   -> Open Settings and paste the TMDB key you were given, or ask the person
+      who gave you Omnia.
+
+
+===============================================================================
+ PRIVACY & SAFETY, IN SHORT
+===============================================================================
+
+  * Your watch history, profiles and recommendations are stored only on your
+    PC. Omnia has no cloud and no account.
+  * Phones and TVs read everything directly from your PC over your own
+    Wi-Fi. Only devices you paired with the PIN can get in, and you can
+    revoke any of them at any time.
+  * The phone/TV connection is meant for your HOME Wi-Fi. Don't switch it on
+    while your PC is on public Wi-Fi (cafes, airports, hotels).
+  * Paired phones and TVs cannot delete profiles, wipe history or change
+    Omnia's settings on your PC.
+
+===============================================================================
+                              Enjoy Omnia!
+===============================================================================
