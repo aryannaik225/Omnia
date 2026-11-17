@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("migrations/005_favorites_collections_manual.sql")),
     (6, include_str!("migrations/006_ott_sync_state.sql")),
     (7, include_str!("migrations/007_lan_devices.sql")),
+    (8, include_str!("migrations/008_title_vectors.sql")),
 ];
 
 /// Cheap-to-clone handle to the local database (internally an mpsc sender to the SQLite thread).

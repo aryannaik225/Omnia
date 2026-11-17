@@ -40,7 +40,6 @@ use crate::{AppError, AppResult};
 
 pub const EMBEDDING_DIM: usize = 384;
 pub const ONNX_MODEL_ID: &str = "all-MiniLM-L6-v2-quint8@1110a24";
-pub const HASHED_MODEL_ID: &str = "hashed-sublinear-tf-384-v1";
 
 const MODEL_REVISION: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
 const MODEL_FILE: &str = "model_quint8_avx2.onnx";
@@ -344,49 +343,177 @@ impl MediaDocument {
         t
     }
 
-    /// Natural-language rendering consumed by the transformer.
-    pub fn to_text(&self) -> String {
-        let mut parts = vec![format!("{}.", self.title)];
-        let mut push = |label: &str, items: &[String]| {
-            if !items.is_empty() {
-                parts.push(format!("{label}: {}.", items.join(", ")));
-            }
-        };
-        push("Genres", &self.genres);
-        push("Mood", &self.moods);
-        push("Themes", &self.keywords);
-        push("Directed by", &self.directors);
-        push("Starring", &self.cast);
-        push("Studios", &self.studios);
-        if !self.overview.is_empty() {
-            parts.push(self.overview.clone());
-        }
-        parts.join(" ")
+    /// Text for the semantic plot block: the overview alone (title-prefixed for context).
+    pub fn plot_text(&self) -> Option<String> {
+        (!self.overview.trim().is_empty()).then(|| format!("{}. {}", self.title, self.overview.trim()))
     }
 
-    /// Weighted sparse features consumed by the hashing fallback.
-    fn weighted_features(&self) -> Vec<(String, f32)> {
-        let mut out = Vec::new();
-        let mut field = |prefix: &str, items: &[String], w: f32| {
-            for it in items {
-                out.push((format!("{prefix}:{}", it.to_lowercase()), w));
-            }
-        };
-        field("g", &self.genres, 2.0);
-        field("k", &self.keywords, 1.5);
-        field("m", &self.moods, 1.5);
-        field("d", &self.directors, 1.2);
-        field("c", &self.cast, 0.8);
-        field("s", &self.studios, 0.8);
-        let mut tf: HashMap<String, f32> = HashMap::new();
-        for word in basic_tokenize(&self.overview) {
-            if word.chars().count() >= 3 && !is_stopword(&word) && word.chars().any(char::is_alphanumeric) {
-                *tf.entry(format!("w:{word}")).or_default() += 1.0;
-            }
-        }
-        out.extend(tf.into_iter().map(|(w, n)| (w, 1.0 + n.ln())));
-        out
+    /// Text for the semantic half of the keyword block ("cyberpunk, time loop, dark comedy").
+    pub fn keyword_text(&self) -> Option<String> {
+        (!self.keywords.is_empty()).then(|| self.keywords.join(", "))
     }
+
+    /// Director(s) / creators and the top three billed cast members.
+    fn auteurs(&self) -> impl Iterator<Item = (&String, f32)> {
+        self.directors
+            .iter()
+            .take(2)
+            .map(|d| (d, AUTEUR_DIRECTOR_WEIGHT))
+            .chain(self.cast.iter().take(3).zip(AUTEUR_CAST_WEIGHTS))
+    }
+
+    /// Fingerprint of everything the composite vector is built from (stored with the vector, so a
+    /// title whose metadata changed is re-embedded).
+    pub fn content_hash(&self) -> String {
+        let mut s = format!("{COMPOSITE_VERSION}|{}|{}", self.title, self.overview);
+        for part in [&self.genres, &self.keywords, &self.directors] {
+            s.push('|');
+            s.push_str(&part.join(","));
+        }
+        s.push('|');
+        s.push_str(&self.cast.iter().take(3).cloned().collect::<Vec<_>>().join(","));
+        format!("{:016x}", fnv1a64(&s))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Composite "vibe" vector
+// ---------------------------------------------------------------------------------------------
+//
+// Four blocks, each L2-normalised on its own (or all-zero when the title has no data for it),
+// concatenated after scaling by √weight. For two titles a and b this makes
+//
+//     a · b = 0.40·cos(keywords) + 0.25·cos(auteur) + 0.20·cos(genres) + 0.15·cos(plot)
+//
+// exactly, so the weights are a hard property of the space rather than a tuning hint, and a block
+// a title lacks (no keywords fetched yet) contributes 0 instead of being renormalised upwards.
+// The composite has norm ≤ 1; ranking uses the dot product against a unit query.
+
+/// Bump when the composite layout or features change (invalidates stored vectors).
+const COMPOSITE_VERSION: &str = "composite-v1";
+pub const COMPOSITE_ONNX_ID: &str = "composite-v1(kw.40,auteur.25,genre.20,plot.15)+all-MiniLM-L6-v2-quint8@1110a24";
+pub const COMPOSITE_HASHED_ID: &str = "composite-v1(kw.40,auteur.25,genre.20,plot.15)+hashed-384";
+
+pub const W_KEYWORDS: f32 = 0.40;
+pub const W_AUTEUR: f32 = 0.25;
+pub const W_GENRE: f32 = 0.20;
+pub const W_PLOT: f32 = 0.15;
+
+/// Hashed exact-keyword space ("time loop" ≠ "time travel", but they share the word "time").
+const KEYWORD_HASH_DIM: usize = 512;
+const AUTEUR_DIM: usize = 256;
+/// A whole keyword counts more than one of its words.
+const KEYWORD_WEIGHT: f32 = 1.0;
+const KEYWORD_WORD_WEIGHT: f32 = 0.5;
+/// The director sets the vibe more than any single actor; cast by billing order.
+const AUTEUR_DIRECTOR_WEIGHT: f32 = 1.4;
+const AUTEUR_CAST_WEIGHTS: [f32; 3] = [1.0, 0.85, 0.7];
+
+/// Base TMDB genre taxonomy. TV's combined genres map onto the movie axes ("Sci-Fi & Fantasy"
+/// → Science Fiction + Fantasy), so a series and a film share genre space.
+const GENRE_AXES: [&str; 25] = [
+    "action", "adventure", "animation", "comedy", "crime", "documentary", "drama", "family", "fantasy",
+    "history", "horror", "music", "mystery", "romance", "science fiction", "tv movie", "thriller", "war",
+    "western", "kids", "news", "reality", "soap", "talk", "politics",
+];
+
+fn genre_axes(name: &str) -> Vec<usize> {
+    let lower = name.trim().to_lowercase();
+    let names: Vec<&str> = match lower.as_str() {
+        "action & adventure" => vec!["action", "adventure"],
+        "sci-fi & fantasy" => vec!["science fiction", "fantasy"],
+        "war & politics" => vec!["war", "politics"],
+        other => vec![other],
+    };
+    names.iter().filter_map(|n| GENRE_AXES.iter().position(|a| a == n)).collect()
+}
+
+/// Signed feature hashing into `dim`, L2-normalised (all-zero when there are no features).
+fn hashed_block(dim: usize, features: impl IntoIterator<Item = (String, f32)>) -> Vec<f32> {
+    let mut v = vec![0f32; dim];
+    for (feature, weight) in features {
+        let h = fnv1a64(&feature);
+        let sign = if (h >> 63) & 1 == 1 { -1.0 } else { 1.0 };
+        v[(h % dim as u64) as usize] += sign * weight;
+    }
+    l2_normalize(&mut v);
+    v
+}
+
+/// Exact keywords plus their individual words (so related keywords overlap partially).
+pub fn keyword_block(doc: &MediaDocument) -> Vec<f32> {
+    let mut feats = Vec::new();
+    for k in &doc.keywords {
+        let k = k.trim().to_lowercase();
+        if k.is_empty() {
+            continue;
+        }
+        for word in k.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() >= 3 && !is_stopword(w)) {
+            feats.push((format!("w:{word}"), KEYWORD_WORD_WEIGHT));
+        }
+        feats.push((format!("k:{k}"), KEYWORD_WEIGHT));
+    }
+    hashed_block(KEYWORD_HASH_DIM, feats)
+}
+
+/// Director(s) + top 3 cast. One "person" space, so an actor-director matches across roles.
+pub fn auteur_block(doc: &MediaDocument) -> Vec<f32> {
+    hashed_block(AUTEUR_DIM, doc.auteurs().map(|(name, w)| (format!("p:{}", name.trim().to_lowercase()), w)))
+}
+
+/// One-hot over the genre taxonomy.
+pub fn genre_block(doc: &MediaDocument) -> Vec<f32> {
+    let mut v = vec![0f32; GENRE_AXES.len()];
+    for g in &doc.genres {
+        for axis in genre_axes(g) {
+            v[axis] = 1.0;
+        }
+    }
+    l2_normalize(&mut v);
+    v
+}
+
+/// Hashing fallback for the plot block: sublinear term frequency of the overview's words.
+pub fn hashed_plot_block(doc: &MediaDocument) -> Vec<f32> {
+    let mut tf: HashMap<String, f32> = HashMap::new();
+    for word in basic_tokenize(&doc.overview) {
+        if word.chars().count() >= 3 && !is_stopword(&word) && word.chars().any(char::is_alphanumeric) {
+            *tf.entry(format!("w:{word}")).or_default() += 1.0;
+        }
+    }
+    hashed_block(EMBEDDING_DIM, tf.into_iter().map(|(w, n)| (w, 1.0 + n.ln())))
+}
+
+/// Concatenates unit (or zero) blocks, each scaled by √weight.
+pub fn compose(blocks: &[(&[f32], f32)]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blocks.iter().map(|(b, _)| b.len()).sum());
+    for (block, weight) in blocks {
+        let s = weight.sqrt();
+        out.extend(block.iter().map(|x| x * s));
+    }
+    out
+}
+
+/// Composite vector when the plot (and keyword-semantic) blocks come from elsewhere.
+/// `keyword_semantic` = transformer embedding of the keyword list: with it, the keyword weight
+/// is split evenly between exact matches and meaning ("time loop" ≈ "groundhog day").
+pub fn composite(doc: &MediaDocument, plot: &[f32], keyword_semantic: Option<&[f32]>) -> Vec<f32> {
+    let (kw, auteur, genre) = (keyword_block(doc), auteur_block(doc), genre_block(doc));
+    match keyword_semantic {
+        Some(sem) => compose(&[
+            (&kw, W_KEYWORDS / 2.0),
+            (sem, W_KEYWORDS / 2.0),
+            (&auteur, W_AUTEUR),
+            (&genre, W_GENRE),
+            (plot, W_PLOT),
+        ]),
+        None => compose(&[(&kw, W_KEYWORDS), (&auteur, W_AUTEUR), (&genre, W_GENRE), (plot, W_PLOT)]),
+    }
+}
+
+/// Fully local composite (no transformer): every block hashed.
+pub fn hashed_composite(doc: &MediaDocument) -> Vec<f32> {
+    composite(doc, &hashed_plot_block(doc), None)
 }
 
 fn is_stopword(w: &str) -> bool {
@@ -548,19 +675,6 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-/// Signed feature hashing (deterministic random projection) into `EMBEDDING_DIM`.
-pub fn hashed_embedding(doc: &MediaDocument) -> Vec<f32> {
-    let mut v = vec![0f32; EMBEDDING_DIM];
-    for (feature, weight) in doc.weighted_features() {
-        let h = fnv1a64(&feature);
-        let idx = (h % EMBEDDING_DIM as u64) as usize;
-        let sign = if (h >> 63) & 1 == 1 { -1.0 } else { 1.0 };
-        v[idx] += sign * weight;
-    }
-    l2_normalize(&mut v);
-    v
-}
-
 struct OnnxEmbedder {
     // Held so the ONNX Runtime environment outlives the session.
     _env: ort::environment::Environment,
@@ -677,20 +791,46 @@ impl Embedder {
         Self { backend: Backend::Hashed }
     }
 
+    /// Id of the vector space this embedder produces (composite layout + text backend).
     pub fn model_id(&self) -> &'static str {
         match self.backend {
-            Backend::Onnx(_) => ONNX_MODEL_ID,
-            Backend::Hashed => HASHED_MODEL_ID,
+            Backend::Onnx(_) => COMPOSITE_ONNX_ID,
+            Backend::Hashed => COMPOSITE_HASHED_ID,
         }
     }
 
+    /// Composite "vibe" vectors. With the transformer, the plot block and half of the keyword
+    /// block are sentence embeddings (one batched pass over every non-empty text); the auteur and
+    /// genre blocks are always exact.
     pub fn embed(&self, docs: &[MediaDocument]) -> AppResult<Vec<Vec<f32>>> {
         match &self.backend {
             Backend::Onnx(model) => {
-                let texts: Vec<String> = docs.iter().map(MediaDocument::to_text).collect();
-                model.embed(&texts)
+                // (doc index, is_keywords, text) for every non-empty text.
+                let jobs: Vec<(usize, bool, String)> = docs
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, d)| [d.plot_text().map(|t| (i, false, t)), d.keyword_text().map(|t| (i, true, t))])
+                    .flatten()
+                    .collect();
+                let texts: Vec<String> = jobs.iter().map(|(_, _, t)| t.clone()).collect();
+                let vectors = model.embed(&texts)?;
+                let zero = vec![0f32; EMBEDDING_DIM];
+                let mut plot: Vec<Option<Vec<f32>>> = vec![None; docs.len()];
+                let mut kw: Vec<Option<Vec<f32>>> = vec![None; docs.len()];
+                for ((i, is_kw, _), v) in jobs.into_iter().zip(vectors) {
+                    if is_kw {
+                        kw[i] = Some(v);
+                    } else {
+                        plot[i] = Some(v);
+                    }
+                }
+                Ok(docs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| composite(d, plot[i].as_deref().unwrap_or(&zero), Some(kw[i].as_deref().unwrap_or(&zero))))
+                    .collect())
             }
-            Backend::Hashed => Ok(docs.iter().map(hashed_embedding).collect()),
+            Backend::Hashed => Ok(docs.iter().map(hashed_composite).collect()),
         }
     }
 }
@@ -959,7 +1099,8 @@ mod tests {
         assert_eq!(doc.directors, vec!["Denis Villeneuve"]);
         assert_eq!(doc.cast, vec!["A Lead", "B Actor"]);
         assert!(doc.moods.contains(&"mind-bending".to_string()));
-        assert!(doc.to_text().contains("Directed by: Denis Villeneuve."));
+        assert_eq!(doc.keyword_text().as_deref(), Some("time travel"));
+        assert_eq!(doc.plot_text().as_deref(), Some("Arrival. Linguist."));
 
         let ids_only = entry("X", json!({"ids": [27, 53]}), json!(["haunted house"]), "");
         assert_eq!(MediaDocument::from_catalog(&ids_only).genres, vec!["Horror", "Thriller"]);
@@ -1008,16 +1149,105 @@ mod tests {
         let (related, unrelated) = (dot(&v[0], &v[1]), dot(&v[0], &v[2]));
         eprintln!("cos(space, space) = {related:.3}, cos(space, wedding) = {unrelated:.3}");
         assert!(related > unrelated + 0.2);
+
+        // Composite "vibe" vectors on real titles (TMDB keywords / credits / genres / overviews).
+        let embedder = Embedder { backend: Backend::Onnx(model) };
+        let film = |title: &str, kw: &[&str], dir: &str, cast: &[&str], genres: &[&str], plot: &str| MediaDocument {
+            title: title.into(),
+            overview: plot.into(),
+            genres: genres.iter().map(|s| s.to_string()).collect(),
+            keywords: kw.iter().map(|s| s.to_string()).collect(),
+            directors: vec![dir.into()],
+            cast: cast.iter().map(|s| s.to_string()).collect(),
+            studios: vec![],
+            moods: vec![],
+        };
+        let docs = [
+            film("Blade Runner", &["cyberpunk", "dystopia", "android", "neo-noir", "future noir"], "Ridley Scott", &["Harrison Ford", "Rutger Hauer", "Sean Young"], &["Science Fiction", "Drama", "Thriller"], "In the smog-choked dystopian Los Angeles of 2019, blade runner Rick Deckard is called out of retirement to terminate a quartet of replicants who have escaped to Earth seeking their creator for a way to extend their short life spans."),
+            film("Ghost in the Shell", &["cyberpunk", "cyborg", "artificial intelligence", "hacker", "dystopia"], "Mamoru Oshii", &["Atsuko Tanaka", "Akio Otsuka", "Iemasa Kayumi"], &["Animation", "Science Fiction", "Action"], "In the year 2029, the barriers of our world have been broken down by the net and by cybernetics. Cyborg Major Motoko Kusanagi hunts a mysterious hacker known as the Puppet Master."),
+            film("Notting Hill", &["bookshop", "movie star", "romantic comedy", "london"], "Roger Michell", &["Julia Roberts", "Hugh Grant", "Rhys Ifans"], &["Romance", "Comedy", "Drama"], "The British owner of a small travel bookshop in Notting Hill has his life turned upside down when a famous American actress walks into his store."),
+            film("Groundhog Day", &["time loop", "small town", "weatherman", "repeated day"], "Harold Ramis", &["Bill Murray", "Andie MacDowell", "Chris Elliott"], &["Romance", "Fantasy", "Drama", "Comedy"], "A narcissistic TV weatherman, along with his attractive-but-distant producer and his mawkish cameraman, is sent to report on Groundhog Day, where he finds himself living the same day over and over."),
+            film("Palm Springs", &["time loop", "wedding", "desert", "repeated day"], "Max Barbakow", &["Andy Samberg", "Cristin Milioti", "J.K. Simmons"], &["Comedy", "Romance", "Science Fiction"], "When carefree Nyles and reluctant maid of honor Sarah have a chance encounter at a Palm Springs wedding, things get complicated when they find themselves unable to escape the venue, themselves, or each other."),
+            film("Edge of Tomorrow", &["time loop", "alien invasion", "soldier", "repeated day"], "Doug Liman", &["Tom Cruise", "Emily Blunt", "Bill Paxton"], &["Action", "Science Fiction"], "Major Bill Cage is an officer who has never seen a day of combat when he is unceremoniously demoted and dropped into combat. Cage is killed within minutes, but finds himself thrown into a time loop."),
+        ];
+        let v = embedder.embed(&docs).unwrap();
+        let sim = |a: usize, b: usize| dot(&v[a], &v[b]);
+        for i in 0..docs.len() {
+            let row: Vec<String> = (0..docs.len()).map(|j| format!("{:.2}", sim(i, j))).collect();
+            eprintln!("{:<20} {}", docs[i].title, row.join("  "));
+        }
+        assert!(sim(0, 1) > sim(0, 2) + 0.15, "Blade Runner should be closer to Ghost in the Shell than to Notting Hill");
+        // Groundhog Day's nearest neighbours are the other time-loop films, not the romcom.
+        assert!(sim(3, 4) > sim(3, 2) && sim(3, 5) > sim(3, 0));
     }
 
     #[test]
-    fn hashed_embeddings_are_normalized_and_semantic() {
+    fn hashed_composites_are_unit_and_semantic() {
         let scifi = MediaDocument::from_catalog(&entry("A", json!(["Science Fiction"]), json!(["space", "alien"]), "astronauts explore space"));
         let scifi2 = MediaDocument::from_catalog(&entry("B", json!(["Science Fiction"]), json!(["space"]), "a crew in deep space"));
         let romcom = MediaDocument::from_catalog(&entry("C", json!(["Romance", "Comedy"]), json!(["wedding"]), "two strangers fall in love"));
-        let (a, b, c) = (hashed_embedding(&scifi), hashed_embedding(&scifi2), hashed_embedding(&romcom));
+        let (a, b, c) = (hashed_composite(&scifi), hashed_composite(&scifi2), hashed_composite(&romcom));
         let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        // Every block present => unit norm (the √weights sum to 1).
         assert!((dot(&a, &a) - 1.0).abs() < 1e-5);
         assert!(dot(&a, &b) > dot(&a, &c));
+    }
+
+    fn doc(keywords: &[&str], director: &str, cast: &[&str], genres: &[&str], overview: &str) -> MediaDocument {
+        MediaDocument {
+            title: "T".into(),
+            overview: overview.into(),
+            genres: genres.iter().map(|s| s.to_string()).collect(),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            directors: vec![director.into()],
+            cast: cast.iter().map(|s| s.to_string()).collect(),
+            studios: vec![],
+            moods: vec![],
+        }
+    }
+
+    #[test]
+    fn composite_similarity_is_the_weighted_sum_of_block_cosines() {
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        let base = doc(&["cyberpunk", "dystopia"], "Ridley Scott", &["A", "B", "C"], &["Science Fiction"], "replicants hunted in a rainy city");
+        let full = hashed_composite(&base);
+
+        // Same everything but nothing in common in the plot: exactly 1 - 0.15.
+        let mut other_plot = base.clone();
+        other_plot.overview = "bakers compete wholesome pastry tournament".into();
+        assert!((dot(&full, &hashed_composite(&other_plot)) - (1.0 - W_PLOT)).abs() < 0.02);
+
+        // Only the keywords shared: 0.40.
+        let only_kw = doc(&["cyberpunk", "dystopia"], "Nobody", &["X", "Y", "Z"], &["Romance"], "bakers compete wholesome pastry tournament");
+        assert!((dot(&full, &hashed_composite(&only_kw)) - W_KEYWORDS).abs() < 0.03);
+
+        // Only the auteurs shared: 0.25; only the genre shared: 0.20.
+        let only_auteur = doc(&["wedding"], "Ridley Scott", &["A", "B", "C"], &["Romance"], "bakers compete wholesome pastry tournament");
+        assert!((dot(&full, &hashed_composite(&only_auteur)) - W_AUTEUR).abs() < 0.03);
+        let only_genre = doc(&["wedding"], "Nobody", &["X", "Y", "Z"], &["Science Fiction"], "bakers compete wholesome pastry tournament");
+        assert!((dot(&full, &hashed_composite(&only_genre)) - W_GENRE).abs() < 0.03);
+
+        // A missing block contributes nothing (the vector is not renormalised upward).
+        let no_keywords = doc(&[], "Ridley Scott", &["A", "B", "C"], &["Science Fiction"], "replicants hunted in a rainy city");
+        let v = hashed_composite(&no_keywords);
+        assert!((dot(&v, &v) - (1.0 - W_KEYWORDS)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn related_keywords_overlap_partially() {
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        let loop_ = keyword_block(&doc(&["time loop"], "", &[], &[], ""));
+        let travel = keyword_block(&doc(&["time travel"], "", &[], &[], ""));
+        let wedding = keyword_block(&doc(&["wedding"], "", &[], &[], ""));
+        assert!(dot(&loop_, &travel) > 0.1 && dot(&loop_, &travel) < 0.9);
+        assert!(dot(&loop_, &wedding).abs() < 0.1);
+    }
+
+    #[test]
+    fn tv_genres_share_the_movie_taxonomy() {
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        let series = genre_block(&doc(&[], "", &[], &["Sci-Fi & Fantasy"], ""));
+        let film = genre_block(&doc(&[], "", &[], &["Science Fiction"], ""));
+        assert!(dot(&series, &film) > 0.7);
     }
 }

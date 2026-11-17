@@ -1362,6 +1362,7 @@ pub fn run() {
             recommender::get_recommendations,
             recommender::get_taste_summary,
             recommender::get_embedding_status,
+            recommender::get_similar_titles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Omnia");

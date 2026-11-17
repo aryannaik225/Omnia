@@ -91,8 +91,8 @@ function BecauseRows({ signals, env }: { signals: PersonalSignals; env: RowEnv }
 }
 
 /**
- * "We Think You'll Love These": the on-device ML taste row (the profile's taste centroid, where
- * Loved titles carry the most weight). If the model has no row yet, an aggregate of TMDB
+ * "We Think You'll Love These": the on-device ML taste row (K-means clusters of the profile's
+ * composite vectors, Loved titles weighted highest). If the model has no row yet, an aggregate of TMDB
  * recommendations across your Loved titles (or, with none, your watch history). Hidden when
  * there are neither likes nor history.
  */
@@ -123,14 +123,16 @@ function LoveRow({ signals, env }: { signals: PersonalSignals; env: RowEnv }) {
   if (source === "none") return null;
   const subtitle = source === "liked" ? "Based on everything you've loved" : "Based on your watch history";
   if (taste) {
+    // Several taste clusters: the backend names each side ("Blending 3 sides of your taste: …").
+    const tasteSubtitle = taste.subtitle ?? subtitle;
     return (
       <StaticRow
         title="We Think You'll Love These"
-        subtitle={subtitle}
+        subtitle={tasteSubtitle}
         items={items}
         trusted={trusted}
         onViewMore={() =>
-          navigate("browse", { browse: { kind: "static", key: `love:${recs?.generatedAt}`, title: "We Think You'll Love These", subtitle, items: taste.items.map(recToSummary) } })
+          navigate("browse", { browse: { kind: "static", key: `love:${recs?.generatedAt}`, title: "We Think You'll Love These", subtitle: tasteSubtitle, items: taste.items.map(recToSummary) } })
         }
       />
     );

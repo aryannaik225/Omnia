@@ -698,7 +698,19 @@ export const recommendations = {
   tasteSummary: (appProfileId: number, limit = 50) =>
     invoke<TasteSummary>("get_taste_summary", { appProfileId, limit }),
   embeddingStatus: () => invoke<EmbeddingStatus>("get_embedding_status"),
+  /** "More Like This": local nearest neighbours of one title by composite vibe vector. */
+  similar: (appProfileId: number, tmdbId: number, mediaType: MediaType) =>
+    invoke<SimilarTitles>("get_similar_titles", { appProfileId, tmdbId, mediaType }),
 };
+
+export interface SimilarTitles {
+  tmdbId: number;
+  mediaType: MediaType;
+  modelId: string;
+  /** How many titles the local search compared against. */
+  searched: number;
+  items: RecommendedItem[];
+}
 
 // ---------------------------------------------------------------------------------------------
 // LAN companion server (desktop Settings → Linked Devices; never callable from a LAN device)

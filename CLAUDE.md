@@ -118,9 +118,10 @@ When a user logs into an OTT platform (Netflix, Prime Video, JioHotstar, etc.) i
 
 ### 5.6 Next-Gen Local ML Recommendation Engine (Vector + Behavioral)
 Move beyond basic genre matching by implementing a multi-layered local recommendation engine in Rust:
-1. **Rich Feature Vectorization (Local ONNX Embeddings):**
-   - For every movie/series interacted with or candidate fetched, construct a rich semantic document combining: `Overview + TMDB Keywords + Genres + Director + Top 5 Cast + Production Studios + Mood/Tone descriptors`.
-   - Pass this text through a local quantized ONNX embedding model (`all-MiniLM-L6-v2` via Rust `ort`) or TF-IDF + SVD fallback to generate a normalized 384-dimensional float vector stored as a binary BLOB in SQLite (`media_embeddings`).
+1. **Composite "Vibe" Vectors (Local ONNX Embeddings):**
+   - Every movie/series is a composite of four separately normalised blocks concatenated with √weight scaling, so the dot product of two titles is exactly `0.40·cos(keywords) + 0.25·cos(director + top 3 cast) + 0.20·cos(genres) + 0.15·cos(plot)` (a block a title lacks contributes 0).
+   - Keywords: hashed exact keywords + their words, plus (with the model) a sentence embedding of the keyword list. Auteur: hashed director / creators + top 3 billed cast. Genres: one-hot over the TMDB taxonomy (TV combo genres split onto the movie axes). Plot: local quantized ONNX `all-MiniLM-L6-v2` (via Rust `ort`) embedding of the overview, or hashed term frequency as the fallback.
+   - Vectors are stored per profile in `media_embeddings` and, content-only, in `title_vectors` (migration v8) keyed by model and a content hash.
 2. **Implicit Behavioral Signal Scoring:**
    - Every user interaction updates an implicit affinity weight $W_i$ for that title:
      - **Binge Velocity Bonus:** Watching 3+ episodes of a series in a single session applies a $+1.8\times$ multiplier.
@@ -128,8 +129,9 @@ Move beyond basic genre matching by implementing a multi-layered local recommend
      - **Early Abandonment Penalty:** Starting a movie/show, watching between 10 and 25 minutes, and abandoning it for $>7$ days applies a $-0.8$ negative weight (teaching the engine what the user dislikes).
      - **Rewatch Signal:** Watching a title more than once (like an annual *Twilight* rewatch) flags it as a "Comfort Favorite" ($+2.0$ weight).
      - **Time-of-Day Contextual Bucketing:** Logs the hour of day (`Morning`, `Afternoon`, `PrimeTime 20:00-23:00`, `LateNight 23:00-04:00`) to compute separate user taste centroids per time window (e.g., lighter sitcoms at night vs. dense sci-fi thrillers on weekends).
-3. **Dynamic User Taste Centroid & MMR Ranking:**
-   - Computes the weighted average vector (User Taste Centroid) and performs fast **Cosine Similarity** against candidate pools fetched from TMDB's discovery/trending/similar pipelines filtered by the user's active region and OTT subscriptions.
+3. **Taste Clusters, Nearest Neighbours & MMR Ranking:**
+   - "We Think You'll Love These" runs weighted spherical **K-Means** over the profile's liked / watched composite vectors (K = 1 up to 10 titles, 2 up to 30, 3 beyond), searches nearest neighbours around each centroid against candidate pools fetched from TMDB's discovery/trending/recommendation pipelines (filtered by the user's active region and OTT subscriptions), and interleaves the results in proportion to cluster mass (e.g. 7 / 7 / 6). A weighted global centroid and per-time-of-day centroids still drive the contextual rows.
+   - The info page's "More Like This" (`get_similar_titles`, sub-second fast path) is a single-title nearest-neighbour search over titles already embedded in `title_vectors` (only the title itself is embedded if needed), followed by TMDB's recommendations / similar titles in their raw order.
    - Applies **Maximal Marginal Relevance (MMR)** to ensure row diversity so recommendations feel fresh, surprising, and hyper-personalized rather than repetitive.
    - Generates dynamic rows with explainable micro-copy: *"Because you binged Stranger Things late at night"*, *"Atmospheric Sci-Fi matching your taste profile"*, *"Rediscover your Comfort Favorites"*.
 
@@ -310,6 +312,8 @@ Migration v5 also adds (all isolated by profile, `ON DELETE CASCADE`): `favorite
 Migration v6 adds `ott_sync_state (app_profile_id, provider_id, last_attempt_at, last_success_at, last_error, last_new_rows)` (isolated by profile): the headless background delta sync (on startup and tray wake) reads only provider activity newer than `last_success_at` (48 h overlap); fresh activity is stored live (`is_imported = 0`) so viewing on other devices reaches Continue Watching.
 
 Migration v7 adds `lan_devices (device_id, device_name, token_hash UNIQUE, paired_at, last_seen_at)`: phones / TVs paired with the LAN companion server. Only the SHA-256 of each device's random 256-bit token is stored.
+
+Migration v8 adds `title_vectors (tmdb_id, media_type, model_id, doc_hash, vector_blob, updated_at)`: content-only composite vectors (never user data), re-embedded when a title's metadata hash changes; vectors from other models are pruned.
 
 **LAN companion & Android TV (Settings → Linked Devices, off by default):** `lan/mobile_server.rs` (axum, `0.0.0.0:8765`) serves the built React app plus `POST /api/invoke/{command}`, an **allow-list** bridge to desktop commands (no profile deletion, history wipes, OTT linking, player, importer or `lan_*` controls; `lan_*` settings are hidden from devices). Unpaired devices only get the pairing page; pairing takes a 6-digit PIN (10-min TTL, rotated after each pairing and after 5 wrong guesses) and returns an `HttpOnly; SameSite=Lax` cookie (browsers; Strict cookies are dropped by Safari on restored tabs) or bearer token (TV). Hosts other than IP literals / `localhost` / `.local` are refused (DNS rebinding); cross-site requests are refused except from the TV app's origin (`http://tauri.localhost`, CORS). UDP `8766` answers `OMNIA_DISCOVER` with the PC's name and port only. On Android, `lib.rs` compiles only `tv_client.rs` (no SQLite / ONNX / axum): the frontend is built with `VITE_OMNIA_THIN_CLIENT=1` (`npm run build:tv`, `tauri.android.conf.json`), talks to the PC over HTTP, and hands "Play" to the installed OTT app via Android intents (`open_in_app`). On iPhone, Play shows a tap-to-open link (Universal Links). `src/services/platform.ts` picks the transport (Tauri IPC / same-origin HTTP / HTTP + bearer); phones and TVs keep their own active profile. See `docs/PHONE_AND_TV.md`.
 

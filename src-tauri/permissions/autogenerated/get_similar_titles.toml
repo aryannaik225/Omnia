@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-similar-titles"
+description = "Enables the get_similar_titles command without any pre-configured scope."
+commands.allow = ["get_similar_titles"]
+
+[[permission]]
+identifier = "deny-get-similar-titles"
+description = "Denies the get_similar_titles command without any pre-configured scope."
+commands.deny = ["get_similar_titles"]

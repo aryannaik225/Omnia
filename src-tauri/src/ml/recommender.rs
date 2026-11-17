@@ -8,14 +8,22 @@
 //!    completion `+1.0`, Comfort Favorite (rewatch) `+2.0`, binge velocity `×1.8`,
 //!    early abandonment `−0.8`, plus partial progress, watchlist intent, engagement and skimming,
 //!    all decayed by recency (half-life 120 days) so the taste profile keeps moving.
-//! 3. **Taste centroids** — weighted average of title embeddings (positive weights pull, negative
-//!    weights push away, Rocchio-style), plus one centroid per time-of-day bucket. The query vector
-//!    for "now" blends the global centroid with the current bucket's centroid.
+//! 3. **Composite vectors & taste clusters** — every title is a composite "vibe" vector
+//!    (embeddings.rs: keywords 40%, director + top-3 cast 25%, genres 20%, plot 15%). The
+//!    profile's positive titles are clustered with weighted spherical K-means (K = 1 / 2 / 3 by
+//!    history size) so distinct tastes aren't averaged into one "smoothie"; a weighted global
+//!    centroid and per-time-of-day centroids still drive the context rows, and disliked titles
+//!    push every query away (Rocchio-style).
 //! 4. **Candidates** — TMDB discover (filtered by region + subscribed providers, kids-safe for kids
-//!    profiles), genre-targeted discover, trending and "recommendations" of the strongest seeds.
-//!    Titles the profile already interacted with are excluded.
-//! 5. **Ranking** — cosine similarity against the query vector, then Maximal Marginal Relevance
-//!    for row diversity, assembled into explainable rows ("Because you binged …").
+//!    profiles), genre-targeted discover, trending and "recommendations" of each cluster's
+//!    strongest titles. Titles the profile already interacted with are excluded.
+//! 5. **Ranking** — a nearest-neighbour search (dot product with the unit query) per cluster
+//!    centroid with MMR diversity, interleaved in proportion to cluster mass ("We Think You'll
+//!    Love These"), plus explainable rows ("Because you binged …").
+//!
+//! "More Like This" on the info page ([`similar_titles`]) is a single-title nearest-neighbour
+//! search over titles already embedded locally, followed by TMDB's own list (fast path).
+//! Vectors are persisted per title in `title_vectors` (content only) keyed by a content hash.
 //!
 //! Isolation: every database read is filtered by `app_profile_id`; vectors persisted in
 //! `media_embeddings` are written under that profile only. The in-memory vector cache holds
@@ -33,7 +41,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::db::queries::{self, MediaCatalogEntry, PlaybackEvent, WatchHistoryEntry, WatchlistItem};
-use crate::ml::embeddings::{EmbeddingService, EmbeddingStatus, MediaDocument, Tone};
+use crate::ml::embeddings::{Embedder, EmbeddingService, EmbeddingStatus, MediaDocument, Tone};
 use crate::sync::history_importer::TmdbClient;
 use crate::{AppError, AppResult, AppState};
 
@@ -96,6 +104,9 @@ fn bucket_row_title(idx: usize) -> &'static str {
 }
 
 type TitleKey = (i64, String);
+type SimilarCache = HashMap<(i64, String, bool), (Instant, Arc<SimilarTitles>)>;
+/// A TMDB list request: (path, query params, media type of its results).
+type ListQuery = (String, Vec<(&'static str, String)>, &'static str);
 
 fn parse_db_time(s: &str) -> Option<DateTime<Utc>> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
@@ -445,6 +456,217 @@ pub fn mmr(relevance: &[f32], vectors: &[&[f32]], k: usize, lambda: f32, already
 }
 
 // ---------------------------------------------------------------------------------------------
+// 3b. Taste clusters (weighted spherical K-means)
+// ---------------------------------------------------------------------------------------------
+//
+// One averaged taste vector is a "smoothie": someone who loves both cosy sitcoms and bleak
+// sci-fi gets a centroid between them that matches neither. Clustering the liked / watched
+// titles first keeps each side of the taste intact; every cluster gets its own nearest-neighbour
+// search and the results are interleaved in proportion to how much of the taste it holds.
+
+/// Number of clusters for `n` positively weighted titles: one taste until there is enough
+/// history to split it reliably.
+pub fn cluster_count(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1..=10 => 1,
+        11..=30 => 2,
+        _ => 3,
+    }
+}
+
+/// Small deterministic PRNG (xorshift64*) so a profile's clusters are stable between refreshes.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+    fn next_f64(&mut self) -> f64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Clustering {
+    /// Cluster index of every point.
+    pub assignment: Vec<usize>,
+    /// Unit centroids.
+    pub centroids: Vec<Vec<f32>>,
+    /// Total weight per cluster.
+    pub mass: Vec<f64>,
+}
+
+const KMEANS_ITERATIONS: usize = 30;
+const KMEANS_RESTARTS: u64 = 6;
+
+/// Weighted spherical K-means (cosine distance) with K-means++ seeding. Points are normalised
+/// first; weights are the titles' affinities (non-positive weights are ignored). Several seeded
+/// restarts keep the best objective (total weighted cosine to the assigned centroid).
+pub fn kmeans(points: &[&[f32]], weights: &[f64], k: usize, seed: u64) -> Option<Clustering> {
+    let unit: Vec<Vec<f32>> = points.iter().filter_map(|p| normalized(p.to_vec())).collect();
+    if unit.len() != points.len() || points.is_empty() {
+        return None;
+    }
+    let w: Vec<f64> = weights.iter().map(|w| w.max(0.0)).collect();
+    let k = k.clamp(1, points.len());
+    let mut best: Option<(f64, Clustering)> = None;
+    for restart in 0..KMEANS_RESTARTS {
+        let mut rng = Rng::new(seed ^ (restart + 1).wrapping_mul(0xA24B_AED4_963E_E407));
+        // K-means++: the heaviest title first, then sample ∝ weight · distance².
+        let first = (0..unit.len()).max_by(|a, b| w[*a].partial_cmp(&w[*b]).unwrap_or(std::cmp::Ordering::Equal))?;
+        let mut centroids = vec![unit[first].clone()];
+        while centroids.len() < k {
+            let d2: Vec<f64> = unit
+                .iter()
+                .zip(&w)
+                .map(|(p, wi)| {
+                    let near = centroids.iter().map(|c| dot(p, c)).fold(f32::MIN, f32::max);
+                    wi * f64::from((1.0 - near).max(0.0)).powi(2)
+                })
+                .collect();
+            let total: f64 = d2.iter().sum();
+            if total <= 1e-12 {
+                break; // every remaining point coincides with a centroid
+            }
+            let mut r = rng.next_f64() * total;
+            let pick = d2.iter().position(|d| {
+                r -= d;
+                r <= 0.0
+            });
+            centroids.push(unit[pick.unwrap_or(unit.len() - 1)].clone());
+        }
+
+        let mut assignment = vec![usize::MAX; unit.len()];
+        for _ in 0..KMEANS_ITERATIONS {
+            let next: Vec<usize> = unit
+                .iter()
+                .map(|p| {
+                    (0..centroids.len())
+                        .max_by(|a, b| dot(p, &centroids[*a]).partial_cmp(&dot(p, &centroids[*b])).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(0)
+                })
+                .collect();
+            let changed = next != assignment;
+            assignment = next;
+            let updated: Vec<Option<Vec<f32>>> = (0..centroids.len())
+                .map(|c| {
+                    let mut acc = Vec::new();
+                    for (i, p) in unit.iter().enumerate() {
+                        if assignment[i] == c {
+                            add_scaled(&mut acc, p, w[i].max(1e-6) as f32);
+                        }
+                    }
+                    normalized(acc)
+                })
+                .collect();
+            let mut reseeded = false;
+            for (c, next_centroid) in updated.into_iter().enumerate() {
+                match next_centroid {
+                    Some(v) => centroids[c] = v,
+                    // Empty cluster: re-seed it with the point its own centroid explains worst.
+                    None => {
+                        let worst = (0..unit.len()).min_by(|a, b| {
+                            let fa = dot(&unit[*a], &centroids[assignment[*a]]);
+                            let fb = dot(&unit[*b], &centroids[assignment[*b]]);
+                            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        if let Some(worst) = worst {
+                            centroids[c] = unit[worst].clone();
+                            reseeded = true;
+                        }
+                    }
+                }
+            }
+            if !changed && !reseeded {
+                break;
+            }
+        }
+
+        let objective: f64 = unit.iter().zip(&assignment).zip(&w).map(|((p, &c), wi)| wi * f64::from(dot(p, &centroids[c]))).sum();
+        let mut mass = vec![0.0; centroids.len()];
+        for (i, &c) in assignment.iter().enumerate() {
+            mass[c] += w[i];
+        }
+        // Drop clusters that ended up empty and re-index.
+        let keep: Vec<usize> = (0..centroids.len()).filter(|c| mass[*c] > 0.0).collect();
+        let remap: HashMap<usize, usize> = keep.iter().enumerate().map(|(new, old)| (*old, new)).collect();
+        let clustering = Clustering {
+            assignment: assignment.iter().map(|c| remap.get(c).copied().unwrap_or(0)).collect(),
+            centroids: keep.iter().map(|c| centroids[*c].clone()).collect(),
+            mass: keep.iter().map(|c| mass[*c]).collect(),
+        };
+        if best.as_ref().is_none_or(|(o, _)| objective > *o + 1e-9) {
+            best = Some((objective, clustering));
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// Splits `total` slots in proportion to `mass` (largest remainder), giving every cluster with
+/// any mass at least one slot when there are enough slots to go round.
+pub fn proportional_quotas(mass: &[f64], total: usize) -> Vec<usize> {
+    let sum: f64 = mass.iter().filter(|m| **m > 0.0).sum();
+    if sum <= 0.0 || mass.is_empty() {
+        return vec![0; mass.len()];
+    }
+    let exact: Vec<f64> = mass.iter().map(|m| m.max(0.0) / sum * total as f64).collect();
+    let mut q: Vec<usize> = exact.iter().map(|x| x.floor() as usize).collect();
+    let mut order: Vec<usize> = (0..mass.len()).collect();
+    order.sort_by(|a, b| (exact[*b] - exact[*b].floor()).partial_cmp(&(exact[*a] - exact[*a].floor())).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(b)));
+    let mut left = total - q.iter().sum::<usize>();
+    for &i in order.iter().cycle().take(mass.len() * 2) {
+        if left == 0 {
+            break;
+        }
+        if mass[i] > 0.0 {
+            q[i] += 1;
+            left -= 1;
+        }
+    }
+    // Minimum one slot each: borrow from the largest cluster.
+    if total >= mass.iter().filter(|m| **m > 0.0).count() {
+        for i in 0..q.len() {
+            if mass[i] > 0.0 && q[i] == 0 {
+                if let Some(donor) = (0..q.len()).filter(|d| q[*d] > 1).max_by_key(|d| q[*d]) {
+                    q[donor] -= 1;
+                    q[i] += 1;
+                }
+            }
+        }
+    }
+    q
+}
+
+/// Merges per-cluster lists so each cluster appears at an even rate in proportion to its length
+/// (7/7/6 → A B C A B C …; 12/6/2 → A B A A B A …), never ending with a run of one cluster
+/// while others still have items.
+pub fn interleave_proportionally<T>(lists: Vec<Vec<T>>) -> Vec<T> {
+    let lens: Vec<usize> = lists.iter().map(Vec::len).collect();
+    let total: usize = lens.iter().sum();
+    let mut iters: Vec<std::vec::IntoIter<T>> = lists.into_iter().map(Vec::into_iter).collect();
+    let mut taken = vec![0usize; iters.len()];
+    let mut out = Vec::with_capacity(total);
+    for t in 0..total {
+        let pick = (0..iters.len())
+            .filter(|c| taken[*c] < lens[*c])
+            .max_by(|a, b| {
+                let deficit = |c: usize| lens[c] as f64 * (t + 1) as f64 / total as f64 - taken[c] as f64;
+                deficit(*a).partial_cmp(&deficit(*b)).unwrap_or(std::cmp::Ordering::Equal).then(b.cmp(a))
+            });
+        let Some(c) = pick else { break };
+        if let Some(item) = iters[c].next() {
+            out.push(item);
+        }
+        taken[c] += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
 // Public response types
 // ---------------------------------------------------------------------------------------------
 
@@ -516,6 +738,8 @@ pub struct Recommender {
     run_lock: tokio::sync::Mutex<()>,
     /// (tmdb_id, media_type, region) -> provider ids with flatrate/free/ads availability.
     providers: Mutex<HashMap<(i64, String, String), (Instant, Vec<i64>)>>,
+    /// "More Like This" results per (tmdb_id, media_type, kids); content-only, not per profile.
+    similar: Mutex<SimilarCache>,
 }
 
 impl Recommender {
@@ -525,6 +749,7 @@ impl Recommender {
             results: Mutex::new(HashMap::new()),
             run_lock: tokio::sync::Mutex::new(()),
             providers: Mutex::new(HashMap::new()),
+            similar: Mutex::new(HashMap::new()),
         }
     }
 
@@ -810,7 +1035,7 @@ async fn gather_candidates(
         for mt in ["movie", "tv"] {
             plan.push(Query { path: format!("/trending/{mt}/week"), params: vec![], media_type: Some(mt), verified: !filtered });
         }
-        for (id, mt) in seeds.iter().take(4) {
+        for (id, mt) in seeds.iter().take(6) {
             let mt: &'static str = if mt == "tv" { "tv" } else { "movie" };
             plan.push(Query { path: format!("/{mt}/{id}/recommendations"), params: vec![], media_type: Some(mt), verified: !filtered });
         }
@@ -1001,13 +1226,16 @@ impl Pool {
         intent: Option<Tone>,
     ) -> Vec<RecommendedItem> {
         let idx: Vec<usize> = (0..self.keys.len()).filter(|i| !used.contains(i)).collect();
-        if idx.is_empty() {
+        if idx.is_empty() || k == 0 {
             return Vec::new();
         }
-        // Penalised similarity drives both ranking and the displayed match %.
+        let Some(query) = normalized(query.to_vec()) else { return Vec::new() };
+        // Composite vectors have norm <= 1 (missing blocks count as no match), so the dot with a
+        // unit query is the weighted block similarity. Penalised similarity drives both ranking
+        // and the displayed match %.
         let sims: Vec<f32> = idx
             .iter()
-            .map(|&i| cosine(query, &self.vectors[i]) - intent.map_or(0.0, |t| tone_penalty(t, self.tones[i])))
+            .map(|&i| dot(&query, &self.vectors[i]) - intent.map_or(0.0, |t| tone_penalty(t, self.tones[i])))
             .collect();
         let rel: Vec<f32> = idx
             .iter()
@@ -1025,9 +1253,9 @@ impl Pool {
                 used.insert(i);
                 let because = seeds
                     .iter()
-                    .map(|(t, v)| (t, cosine(&self.vectors[i], v)))
+                    .map(|(t, v)| (t, dot(&self.vectors[i], v)))
                     .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .filter(|(_, s)| *s >= 0.35)
+                    .filter(|(_, s)| *s >= 0.3)
                     .map(|(t, _)| t.clone());
                 self.item(i, rel[p], sims[p], because)
             })
@@ -1039,6 +1267,162 @@ impl Pool {
 // Orchestration
 // ---------------------------------------------------------------------------------------------
 
+/// One side of a profile's taste: its titles (strongest first), unit centroid and total weight.
+struct TasteCluster {
+    members: Vec<TitleKey>,
+    centroid: Vec<f32>,
+    mass: f64,
+}
+
+/// Clusters the profile's positively weighted titles (`seeds`, strongest first), heaviest
+/// cluster first. Seeded by the profile id so the row is stable between refreshes.
+fn taste_clusters(
+    seeds: &[TitleKey],
+    vectors: &HashMap<TitleKey, Arc<Vec<f32>>>,
+    affinities: &HashMap<TitleKey, Affinity>,
+    app_profile_id: i64,
+) -> Vec<TasteCluster> {
+    let points: Vec<(&TitleKey, &[f32], f64)> = seeds
+        .iter()
+        .filter_map(|k| Some((k, vectors.get(k)?.as_slice(), affinities.get(k)?.weight)))
+        .filter(|(_, _, w)| *w > 0.0)
+        .collect();
+    let k = cluster_count(points.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let vecs: Vec<&[f32]> = points.iter().map(|p| p.1).collect();
+    let weights: Vec<f64> = points.iter().map(|p| p.2).collect();
+    let Some(c) = kmeans(&vecs, &weights, k, app_profile_id as u64) else { return Vec::new() };
+    let mut clusters: Vec<TasteCluster> = c
+        .centroids
+        .into_iter()
+        .zip(c.mass)
+        .map(|(centroid, mass)| TasteCluster { members: Vec::new(), centroid, mass })
+        .collect();
+    for (p, &ci) in points.iter().zip(&c.assignment) {
+        clusters[ci].members.push(p.0.clone());
+    }
+    clusters.sort_by(|a, b| b.mass.partial_cmp(&a.mass).unwrap_or(std::cmp::Ordering::Equal));
+    clusters
+}
+
+/// Titles in the "We Think You'll Love These" row.
+const LOVE_ROW_SIZE: usize = 20;
+
+/// The aggregate taste row: a nearest-neighbour search around every cluster centroid (minus the
+/// dislike centroid), each with the tone of its own titles, sized by cluster mass and
+/// interleaved. Slots a cluster can't fill go to the others.
+#[allow(clippy::too_many_arguments)]
+fn cluster_row(
+    clusters: &[TasteCluster],
+    pool: &Pool,
+    used: &mut HashSet<usize>,
+    docs: &HashMap<TitleKey, MediaDocument>,
+    vectors: &HashMap<TitleKey, Arc<Vec<f32>>>,
+    affinities: &HashMap<TitleKey, Affinity>,
+    taste: &TasteProfile,
+    title_of: &dyn Fn(&TitleKey) -> Option<String>,
+) -> Option<RecommendationRow> {
+    if clusters.is_empty() {
+        return None;
+    }
+    let mass: Vec<f64> = clusters.iter().map(|c| c.mass).collect();
+    let quotas = proportional_quotas(&mass, LOVE_ROW_SIZE);
+    struct Side {
+        query: Vec<f32>,
+        tone: Option<Tone>,
+        seeds: Vec<(String, Arc<Vec<f32>>)>,
+        label: Option<String>,
+    }
+    let sides: Vec<Side> = clusters
+        .iter()
+        .map(|c| {
+            let mut query = c.centroid.clone();
+            if let Some(neg) = &taste.negative {
+                query.iter_mut().zip(neg).for_each(|(x, y)| *x -= NEGATIVE_PUSH * y);
+            }
+            let member_docs: Vec<(&MediaDocument, f64)> =
+                c.members.iter().filter_map(|k| Some((docs.get(k)?, affinities.get(k)?.weight))).collect();
+            Side {
+                query,
+                tone: Tone::blend(member_docs.iter().map(|(d, w)| (d.tone(), *w))),
+                seeds: c.members.iter().take(8).filter_map(|k| Some((title_of(k)?, vectors.get(k)?.clone()))).collect(),
+                label: taste_label(&member_docs),
+            }
+        })
+        .collect();
+
+    let mut lists: Vec<Vec<RecommendedItem>> =
+        sides.iter().zip(&quotas).map(|(s, q)| pool.rank(&s.query, *q, used, &s.seeds, s.tone)).collect();
+    // Top up from the heaviest clusters if a side ran out of neighbours.
+    for (i, side) in sides.iter().enumerate() {
+        let short = LOVE_ROW_SIZE.saturating_sub(lists.iter().map(Vec::len).sum());
+        if short == 0 {
+            break;
+        }
+        let extra = pool.rank(&side.query, short, used, &side.seeds, side.tone);
+        lists[i].extend(extra);
+    }
+    let items = interleave_proportionally(lists);
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut labels: Vec<String> = Vec::new();
+    for l in sides.iter().filter_map(|s| s.label.clone()) {
+        if !labels.contains(&l) {
+            labels.push(l);
+        }
+    }
+    let (title, subtitle) = if clusters.len() == 1 {
+        (format!("{} matching your taste profile", labels.first().map_or("Top picks", String::as_str)), None)
+    } else {
+        (
+            "Picks from every side of your taste".to_string(),
+            Some(format!("Blending {} sides of your taste: {}", clusters.len(), labels.join(" · "))),
+        )
+    };
+    Some(RecommendationRow { id: "taste".into(), kind: "taste", title, subtitle, items })
+}
+
+/// Composite vectors for `docs`: stored vectors whose content hash still matches are read back
+/// from `title_vectors`; the rest are embedded (memory-cached) and written back. Content only.
+async fn content_vectors(
+    state: &AppState,
+    embedder: &Arc<Embedder>,
+    docs: &HashMap<TitleKey, MediaDocument>,
+) -> AppResult<HashMap<TitleKey, Arc<Vec<f32>>>> {
+    let model = embedder.model_id();
+    let hashes: HashMap<TitleKey, String> = docs.iter().map(|(k, d)| (k.clone(), d.content_hash())).collect();
+    let keys: Vec<TitleKey> = docs.keys().cloned().collect();
+    let stored = state.db.run(move |c| queries::get_title_vectors(c, model, &keys)).await?;
+    let mut out = HashMap::with_capacity(docs.len());
+    let mut missing = Vec::new();
+    for (k, d) in docs {
+        match stored.get(k) {
+            Some((hash, v)) if Some(hash) == hashes.get(k) && !v.is_empty() => {
+                out.insert(k.clone(), Arc::new(v.clone()));
+            }
+            _ => missing.push((k.clone(), d.clone())),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(out);
+    }
+    // A stale stored hash means the metadata changed: drop any in-memory copy too.
+    let missing_keys: Vec<TitleKey> = missing.iter().map(|(k, _)| k.clone()).collect();
+    state.recommender.embeddings.invalidate(&missing_keys);
+    let fresh = state.recommender.embeddings.embed_keyed(embedder.clone(), missing).await?;
+    let rows: Vec<(i64, String, String, Vec<f32>)> = fresh
+        .iter()
+        .filter_map(|(k, v)| Some((k.0, k.1.clone(), hashes.get(k)?.clone(), v.as_ref().clone())))
+        .collect();
+    state.db.run(move |c| queries::upsert_title_vectors(c, model, &rows)).await?;
+    out.extend(fresh);
+    Ok(out)
+}
+
 async fn sync_model_id(state: &AppState, stored: Option<String>, current: &'static str) -> AppResult<()> {
     if stored.as_deref() == Some(current) {
         return Ok(());
@@ -1047,6 +1431,7 @@ async fn sync_model_id(state: &AppState, stored: Option<String>, current: &'stat
         .db
         .run(move |c| {
             let removed = queries::clear_all_embeddings(c)?;
+            queries::prune_title_vectors(c, current)?;
             queries::set_setting(c, queries::keys::EMBEDDING_MODEL_ID, current)?;
             Ok(removed)
         })
@@ -1118,24 +1503,33 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
     top_genres.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let top_genres: Vec<(String, i64)> = top_genres.into_iter().take(3).map(|(k, _)| k).collect();
 
-    // 4. Candidates (excluding everything this profile already touched).
+    // Composite vectors for the profile's own titles, then the taste clusters (3b).
+    let interacted_docs: HashMap<TitleKey, MediaDocument> =
+        interacted.iter().map(|(k, e)| (k.clone(), MediaDocument::from_catalog(e))).collect();
+    let mut vectors = content_vectors(&state, &embedder, &interacted_docs).await?;
+    let clusters = taste_clusters(&seeds, &vectors, &affinities, app_profile_id);
+
+    // 4. Candidates (excluding everything this profile already touched), seeded from the
+    //    strongest titles of every cluster so each side of the taste brings its own neighbours.
     let exclude: HashSet<TitleKey> = signals.keys().cloned().collect();
-    let candidates = gather_candidates(&tmdb, &snap, &seeds, &top_genres, &exclude).await?;
+    let candidate_seeds: Vec<TitleKey> = if clusters.is_empty() {
+        seeds.iter().take(4).cloned().collect()
+    } else {
+        let per = if clusters.len() == 1 { 4 } else { 2 };
+        clusters.iter().flat_map(|c| c.members.iter().take(per).cloned()).collect()
+    };
+    let candidates = gather_candidates(&tmdb, &snap, &candidate_seeds, &top_genres, &exclude).await?;
     let popularity_max = candidates.iter().map(|c| c.popularity).fold(1.0, f64::max);
     let verified: HashMap<TitleKey, bool> = candidates.iter().map(|c| ((c.entry.tmdb_id, c.entry.media_type.clone()), c.provider_verified)).collect();
     let popularity: HashMap<TitleKey, f64> = candidates.iter().map(|c| ((c.entry.tmdb_id, c.entry.media_type.clone()), c.popularity / popularity_max)).collect();
     let candidate_entries = enrich(&state, &tmdb, candidates.into_iter().map(|c| c.entry).collect()).await?;
 
-    // Embed interacted + candidates.
-    let docs: HashMap<TitleKey, MediaDocument> = interacted
-        .iter()
-        .chain(candidate_entries.iter())
-        .map(|(k, e)| (k.clone(), MediaDocument::from_catalog(e)))
-        .collect();
-    let vectors = rec
-        .embeddings
-        .embed_keyed(embedder.clone(), docs.iter().map(|(k, d)| (k.clone(), d.clone())).collect())
-        .await?;
+    // Embed the candidates (stored composites are reused).
+    let candidate_docs: HashMap<TitleKey, MediaDocument> =
+        candidate_entries.iter().map(|(k, e)| (k.clone(), MediaDocument::from_catalog(e))).collect();
+    vectors.extend(content_vectors(&state, &embedder, &candidate_docs).await?);
+    let mut docs = interacted_docs;
+    docs.extend(candidate_docs);
 
     // Persist this profile's vectors + affinities (profile-scoped table).
     let persist: Vec<(i64, String, Vec<f32>, f64)> = interacted
@@ -1202,19 +1596,14 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
             .iter()
             .filter_map(|k| Some((docs.get(k)?, affinities.get(k)?.weight)))
             .collect();
-        let label = taste_label(&liked_docs).unwrap_or_else(|| "Top picks".into());
         // Row tone = what the liked titles feel like (a "Lighthearted Comedy" row stays light).
         let taste_tone = Tone::blend(liked_docs.iter().map(|(d, w)| (d.tone(), *w)));
         let seed_tone = |k: &TitleKey| docs.get(k).map(MediaDocument::tone);
-        let items = pool.rank(&q_global, 20, &mut used, &seed_vectors, taste_tone);
-        if !items.is_empty() {
-            rows.push(RecommendationRow {
-                id: "taste".into(),
-                kind: "taste",
-                title: format!("{label} matching your taste profile"),
-                subtitle: None,
-                items,
-            });
+
+        // "We Think You'll Love These": one nearest-neighbour search per taste cluster, each
+        // with its own tone and dislike push, interleaved in proportion to cluster mass.
+        if let Some(row) = cluster_row(&clusters, &pool, &mut used, &docs, &vectors, &affinities, &taste, &title_of) {
+            rows.push(row);
         }
 
         // Time-of-day context row.
@@ -1351,8 +1740,234 @@ pub async fn generate(app: &AppHandle, app_profile_id: i64, force: bool) -> AppR
 }
 
 // ---------------------------------------------------------------------------------------------
+// "More Like This": single-title nearest neighbours (info page)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarTitles {
+    pub tmdb_id: i64,
+    pub media_type: String,
+    pub model_id: String,
+    /// How many titles the search compared against.
+    pub searched: usize,
+    pub items: Vec<RecommendedItem>,
+}
+
+/// Most recently embedded titles searched per request (vectors read straight from SQLite).
+const LOCAL_SEARCH_LIMIT: i64 = 2000;
+const SIMILAR_TTL: Duration = Duration::from_secs(30 * 60);
+const SIMILAR_LIMIT: usize = 20;
+/// Similar is about the vibe, not the format, but a film page should lean toward films.
+const SAME_TYPE_BONUS: f32 = 0.03;
+const SIMILAR_MMR_LAMBDA: f32 = 0.85;
+/// Genres a kids profile never gets from this search.
+const KIDS_BLOCKED_GENRES: &[&str] = &["horror", "thriller", "crime", "war", "war & politics"];
+
+/// Fetches TMDB list endpoints concurrently, returning their titles in plan order (deduplicated).
+async fn fetch_lists(tmdb: &TmdbClient, plan: Vec<ListQuery>) -> AppResult<Vec<MediaCatalogEntry>> {
+    let sem = Arc::new(Semaphore::new(TMDB_CONCURRENCY));
+    let mut set = JoinSet::new();
+    for (order, (path, params, mt)) in plan.into_iter().enumerate() {
+        let (tmdb, sem) = (tmdb.clone(), sem.clone());
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            (order, mt, tmdb.get(&path, &params).await)
+        });
+    }
+    let mut bodies = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let (order, mt, res) = joined.map_err(|e| AppError::Message(e.to_string()))?;
+        match res {
+            Ok(body) => bodies.push((order, mt, body)),
+            Err(e) if e.to_string().contains("API key") => return Err(e),
+            Err(e) => log::debug!("similar-titles query failed: {e}"),
+        }
+    }
+    bodies.sort_by_key(|(order, ..)| *order);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (_, mt, body) in bodies {
+        for item in body["results"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            if let Some((entry, _)) = entry_from_list_item(item, mt) {
+                if seen.insert((entry.tmdb_id, entry.media_type.clone())) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Local matches below this composite similarity aren't shown (a small catalog shouldn't pad
+/// the row with unrelated titles; TMDB's list follows anyway).
+const MIN_LOCAL_SIMILARITY: f32 = 0.15;
+/// Local matches plus TMDB's own list, at most.
+const SIMILAR_TOTAL: usize = 40;
+
+fn similar_item(e: &MediaCatalogEntry, score: f32, match_percent: u8) -> RecommendedItem {
+    RecommendedItem {
+        tmdb_id: e.tmdb_id,
+        media_type: e.media_type.clone(),
+        title: e.title.clone(),
+        overview: e.overview.clone(),
+        poster_path: e.poster_path.clone(),
+        backdrop_path: e.backdrop_path.clone(),
+        release_year: e.release_year,
+        vote_average: e.vote_average,
+        score,
+        match_percent,
+        because_of: None,
+    }
+}
+
+/// "More Like This" fast path (well under a second):
+/// 1. Local ML matches: nearest neighbours of the title's composite vector, searched ONLY among
+///    titles already embedded in `title_vectors` (nothing is embedded on the fly, except the
+///    title itself when it has no stored vector yet: one document).
+/// 2. Then TMDB's own recommendations / similar titles, appended in their raw TMDB order
+///    (no match %), skipping anything already listed.
+pub async fn similar_titles(app: &AppHandle, app_profile_id: i64, tmdb_id: i64, media_type: &str) -> AppResult<SimilarTitles> {
+    let mt: &'static str = match media_type {
+        "movie" => "movie",
+        "tv" => "tv",
+        other => return Err(AppError::Message(format!("invalid media type '{other}'"))),
+    };
+    let state = app.state::<AppState>();
+    let rec = &state.recommender;
+    let embedder = rec.embeddings.get().await;
+    let model = embedder.model_id();
+
+    let (kids, seed_entry, embedded) = state
+        .db
+        .run(move |c| {
+            let settings = queries::get_all_settings(c)?;
+            let kids = queries::get_profile(c, app_profile_id)?.is_some_and(|p| p.is_kids_profile)
+                || settings.get(queries::keys::KIDS_SAFE_MODE).map(String::as_str) == Some("true");
+            Ok((kids, queries::get_media(c, tmdb_id, mt)?, queries::list_embedded_media(c, model, LOCAL_SEARCH_LIMIT)?))
+        })
+        .await?;
+    let cache_key = (tmdb_id, mt.to_string(), kids);
+    let cached = rec
+        .similar
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&cache_key)
+        .filter(|(at, _)| at.elapsed() < SIMILAR_TTL)
+        .map(|(_, r)| r.clone());
+    if let Some(hit) = cached {
+        return Ok((*hit).clone());
+    }
+
+    let tmdb = TmdbClient::from_settings(&state).await?;
+    let seed_key: TitleKey = (tmdb_id, mt.to_string());
+    let stored_seed = embedded
+        .iter()
+        .find(|(e, _)| e.tmdb_id == tmdb_id && e.media_type == mt)
+        .map(|(e, v)| (e.clone(), v.clone()));
+
+    // TMDB's list and (only if needed) the seed's metadata, concurrently.
+    let plan: Vec<ListQuery> = vec![
+        (format!("/{mt}/{tmdb_id}/recommendations"), vec![("page", "1".into())], mt),
+        (format!("/{mt}/{tmdb_id}/similar"), vec![("page", "1".into())], mt),
+    ];
+    let seed_needs_details = stored_seed.is_none() && !seed_entry.as_ref().is_some_and(is_rich);
+    let (tmdb_list, fetched_seed) = tokio::join!(fetch_lists(&tmdb, plan), async {
+        if seed_needs_details {
+            fetch_details(&tmdb, tmdb_id, mt).await.ok()
+        } else {
+            None
+        }
+    });
+    let tmdb_list = tmdb_list.unwrap_or_default();
+
+    // The seed's composite vector: stored, else embed this one document (and store it).
+    let seed_vector: Option<(MediaCatalogEntry, Vec<f32>)> = match stored_seed {
+        Some(hit) => Some(hit),
+        None => match fetched_seed.or(seed_entry) {
+            Some(entry) => {
+                if seed_needs_details {
+                    let fresh = entry.clone();
+                    let _ = state.db.run(move |c| queries::upsert_media(c, &fresh)).await;
+                }
+                let docs: HashMap<TitleKey, MediaDocument> = HashMap::from([(seed_key.clone(), MediaDocument::from_catalog(&entry))]);
+                content_vectors(&state, &embedder, &docs)
+                    .await
+                    .ok()
+                    .and_then(|mut v| v.remove(&seed_key))
+                    .map(|v| (entry, v.as_ref().clone()))
+            }
+            None => None,
+        },
+    };
+
+    let blocked = |e: &MediaCatalogEntry| {
+        kids && MediaDocument::from_catalog(e).genres.iter().any(|g| KIDS_BLOCKED_GENRES.contains(&g.to_lowercase().as_str()))
+    };
+    let mut items: Vec<RecommendedItem> = Vec::new();
+    let mut searched = 0;
+
+    // 1. Local ML matches.
+    if let Some((seed, query)) = seed_vector.and_then(|(e, v)| Some((e, normalized(v)?))) {
+        let seed_tone = MediaDocument::from_catalog(&seed).tone();
+        let pool: Vec<&(MediaCatalogEntry, Vec<f32>)> = embedded
+            .iter()
+            .filter(|(e, v)| {
+                !(e.tmdb_id == tmdb_id && e.media_type == mt) && e.poster_path.is_some() && v.len() == query.len() && !blocked(e)
+            })
+            .collect();
+        searched = pool.len();
+        let sims: Vec<f32> = pool
+            .iter()
+            .map(|(e, v)| dot(&query, v) - tone_penalty(seed_tone, MediaDocument::from_catalog(e).tone()))
+            .collect();
+        let rel: Vec<f32> = pool
+            .iter()
+            .zip(&sims)
+            .map(|((e, _), s)| {
+                s + 0.04 * e.vote_average.unwrap_or(6.0) as f32 / 10.0 + if e.media_type == mt { SAME_TYPE_BONUS } else { 0.0 }
+            })
+            .collect();
+        let mut shortlist: Vec<usize> = (0..pool.len()).filter(|&i| sims[i] >= MIN_LOCAL_SIMILARITY).collect();
+        shortlist.sort_by(|a, b| rel[*b].partial_cmp(&rel[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        shortlist.truncate(200);
+        let short_rel: Vec<f32> = shortlist.iter().map(|&i| rel[i]).collect();
+        let short_vecs: Vec<&[f32]> = shortlist.iter().map(|&i| pool[i].1.as_slice()).collect();
+        for p in mmr(&short_rel, &short_vecs, SIMILAR_LIMIT, SIMILAR_MMR_LAMBDA, &[]) {
+            let i = shortlist[p];
+            items.push(similar_item(&pool[i].0, rel[i], match_percent(sims[i])));
+        }
+    }
+
+    // 2. TMDB's own list, raw order, after the local matches.
+    let mut seen: HashSet<TitleKey> = items.iter().map(|it| (it.tmdb_id, it.media_type.clone())).collect();
+    seen.insert(seed_key);
+    for e in tmdb_list {
+        if items.len() >= SIMILAR_TOTAL {
+            break;
+        }
+        if e.poster_path.is_some() && !blocked(&e) && seen.insert((e.tmdb_id, e.media_type.clone())) {
+            items.push(similar_item(&e, 0.0, 0));
+        }
+    }
+
+    let result = SimilarTitles { tmdb_id, media_type: mt.to_string(), model_id: model.to_string(), searched, items };
+    rec.similar
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(cache_key, (Instant::now(), Arc::new(result.clone())));
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------------------------
+
+/// "More Like This" for the info page: local composite-vector nearest neighbours of one title.
+#[tauri::command]
+pub async fn get_similar_titles(app: AppHandle, app_profile_id: i64, tmdb_id: i64, media_type: String) -> AppResult<SimilarTitles> {
+    similar_titles(&app, app_profile_id, tmdb_id, &media_type).await
+}
 
 #[tauri::command]
 pub async fn get_recommendations(app: AppHandle, app_profile_id: i64, force_refresh: Option<bool>) -> AppResult<RecommendationsResponse> {
@@ -1567,6 +2182,94 @@ mod tests {
         // No tone signal, no penalty.
         assert_eq!(tone_penalty(Tone::default(), killer), 0.0);
         assert_eq!(tone_penalty(comedy_row, Tone::default()), 0.0);
+    }
+
+    #[test]
+    fn cluster_count_grows_with_history() {
+        assert_eq!(cluster_count(0), 0);
+        assert_eq!(cluster_count(5), 1);
+        assert_eq!(cluster_count(10), 1);
+        assert_eq!(cluster_count(11), 2);
+        assert_eq!(cluster_count(30), 2);
+        assert_eq!(cluster_count(31), 3);
+        assert_eq!(cluster_count(400), 3);
+    }
+
+    /// Three well-separated tastes (sitcoms, bleak sci-fi, anime) around three axes, with noise.
+    fn three_tastes() -> (Vec<Vec<f32>>, Vec<usize>) {
+        let mut rng = Rng::new(7);
+        let mut points = Vec::new();
+        let mut truth = Vec::new();
+        for (axis, n) in [(0usize, 14usize), (1, 12), (2, 9)] {
+            for _ in 0..n {
+                let mut v: Vec<f32> = (0..6).map(|_| (rng.next_f64() as f32 - 0.5) * 0.3).collect();
+                v[axis] += 1.0;
+                points.push(v);
+                truth.push(axis);
+            }
+        }
+        (points, truth)
+    }
+
+    #[test]
+    fn kmeans_finds_separate_tastes_instead_of_a_smoothie() {
+        let (points, truth) = three_tastes();
+        let refs: Vec<&[f32]> = points.iter().map(Vec::as_slice).collect();
+        let weights = vec![1.0; points.len()];
+        let c = kmeans(&refs, &weights, cluster_count(points.len()), 42).unwrap();
+        assert_eq!(c.centroids.len(), 3);
+        // Every true group lands in exactly one cluster.
+        for axis in 0..3 {
+            let labels: HashSet<usize> = truth.iter().zip(&c.assignment).filter(|(t, _)| **t == axis).map(|(_, a)| *a).collect();
+            assert_eq!(labels.len(), 1, "taste {axis} was split: {labels:?}");
+        }
+        // Each centroid points at its own taste; the plain average points at none of them.
+        for centroid in &c.centroids {
+            assert!(centroid.iter().take(3).cloned().fold(f32::MIN, f32::max) > 0.9);
+        }
+        let mut mean = Vec::new();
+        for p in &refs {
+            add_scaled(&mut mean, p, 1.0);
+        }
+        let mean = normalized(mean).unwrap();
+        assert!(mean.iter().take(3).cloned().fold(f32::MIN, f32::max) < 0.75, "the smoothie: {mean:?}");
+        // Deterministic for a given seed.
+        assert_eq!(kmeans(&refs, &weights, 3, 42).unwrap().assignment, c.assignment);
+    }
+
+    #[test]
+    fn kmeans_weights_pull_centroids() {
+        let a = [1.0f32, 0.0];
+        let b = [0.0f32, 1.0];
+        let c = kmeans(&[&a, &b], &[5.0, 1.0], 1, 1).unwrap();
+        assert_eq!(c.centroids.len(), 1);
+        assert!(c.centroids[0][0] > c.centroids[0][1] * 4.0);
+        assert_eq!(c.mass, vec![6.0]);
+    }
+
+    #[test]
+    fn quotas_are_proportional_and_complete() {
+        assert_eq!(proportional_quotas(&[1.0, 1.0, 1.0], 20), vec![7, 7, 6]);
+        assert_eq!(proportional_quotas(&[6.0, 3.0, 1.0], 20), vec![12, 6, 2]);
+        assert_eq!(proportional_quotas(&[1.0], 20), vec![20]);
+        // A tiny side still gets a slot.
+        let q = proportional_quotas(&[100.0, 0.4], 20);
+        assert_eq!(q.iter().sum::<usize>(), 20);
+        assert_eq!(q[1], 1);
+    }
+
+    #[test]
+    fn interleaving_follows_the_quotas() {
+        let lists = vec![vec!['A'; 7], vec!['B'; 7], vec!['C'; 6]];
+        let out: String = interleave_proportionally(lists).into_iter().collect();
+        assert_eq!(out.len(), 20);
+        assert!(out.starts_with("ABCABC"), "{out}");
+        assert_eq!(out.matches('A').count(), 7);
+        assert_eq!(out.matches('C').count(), 6);
+        // Uneven: no long run of the big side at the end.
+        let out: String = interleave_proportionally(vec![vec!['A'; 12], vec!['B'; 6], vec!['C'; 2]]).into_iter().collect();
+        assert!(!out.contains("AAA"), "{out}");
+        assert!(!out.ends_with("AA"), "{out}");
     }
 
     #[test]

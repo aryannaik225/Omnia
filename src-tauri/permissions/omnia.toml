@@ -82,7 +82,8 @@ permissions = [
   "allow-import-history-file",
   "allow-get-recommendations",
   "allow-get-taste-summary",
-  "allow-get-embedding-status"
+  "allow-get-embedding-status",
+  "allow-get-similar-titles"
 ]
 
 [[set]]

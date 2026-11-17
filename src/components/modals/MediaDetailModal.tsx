@@ -18,15 +18,15 @@ import {
   type MediaDetails,
   type MediaSummary,
 } from "../../services/tmdbClient";
-import { catalog, history, type ResolvedLink, type WatchHistoryEntry } from "../../services/tauriBridge";
+import { catalog, history, recommendations, type MediaType, type ResolvedLink, type WatchHistoryEntry } from "../../services/tauriBridge";
 import { useAppStore, type ModalEntry } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
-import { PosterCard, TmdbRating } from "../common/Cards";
+import { MatchBadge, PosterCard, TmdbRating } from "../common/Cards";
 import { HorizontalScroller } from "../common/HorizontalScroller";
 import { CollectionMenu, EpisodeWatchedToggle, FavoriteButton, MarkWatchedButton } from "../common/LibraryActions";
 import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
-import { fromSummary, MediaCarouselRow } from "../home/MediaCarouselRow";
+import { fromSummary, MediaCarouselRow, type CarouselItem } from "../home/MediaCarouselRow";
 import { useDevMode } from "../../services/devMode";
 
 // ---------------------------------------------------------------------------------------------
@@ -439,11 +439,41 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
           </section>
         )}
 
-        {/* Everything TMDB relates to this title, watched or not. */}
-        {d && d.recommendations.length > 0 && <MediaCarouselRow title="Recommendations" items={d.recommendations.filter((x) => x.posterPath).map(fromSummary)} />}
+        {/* Local composite-vector neighbours (watched or not); TMDB's list if the engine can't answer. */}
+        <MoreLikeThis id={entry.id} mediaType={entry.mediaType} fallback={d?.recommendations ?? []} />
       </div>
     </div>
   );
+}
+
+/**
+ * "More Like This": nearest neighbours by composite vibe vector (keywords 40%, director & cast
+ * 25%, genres 20%, plot 15%) among titles already embedded on this machine, followed by TMDB's
+ * own recommendations in their order. Falls back to TMDB's list if the local engine fails.
+ */
+function MoreLikeThis({ id, mediaType, fallback }: { id: number; mediaType: MediaType; fallback: MediaSummary[] }) {
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  const local = useAsync(() => recommendations.similar(profileId!, id, mediaType), [profileId, id, mediaType], !!profileId);
+  const items = useMemo(
+    () =>
+      (local.data?.items ?? []).map(
+        (it): CarouselItem => ({
+          id: it.tmdbId,
+          mediaType: it.mediaType,
+          title: it.title,
+          posterPath: it.posterPath,
+          year: it.releaseYear,
+          rating: it.voteAverage,
+          // TMDB's own picks follow the local matches and carry no match %.
+          badge: it.matchPercent > 0 ? <MatchBadge percent={it.matchPercent} /> : undefined,
+        }),
+      ),
+    [local.data],
+  );
+  if (local.loading) return <MediaCarouselRow title="More Like This" subtitle="Matching themes, director & cast, genre and story…" items={[]} loading />;
+  if (items.length) return <MediaCarouselRow title="More Like This" subtitle="Matched on themes, director & cast, genre and story" items={items} />;
+  const tmdb = fallback.filter((x) => x.posterPath).map(fromSummary);
+  return tmdb.length ? <MediaCarouselRow title="Recommendations" items={tmdb} /> : null;
 }
 
 // ---------------------------------------------------------------------------------------------

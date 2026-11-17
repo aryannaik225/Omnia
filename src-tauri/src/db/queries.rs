@@ -1615,6 +1615,90 @@ pub fn clear_all_embeddings(c: &Connection) -> rusqlite::Result<usize> {
     c.execute("DELETE FROM media_embeddings", [])
 }
 
+// --- title_vectors (content-only composite vectors, migration v8) ----------------------------
+
+/// (tmdb_id, media_type) -> (doc_hash, vector).
+pub type StoredTitleVectors = HashMap<(i64, String), (String, Vec<f32>)>;
+
+/// Stored vectors for `keys` under `model_id`.
+pub fn get_title_vectors(c: &Connection, model_id: &str, keys: &[(i64, String)]) -> rusqlite::Result<StoredTitleVectors> {
+    let mut stmt = c.prepare_cached(
+        "SELECT doc_hash, vector_blob FROM title_vectors WHERE tmdb_id = ?1 AND media_type = ?2 AND model_id = ?3",
+    )?;
+    let mut out = HashMap::new();
+    for (id, mt) in keys {
+        let row = stmt
+            .query_row(params![id, mt, model_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .optional()?;
+        if let Some((hash, blob)) = row {
+            out.insert((*id, mt.clone()), (hash, decode_embedding(&blob)));
+        }
+    }
+    Ok(out)
+}
+
+/// Upserts (tmdb_id, media_type, doc_hash, vector) rows for one model in a single transaction.
+pub fn upsert_title_vectors(
+    c: &mut Connection,
+    model_id: &str,
+    rows: &[(i64, String, String, Vec<f32>)],
+) -> rusqlite::Result<usize> {
+    let tx = c.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO title_vectors (tmdb_id, media_type, model_id, doc_hash, vector_blob, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(tmdb_id, media_type, model_id) DO UPDATE SET
+                doc_hash = excluded.doc_hash,
+                vector_blob = excluded.vector_blob,
+                updated_at = excluded.updated_at",
+        )?;
+        for (id, mt, hash, v) in rows {
+            stmt.execute(params![id, mt, model_id, hash, encode_embedding(v)])?;
+        }
+    }
+    tx.commit()?;
+    Ok(rows.len())
+}
+
+/// Drops vectors computed by any other model (they live in incompatible spaces).
+pub fn prune_title_vectors(c: &Connection, keep_model_id: &str) -> rusqlite::Result<usize> {
+    c.execute("DELETE FROM title_vectors WHERE model_id != ?1", [keep_model_id])
+}
+
+/// Catalog entries that already have a stored vector for `model_id`, with that vector (most
+/// recently embedded first). The fast "More Like This" search space: nothing is embedded.
+pub fn list_embedded_media(c: &Connection, model_id: &str, limit: i64) -> rusqlite::Result<Vec<(MediaCatalogEntry, Vec<f32>)>> {
+    let cols = MEDIA_COLS.split(", ").map(|col| format!("mc.{}", col.trim())).collect::<Vec<_>>().join(", ");
+    collect_rows(
+        c,
+        &format!(
+            "SELECT {cols}, tv.vector_blob FROM title_vectors tv
+             JOIN media_catalog mc ON mc.tmdb_id = tv.tmdb_id AND mc.media_type = tv.media_type
+             WHERE tv.model_id = ?1
+             ORDER BY tv.updated_at DESC LIMIT ?2"
+        ),
+        params![model_id, limit],
+        |r| Ok((map_media(r)?, decode_embedding(&r.get::<_, Vec<u8>>(15)?))),
+    )
+}
+
+/// Catalog entries with full metadata (keywords + credits), most recently refreshed first: the
+/// local search space for "More Like This".
+pub fn list_rich_media(c: &Connection, limit: i64) -> rusqlite::Result<Vec<MediaCatalogEntry>> {
+    collect_rows(
+        c,
+        &format!(
+            "SELECT {MEDIA_COLS} FROM media_catalog
+             WHERE keywords_json IS NOT NULL AND keywords_json != 'null'
+               AND credits_json IS NOT NULL AND credits_json != 'null'
+             ORDER BY updated_at DESC LIMIT ?1"
+        ),
+        [limit],
+        map_media,
+    )
+}
+
 pub fn list_embeddings(c: &Connection, app_profile_id: i64) -> rusqlite::Result<Vec<EmbeddingRecord>> {
     collect_rows(
         c,

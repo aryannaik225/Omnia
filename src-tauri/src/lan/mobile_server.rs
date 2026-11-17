@@ -919,6 +919,7 @@ async fn dispatch(app: &AppHandle, command: &str, v: Value) -> Result<Value, Str
         "get_recommendations" => call!(app, v, rec::get_recommendations, [app], app_profile_id: i64, force_refresh: Option<bool>),
         "get_taste_summary" => call!(app, v, rec::get_taste_summary, [state], app_profile_id: i64, limit: Option<usize>),
         "get_embedding_status" => call!(app, v, rec::get_embedding_status, [state]),
+        "get_similar_titles" => call!(app, v, rec::get_similar_titles, [app], app_profile_id: i64, tmdb_id: i64, media_type: String),
 
         // The PC's player is the PC's: a remote device only sees whether one is open.
         "get_player_status" => call!(app, v, window_manager::get_player_status, [state]),
