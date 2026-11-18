@@ -86,6 +86,9 @@ const COMMANDS: &[&str] = &[
     "get_taste_summary",
     "get_embedding_status",
     "get_similar_titles",
+    // Self-update
+    "check_for_update",
+    "install_update",
     // Injected OTT script (remote origins)
     "sync_playback_telemetry",
     "player_back_to_hub",

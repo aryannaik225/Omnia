@@ -1,6 +1,6 @@
 [package]
 name = "omnia"
-version = "1.0.0"
+version = "1.0.2"
 description = "Omnia - Universal OTT Aggregator, Discovery Engine & Smart Playback Hub"
 edition = "2021"
 rust-version = "1.82"
@@ -39,6 +39,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-single-instance = "2"
+# Signed self-updates from GitHub Releases (latest.json).
+tauri-plugin-updater = "2"
 
 # Android TV thin client: hands playback to the installed OTT apps (Android intents).
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]

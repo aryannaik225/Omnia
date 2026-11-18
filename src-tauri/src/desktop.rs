@@ -1068,6 +1068,62 @@ const TRAY_QUIT: &str = "tray-quit";
 /// Tray icon (Omnia's ring, from the generated icon set) with "Open Omnia" / "Quit Omnia".
 /// Left click opens the hub; right click shows the menu.
 #[cfg(desktop)]
+// ---------------------------------------------------------------------------------------------
+// Self-update (GitHub Releases latest.json, minisign-verified by tauri-plugin-updater)
+// ---------------------------------------------------------------------------------------------
+
+/// A newer signed release than the running build.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    version: String,
+    current_version: String,
+    notes: Option<String>,
+    date: Option<String>,
+}
+
+async fn find_update(app: &tauri::AppHandle) -> AppResult<Option<tauri_plugin_updater::Update>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| invalid(format!("Updater unavailable: {e}")))?;
+    updater.check().await.map_err(|e| invalid(format!("Could not check for updates: {e}")))
+}
+
+/// Silent launch check: `None` when up to date. Sends no user data, only fetches latest.json.
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> AppResult<Option<UpdateInfo>> {
+    Ok(find_update(&app).await?.map(|u| UpdateInfo {
+        version: u.version.clone(),
+        current_version: u.current_version.clone(),
+        notes: u.body.clone().filter(|b| !b.trim().is_empty()),
+        date: u.date.map(|d| d.to_string()),
+    }))
+}
+
+/// Downloads, verifies and installs the update, then relaunches. Emits `omnia://update-progress`
+/// `{ downloaded, total }`. On Windows the installer closes Omnia itself and reopens it.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri::Emitter;
+    let update = find_update(&app).await?.ok_or_else(|| invalid("Omnia is already up to date."))?;
+
+    // Flush the open player's final position before the process goes away.
+    window_manager::close_active_player(&app, "update").await;
+
+    let emitter = app.clone();
+    let mut downloaded: u64 = 0;
+    update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded += chunk as u64;
+                let _ = emitter.emit("omnia://update-progress", serde_json::json!({ "downloaded": downloaded, "total": total }));
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| invalid(format!("Update failed: {e}")))?;
+    app.restart()
+}
+
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -1152,6 +1208,8 @@ pub fn run() {
     let builder = builder
         .plugin(global_shortcut_plugin())
         .plugin(window_state_plugin())
+        // Signed self-updates (endpoint + public key in tauri.conf.json → plugins.updater).
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Close-to-tray: the main window's X hides it; the process keeps the embedding model,
         // recommender cache and isolated WebView2 sessions warm. "Quit Omnia" in the tray exits.
         .on_window_event(|window, event| {
@@ -1366,6 +1424,9 @@ pub fn run() {
             recommender::get_taste_summary,
             recommender::get_embedding_status,
             recommender::get_similar_titles,
+            // Self-update
+            check_for_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Omnia");

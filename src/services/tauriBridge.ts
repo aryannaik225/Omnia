@@ -691,6 +691,22 @@ export interface EmbeddingStatus {
   modelDir: string;
 }
 
+/** A newer signed release on GitHub (mirrors `desktop::UpdateInfo`). */
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  date: string | null;
+}
+
+/** Self-update: desktop app only (not exposed to phones / TVs over the LAN bridge). */
+export const updater = {
+  check: () => invoke<UpdateInfo | null>("check_for_update"),
+  /** Downloads, verifies, installs and relaunches; resolves only if relaunch fails. */
+  install: () => invoke<void>("install_update"),
+  onProgress: on<{ downloaded: number; total: number | null }>("omnia://update-progress"),
+};
+
 export const recommendations = {
   /** Cached for 30 min per profile; new telemetry/imports invalidate it automatically. */
   get: (appProfileId: number, forceRefresh = false) =>

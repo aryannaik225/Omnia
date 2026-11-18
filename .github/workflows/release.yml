@@ -33,6 +33,12 @@ jobs:
             echo "::error::Repository secret TMDB_API_KEY is missing or empty (Settings > Secrets and variables > Actions)."
             exit 1
           fi
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::Repository secret TAURI_PRIVATE_KEY is missing: updater artifacts can't be signed."
+            exit 1
+          fi
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -59,6 +65,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          # Updater signing (Tauri 2 variable names). Signs the installers (.sig) and makes
+          # tauri-action upload latest.json, which installed copies poll for updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Omnia ${{ github.ref_name }}"
@@ -68,6 +78,7 @@ jobs:
             - `Omnia_*_x64-setup.exe`: recommended installer (per-user, no admin needed)
             - `Omnia_*_x64_en-US.msi`: MSI installer
             - `setup_instructions.txt`: step-by-step setup guide
+          includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
 

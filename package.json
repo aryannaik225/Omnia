@@ -1,7 +1,7 @@
 {
   "name": "omnia",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Universal OTT aggregator, discovery engine & smart playback hub",
   "type": "module",
   "scripts": {

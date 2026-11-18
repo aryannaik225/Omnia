@@ -83,7 +83,9 @@ permissions = [
   "allow-get-recommendations",
   "allow-get-taste-summary",
   "allow-get-embedding-status",
-  "allow-get-similar-titles"
+  "allow-get-similar-titles",
+  "allow-check-for-update",
+  "allow-install-update"
 ]
 
 [[set]]

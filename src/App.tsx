@@ -12,6 +12,7 @@ import { events, isTauri } from "./services/tauriBridge";
 import { browseKey, useAppStore, type View } from "./store/useAppStore";
 import { usePlayerStore } from "./store/usePlayerStore";
 import { Toasts } from "./components/common/Toasts";
+import { UpdatePrompt } from "./components/common/UpdatePrompt";
 import { AmbientBackground } from "./components/layout/AmbientBackground";
 import { LiquidSidebar, SIDEBAR_COLLAPSED, SIDEBAR_EXPANDED } from "./components/layout/LiquidSidebar";
 import { TopFilterBar } from "./components/layout/TopFilterBar";
@@ -312,6 +313,7 @@ function Main({ onUnpaired }: { onUnpaired: () => void }) {
           <Shell />
         )}
         <Toasts />
+        {booted && !bootError && <UpdatePrompt />}
         <TvChrome remoteKeys={booted && !bootError} />
       </MotionConfig>
     </LazyMotion>
