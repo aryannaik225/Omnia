@@ -5,6 +5,7 @@
  */
 import { AnimatePresence, m } from "framer-motion";
 import { useState, type ComponentType } from "react";
+import { requestScrollTop } from "../../lib/scrollTop";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { Avatar, defaultAvatarFor } from "../common/Avatar";
 import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, PlayCircleIcon, SearchIcon, StackIcon, TvIcon } from "../common/Icons";
@@ -62,7 +63,7 @@ export function MobileTabBar() {
         style={{ bottom: "max(12px, env(safe-area-inset-bottom))" }}
       >
         {TABS.map(({ view: v, label, icon: Icon }) => (
-          <button key={v} onClick={() => navigate(v)} aria-current={view === v ? "page" : undefined} aria-label={label} className={tab(view === v)}>
+          <button key={v} onClick={() => (view === v ? requestScrollTop() : navigate(v))} aria-current={view === v ? "page" : undefined} aria-label={label} className={tab(view === v)}>
             <Icon size={21} />
             <span className="truncate max-[359px]:hidden">{label}</span>
           </button>
@@ -107,7 +108,8 @@ export function MobileTabBar() {
                   key={v}
                   onClick={() => {
                     setMoreOpen(false);
-                    navigate(v);
+                    if (view === v) requestScrollTop();
+                    else navigate(v);
                   }}
                   aria-current={view === v ? "page" : undefined}
                   className={`flex w-full items-center gap-3 rounded-[14px] px-3 py-3 text-left text-[15px] ${view === v ? "bg-white/[0.12] text-label-primary" : "text-label-secondary hover:bg-white/[0.07]"}`}

@@ -23,6 +23,7 @@ import { useAppStore, type ModalEntry } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { MatchBadge, PosterCard, TmdbRating } from "../common/Cards";
 import { HorizontalScroller } from "../common/HorizontalScroller";
+import { OscarBadge } from "../common/OscarBadge";
 import { CollectionMenu, EpisodeWatchedToggle, FavoriteButton, MarkWatchedButton } from "../common/LibraryActions";
 import { CheckIcon, ChevronLeftIcon, CloseIcon, PlayIcon, PlusIcon, RefreshIcon } from "../common/Icons";
 import { providerBadge } from "../home/HeroBillboard";
@@ -129,6 +130,9 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
 // Seasons & episodes
 // ---------------------------------------------------------------------------------------------
 
+/** Episodes shown before "Show all N episodes" in seasons longer than this. */
+const EPISODE_PREVIEW = 10;
+
 function Episodes({
   d,
   progress,
@@ -149,6 +153,26 @@ function Episodes({
   const [seasonNo, setSeasonNo] = useState<number>(latest?.seasonNumber ?? d.seasons[0]?.seasonNumber ?? 1);
   const episodes = useAsync(() => tmdbSeason(d.id, seasonNo), [d.id, seasonNo]);
   const byKey = useMemo(() => new Map(progress.map((p) => [`${p.seasonNumber}-${p.episodeNumber}`, p])), [progress]);
+
+  // Long seasons show the first EPISODE_PREVIEW episodes; collapsed again on every season switch,
+  // unless you were last watching beyond them in this season (so Resume stays in view).
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    setExpanded(latest?.seasonNumber === seasonNo && latest.episodeNumber > EPISODE_PREVIEW);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seasonNo, d.id]);
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const allEpisodes = episodes.data ?? [];
+  const collapsible = allEpisodes.length > EPISODE_PREVIEW;
+  const shownEpisodes = collapsible && !expanded ? allEpisodes.slice(0, EPISODE_PREVIEW) : allEpisodes;
+  const toggleExpanded = () => {
+    if (expanded) {
+      // Collapsing removes the rows above the button: bring the list's top back into view.
+      const top = sectionRef.current?.getBoundingClientRect().top ?? 0;
+      if (top < 0) sectionRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+    setExpanded((x) => !x);
+  };
 
   /** Marks every aired, not-yet-finished episode of the open season (watched elsewhere). */
   const markSeason = async () => {
@@ -182,7 +206,7 @@ function Episodes({
 
   if (!d.seasons.length) return null;
   return (
-    <section>
+    <section ref={sectionRef} className="scroll-mt-6">
       <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-col max-md:items-stretch max-md:gap-3">
         <div className="flex shrink-0 items-center gap-3 max-md:justify-between">
           <h2 className="section-title whitespace-nowrap">Episodes</h2>
@@ -203,7 +227,7 @@ function Episodes({
       <div className="flex flex-col gap-2">
         {episodes.loading &&
           Array.from({ length: 4 }, (_, i) => <div key={i} className="skeleton h-[96px] rounded-card" />)}
-        {(episodes.data ?? []).map((ep) => {
+        {shownEpisodes.map((ep) => {
           const p = byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`);
           const ratio = p ? (p.isCompleted ? 1 : p.completionRatio) : 0;
           const still = img(ep.stillPath, "w300");
@@ -247,6 +271,15 @@ function Episodes({
             </div>
           );
         })}
+        {collapsible && (
+          <button
+            className="glass-button mx-auto mt-2 !px-5 !py-2 text-[13px]"
+            onClick={toggleExpanded}
+            aria-expanded={expanded}
+          >
+            {expanded ? "Show less" : `Show all ${allEpisodes.length} episodes`}
+          </button>
+        )}
       </div>
     </section>
   );
@@ -314,6 +347,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
           {badge && <p className="mb-2 text-[13px] font-semibold uppercase tracking-[0.12em] text-white/80">{badge}</p>}
           <h1 className="text-[46px] max-md:text-[30px] font-bold leading-[1.04] tracking-tight drop-shadow-lg">{seed.title}</h1>
           <div className="mt-3 flex flex-wrap items-center gap-2.5 text-[14px] text-white/85">
+            {seed.mediaType === "movie" && <OscarBadge tmdbId={seed.id} />}
             {d?.certification && <span className="badge">{d.certification}</span>}
             {seed.voteAverage ? (
               <span className="badge !bg-black/30">

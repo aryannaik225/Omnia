@@ -7,6 +7,7 @@ import { m } from "framer-motion";
 import { useState, type ComponentType, type FocusEvent } from "react";
 import wordmark from "../../assets/omnia-wordmark.png";
 import { flag } from "../../lib/format";
+import { requestScrollTop } from "../../lib/scrollTop";
 import { useAppStore, type View } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
 import { Avatar, defaultAvatarFor } from "../common/Avatar";
@@ -101,7 +102,7 @@ export function LiquidSidebar() {
           return (
             <li key={v}>
               <button
-                onClick={() => navigate(v)}
+                onClick={() => (active ? requestScrollTop() : navigate(v))}
                 aria-current={active ? "page" : undefined}
                 title={collapsed ? label : undefined}
                 className={`relative flex w-full items-center gap-3.5 rounded-pill px-3 py-2.5 text-[15px] font-medium transition-colors duration-200 ${

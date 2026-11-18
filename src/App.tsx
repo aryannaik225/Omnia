@@ -6,6 +6,7 @@ import { AnimatePresence, domMax, LazyMotion, m, MotionConfig } from "framer-mot
 import { lazy, Suspense, useEffect, useRef, type CSSProperties } from "react";
 import { PHONE_QUERY, useMediaQuery, useRafCallback } from "./lib/hooks";
 import { handleNavKey, setBackHandler, setHomeHandler, startSpatialNavigation, type NavKey } from "./lib/spatialNav";
+import { SCROLL_TOP_EVENT } from "./lib/scrollTop";
 import { useHandoff } from "./services/handoff";
 import { NotPairedError, platformMode, remoteControl, tvNavigation, UNPAIRED_EVENT } from "./services/platform";
 import { events, isTauri } from "./services/tauriBridge";
@@ -99,6 +100,16 @@ function Shell() {
       restoring.current = null;
     });
   }
+
+  // Re-clicking the open view in the sidebar / tab bar scrolls back to the top.
+  useEffect(() => {
+    const toTop = () => {
+      restoring.current = null;
+      main.current?.scrollTo({ top: 0, behavior: "smooth" });
+    };
+    window.addEventListener(SCROLL_TOP_EVENT, toTop);
+    return () => window.removeEventListener(SCROLL_TOP_EVENT, toTop);
+  }, []);
 
   const onScroll = useRafCallback(() => {
     if (restoring.current === null) rememberScroll(view, main.current?.scrollTop ?? 0);
