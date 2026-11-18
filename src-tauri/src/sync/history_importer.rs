@@ -1233,10 +1233,8 @@ impl TmdbClient {
     pub(crate) async fn from_settings(state: &AppState) -> AppResult<Self> {
         let key = state
             .db
-            .run(|c| queries::get_setting(c, queries::keys::TMDB_API_KEY))
+            .run(|c| queries::tmdb_api_key(c))
             .await?
-            .map(|k| k.trim().to_string())
-            .filter(|k| !k.is_empty())
             .ok_or_else(|| msg("A TMDB API key is required to match imported titles. Add it in Settings."))?;
         Ok(Self { http: state.http.clone(), bearer: key.starts_with("eyJ"), credential: key.into() })
     }

@@ -1,0 +1,78 @@
+name: Release (Windows)
+
+# Push a version tag to build the Windows installers and publish a GitHub Release:
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # build.rs bakes this into the Rust binary (env!("OMNIA_TMDB_API_KEY")), and Vite
+      # exposes it to the catalog UI (envPrefix "TMDB_"). No .env file is needed on the runner.
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require the TMDB_API_KEY secret
+        shell: bash
+        run: |
+          if [ -z "$TMDB_API_KEY" ]; then
+            echo "::error::Repository secret TMDB_API_KEY is missing or empty (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Builds the frontend, compiles the release binary and bundles NSIS (setup.exe) + MSI,
+      # then creates the release for this tag and uploads the installers to it.
+      - name: Build and publish installers
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Omnia ${{ github.ref_name }}"
+          releaseBody: |
+            Windows installers for Omnia ${{ github.ref_name }}.
+
+            - `Omnia_*_x64-setup.exe`: recommended installer (per-user, no admin needed)
+            - `Omnia_*_x64_en-US.msi`: MSI installer
+            - `setup_instructions.txt`: step-by-step setup guide
+          releaseDraft: false
+          prerelease: false
+
+      - name: Attach setup instructions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" setup_instructions.txt --clobber

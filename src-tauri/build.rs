@@ -94,7 +94,39 @@ const COMMANDS: &[&str] = &[
     "report_scrape_progress",
 ];
 
+/// Resolves the TMDB key at compile time so the shipped binary needs no `.env` at runtime.
+/// Order: the `TMDB_API_KEY` environment variable (CI secret), then `TMDB_API_KEY=` in the
+/// repo-root `.env` (local builds). Exposed to the crate as `env!("OMNIA_TMDB_API_KEY")`.
+fn embed_tmdb_key() {
+    println!("cargo:rerun-if-env-changed=TMDB_API_KEY");
+    println!("cargo:rerun-if-changed=../.env");
+
+    let from_env = std::env::var("TMDB_API_KEY").ok();
+    let from_file = || {
+        let text = std::fs::read_to_string("../.env").ok()?;
+        text.lines().find_map(|line| {
+            let line = line.trim();
+            let value = line.strip_prefix("export ").unwrap_or(line).strip_prefix("TMDB_API_KEY=")?;
+            Some(value.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        })
+    };
+    let key = from_env
+        .filter(|k| !k.trim().is_empty())
+        .or_else(from_file)
+        .map(|k| k.trim().to_string())
+        .unwrap_or_default();
+
+    if key.is_empty() {
+        println!("cargo:warning=TMDB_API_KEY not set (env or ../.env): this build has no bundled TMDB key; users must paste one in Settings.");
+    }
+    if key.contains(['\n', '\r']) {
+        panic!("TMDB_API_KEY must be a single line");
+    }
+    println!("cargo:rustc-env=OMNIA_TMDB_API_KEY={key}");
+}
+
 fn main() {
+    embed_tmdb_key();
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),

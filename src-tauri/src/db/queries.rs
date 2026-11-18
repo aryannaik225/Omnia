@@ -27,6 +27,27 @@ pub mod keys {
     pub const EMBEDDING_MODEL_ID: &str = "embedding_model_id";
 }
 
+/// TMDB key compiled into the binary by `build.rs` (from the `TMDB_API_KEY` env var or `.env`
+/// at build time). Empty when the build had none; a key saved in Settings always wins.
+pub const BUNDLED_TMDB_API_KEY: &str = env!("OMNIA_TMDB_API_KEY");
+
+/// Stored TMDB key, falling back to the compiled-in one.
+pub fn tmdb_api_key(c: &Connection) -> rusqlite::Result<Option<String>> {
+    let stored = get_setting(c, keys::TMDB_API_KEY)?.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    Ok(stored.or_else(|| Some(BUNDLED_TMDB_API_KEY.trim().to_string()).filter(|k| !k.is_empty())))
+}
+
+/// On startup, mirror the compiled-in key into settings when none is stored, so the catalog UI
+/// (which reads settings) works from a lone `omnia.exe` with no `.env` beside it.
+pub fn seed_bundled_tmdb_key(c: &Connection) -> rusqlite::Result<()> {
+    let key = BUNDLED_TMDB_API_KEY.trim();
+    let stored = get_setting(c, keys::TMDB_API_KEY)?.unwrap_or_default();
+    if !key.is_empty() && stored.trim().is_empty() {
+        set_setting(c, keys::TMDB_API_KEY, key)?;
+    }
+    Ok(())
+}
+
 /// A title counts as completed when the user reaches the credits: 95% of runtime,
 /// or within the final two minutes of anything longer than five minutes.
 pub fn is_completion(progress_seconds: f64, duration_seconds: f64) -> bool {

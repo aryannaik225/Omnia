@@ -1172,6 +1172,9 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let db = tauri::async_runtime::block_on(Database::open(data_dir.join("omnia.db")))?;
+            if let Err(e) = tauri::async_runtime::block_on(db.run(|c| queries::seed_bundled_tmdb_key(c))) {
+                log::warn!("could not seed bundled TMDB key: {e}");
+            }
 
             let http = reqwest::Client::builder()
                 .user_agent(concat!("Omnia/", env!("CARGO_PKG_VERSION")))
