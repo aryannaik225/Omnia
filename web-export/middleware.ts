@@ -3,10 +3,26 @@ import { NextResponse, type NextRequest } from "next/server";
 
 type CookieToSet = { name: string; value: string; options: CookieOptions };
 
-/** Refreshes the Supabase session cookie on every request and keeps signed-out users on /login. */
+/**
+ * Runs only for the web app under /app (the landing page at / is public and static).
+ * Refreshes the Supabase session cookie and keeps signed-out users on /app/login.
+ */
 export async function middleware(request: NextRequest) {
+  const path = request.nextUrl.pathname;
+  const isPublic = path.startsWith("/app/login") || path.startsWith("/app/auth");
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  // Not configured yet (e.g. a fresh Vercel deploy): the login page explains what's missing.
+  if (!url || !anon) {
+    if (isPublic) return NextResponse.next();
+    const to = request.nextUrl.clone();
+    to.pathname = "/app/login";
+    return NextResponse.redirect(to);
+  }
+
   let response = NextResponse.next({ request });
-  const supabase = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
+  const supabase = createServerClient(url, anon, {
     cookies: {
       getAll: () => request.cookies.getAll(),
       setAll: (list: CookieToSet[]) => {
@@ -20,16 +36,14 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const path = request.nextUrl.pathname;
-  const isPublic = path.startsWith("/login") || path.startsWith("/auth");
   if (!user && !isPublic) {
-    const url = request.nextUrl.clone();
-    url.pathname = "/login";
-    return NextResponse.redirect(url);
+    const to = request.nextUrl.clone();
+    to.pathname = "/app/login";
+    return NextResponse.redirect(to);
   }
   return response;
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\.(?:svg|png|jpg|jpeg|webp)$).*)"],
+  matcher: ["/app", "/app/:path*"],
 };

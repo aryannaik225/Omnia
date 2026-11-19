@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { supabaseServer } from "@/lib/supabase/server";
+import { APP_BASE } from "@/lib/supabase/env";
 
 /** E-mail confirmation / magic-link landing: exchanges the code for a session cookie. */
 export async function GET(request: NextRequest) {
@@ -8,7 +9,7 @@ export async function GET(request: NextRequest) {
   if (code) {
     const supabase = await supabaseServer();
     const { error } = await supabase.auth.exchangeCodeForSession(code);
-    if (!error) return NextResponse.redirect(`${origin}/`);
+    if (!error) return NextResponse.redirect(`${origin}${APP_BASE}`);
   }
-  return NextResponse.redirect(`${origin}/login?error=${encodeURIComponent("That sign-in link is invalid or expired.")}`);
+  return NextResponse.redirect(`${origin}${APP_BASE}/login?error=${encodeURIComponent("That sign-in link is invalid or expired.")}`);
 }

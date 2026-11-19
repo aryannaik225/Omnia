@@ -319,7 +319,7 @@ Migration v8 adds `title_vectors (tmdb_id, media_type, model_id, doc_hash, vecto
 
 **Developer Options:** tapping the version in Settings 7 times sets `dev_options_unlocked`; `dev_direct_stream` adds a "Stream (Dev)" button that opens a plain HLS / MP4 test player (hls.js, lazy-loaded). Test streams are never recorded.
 
-**`web-export/`** is a separate, optional Next.js + Supabase cloud edition (RLS on every table). It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to it by design.
+**`web-export/`** is the public website, a separate Next.js project deployed to Vercel: the landing page at `/` (static, hourly ISR; reads the latest GitHub release server-side) and an optional Supabase cloud edition at `/app` (RLS on every table). It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to `/app` by design.
 
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 
@@ -387,7 +387,7 @@ Maintain this exact repository structure:
 │       └── lan/
 │           └── mobile_server.rs          # Optional local Axum server for zero-install iPhone Safari access
 ├── docs/PHONE_AND_TV.md                  # LAN pairing, iPhone, Android TV APK build
-└── web-export/                           # Optional Next.js + Supabase cloud edition (separate project)
+└── web-export/                           # Website: landing page at /, optional Supabase cloud edition at /app
 ```
 
 ---
