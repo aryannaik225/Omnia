@@ -36,7 +36,7 @@ export default async function Login({ searchParams }: { searchParams: Promise<{ 
     <main className="flex min-h-screen items-center justify-center p-4">
       <form className="glass w-full max-w-[400px] rounded-panel p-8 text-center">
         <h1 className="text-[28px] font-bold tracking-tight">Omnia</h1>
-        <p className="mt-1 text-label-secondary">Sign in to your library</p>
+        <p className="mt-1 text-label-secondary">Sign in to save and sync your library</p>
         {configured ? (
           <>
             <input name="email" type="email" required autoComplete="email" placeholder="E-mail" className="glass-input mt-6" />
@@ -51,14 +51,17 @@ export default async function Login({ searchParams }: { searchParams: Promise<{ 
                 Create account
               </button>
             </div>
+            <p className="mt-5 text-[13px] leading-relaxed text-label-tertiary">Anything you tracked as a guest in this browser is added to your account when you sign in.</p>
           </>
         ) : (
           <p className="mt-6 text-[14px] leading-relaxed text-label-secondary">
-            The browser edition isn&apos;t connected to a Supabase project yet. Set <code className="text-label-primary">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-            <code className="text-label-primary">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> for this deployment, or grab the desktop app in the meantime.
+            Accounts aren&apos;t enabled on this deployment yet, but you can use everything as a guest: your library is saved in this browser.
           </p>
         )}
-        <Link href="/" className="mt-6 inline-block text-[13px] text-label-tertiary hover:text-label-primary">
+        <Link href={APP_BASE} className="mt-6 block text-[14px] font-medium text-label-secondary hover:text-label-primary">
+          Continue as guest →
+        </Link>
+        <Link href="/" className="mt-3 inline-block text-[13px] text-label-tertiary hover:text-label-primary">
           ← Back to omnia
         </Link>
       </form>

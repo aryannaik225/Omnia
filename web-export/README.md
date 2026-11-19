@@ -4,8 +4,12 @@ One Next.js project, one Vercel deployment:
 
 - **`/`** is the Omnia landing page: a WebGL theater hero (React Three Fiber), interactive
   previews of the desktop UI, and a download section that reads the latest GitHub release.
-- **`/app`** is the optional web edition with cloud sync (below). It is not part of the desktop
-  app's build, and nothing in the desktop app uses it.
+- **`/app`** is the desktop app's UI in the browser (ported in `omnia/`) as a TV Time / Letterboxd-style
+  **manual tracker**: browse, search, see where a title
+  streams, mark movies watched, tick off episodes, keep a watchlist and follow upcoming air dates.
+  No account needed: guests track in their browser (`localStorage`). Signing in (Supabase) is
+  optional and syncs the library; a guest library is uploaded on first sign-in. It is not part of
+  the desktop app's build, and nothing in the desktop app uses it.
 
 > **This is a different privacy model.** The desktop app is local-first: history, profiles and
 > taste data never leave your PC (see the repo's `CLAUDE.md`). This edition stores them in *your*
@@ -20,15 +24,19 @@ One Next.js project, one Vercel deployment:
 | `lib/release.ts` | Latest release from the GitHub API, fetched on the server with `revalidate: 3600`. Falls back to v1.1.0 and the Releases page while the repo is private (404) or GitHub is unreachable. |
 | `lib/landing.ts` | Poster art for the landing page: TMDB trending (when `TMDB_API_KEY` is set) through Next's image optimizer, or generated art otherwise. |
 | `supabase/schema.sql` | Omnia's schema in Postgres: profiles, settings, subscriptions, watch history (with the generated `completion_ratio`), watchlist, favourites, collections, preferred providers, a shared TMDB catalog cache and a `continue_watching` view. RLS on every table, plus a trigger that gives new users a first profile. |
-| `middleware.ts`, `lib/supabase/*` | Supabase SSR auth for `/app/*` only: refreshes the session cookie and sends signed-out visitors to `/app/login`. Without Supabase env vars the login page explains what's missing. |
-| `app/app/login`, `app/app/auth/*` | E-mail + password sign-in and sign-up (server actions), the e-mail confirmation callback and sign-out. |
-| `app/app/page.tsx` | `/app` home in the desktop app's Liquid Glass style: hero, Continue Watching and Your List (from Supabase), and Trending / Popular rows (from TMDB). |
-| `lib/tmdb.ts` | Server-only TMDB client. The API key never reaches the browser. |
+| `middleware.ts`, `lib/supabase/*`, `lib/session.ts` | Supabase SSR auth for `/app/*`: refreshes a signed-in session cookie. No login wall; without Supabase env vars the app runs in guest mode only. |
+| `app/app/login`, `app/app/auth/*` | Optional e-mail + password sign-in / sign-up (server actions), the e-mail confirmation callback and sign-out. |
+| `omnia/` | **The desktop app's frontend, ported.** Same folder layout as the repo's `src/` (`components/`, `config/`, `lib/`, `services/`, `store/`) so files can be diffed and kept in sync: Liquid Glass sidebar / tab bar, filter bar with the region switcher, ambient bleed, hero with trailer previews, 3D specular cards, Top 10, hubs, the Home row registry, "View More" grids, the detail sheet (season chips, collapsible episode lists, cast → filmography), Oscar badges, toasts, tap-the-tab-again-to-top. Web-only pieces: `store/useAppStore.ts` (localStorage instead of SQLite, Next routes instead of views), `services/tauriBridge.ts` (types only), `lib/region.ts`, `lib/personal.ts`, `components/common/LibraryActions.tsx` / `DesktopOnly.tsx`, `components/layout/WebShell.tsx`, `components/views/SettingsView.tsx`. |
+| `app/globals.css`, `tailwind.config.ts` | The desktop's `src/styles/liquid-glass.css` and Tailwind tokens, verbatim; only window-level rules are scoped to the `.omnia-app` shell so the landing page is unaffected. |
+| `app/app/(main)/*` | Home, Search, **My Library** (`library`: a Watch Summary bar — total watch time from each title's TMDB runtime, recorded when it's marked — then Watchlist, Upcoming, Ongoing Series, Completed Series and Tracked Movies rows, 20 per row, newest first; `library/[section]` is each row's full grid), My OTTs, Franchises & Hubs (`hubs/[slug]`), Settings, `browse` (View More). The detail sheet's Where to watch shows upcoming release dates (TMDB regional `release_dates`, theatrical vs digital) and "In Theatres Now" when a title has no providers yet (`omnia/lib/releaseStatus.ts`). A title opens as the detail sheet and is mirrored in `?t=movie:603` (old `title/[type]/[id]` links redirect there). |
+| `app/app/api/tmdb/[...path]` | Read-only TMDB proxy: the ported TMDB client runs in the browser unchanged, but the key stays on the server. Public catalog GET endpoints only; responses are cached (data cache + CDN `s-maxage`). |
+| `app/app/api/region` | The visitor's country: Vercel's `x-vercel-ip-country` header (or `cf-ipcountry`); off Vercel (e.g. localhost) an IP-country lookup of the server's own connection. The browser falls back to its time zone, then language, then `US`, stores the result in `localStorage`, re-checks auto regions once per visit, and never overrides a manual choice. |
+| `components/tracker/*`, `lib/tracker*.ts` | One tracker API over two backends: `localStorage` for guests, the user's own Supabase rows when signed in (watched movies are `watch_history` rows at S0 E0, episodes at their S/E, as on the desktop). Each watched movie / episode also keeps its TMDB runtime (`runtimes`; `watch_history.duration_seconds` when signed in). Optimistic writes with rollback. Imports this app's export or the desktop's "Export history" JSON. |
+| `app/app/api/titles`, `lib/tmdb.ts`, `lib/media.ts` | Title summaries (artwork, air dates, season sizes) for Continue Watching / Upcoming / Watchlist; client-safe date and provider-link helpers. |
 
-Not included (port these from the desktop app when you need them): the detail page,
-search, hubs, the JustWatch deep-link resolver, the recommender (it uses on-device ONNX),
-and OTT history import. A website can't read your Netflix / Prime sessions, so history
-would come from CSV / JSON import (the desktop's "Export history" JSON fits `watch_history`).
+Desktop-only features (OTT account linking and history auto-import, automatic playback tracking
+in the native player, on-device recommendations, phone / TV pairing) are not in the web app; it
+shows a small "Available on Omnia Desktop" badge linking to the landing page's download section.
 
 ## Set up
 
@@ -37,7 +45,7 @@ would come from CSV / JSON import (the desktop's "Export history" JSON fits `wat
    (`http://localhost:3000` while developing) and add `/app/auth/callback` as a redirect URL.
 3. Copy `.env.example` to `.env.local` and fill it in:
    `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` (Settings → API),
-   `TMDB_API_KEY`, `NEXT_PUBLIC_SITE_URL`, optionally `DEFAULT_REGION` and `GITHUB_TOKEN`.
+   `TMDB_API_KEY`, `NEXT_PUBLIC_SITE_URL`, optionally `GITHUB_TOKEN`. The catalog region is detected per visitor.
    The landing page's download buttons go through `/download/exe` and `/download/msi`, which redirect to the
    latest release asset. With `GITHUB_TOKEN` (read access to the repo) this works even while the repository is
    private, so anyone visiting the site can download the installers; without it they fall back to the Releases page.

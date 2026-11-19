@@ -319,7 +319,7 @@ Migration v8 adds `title_vectors (tmdb_id, media_type, model_id, doc_hash, vecto
 
 **Developer Options:** tapping the version in Settings 7 times sets `dev_options_unlocked`; `dev_direct_stream` adds a "Stream (Dev)" button that opens a plain HLS / MP4 test player (hls.js, lazy-loaded). Test streams are never recorded.
 
-**`web-export/`** is the public website, a separate Next.js project deployed to Vercel: the landing page at `/` (static, hourly ISR; reads the latest GitHub release server-side) and an optional Supabase cloud edition at `/app` (RLS on every table). It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to `/app` by design.
+**`web-export/`** is the public website, a separate Next.js project deployed to Vercel: the landing page at `/` (static, hourly ISR; reads the latest GitHub release server-side) and a manual tracker at `/app`: the desktop frontend ported into `web-export/omnia/` (same layout as `src/`; keep the two in sync when changing shared UI), TMDB through a server-side proxy, region auto-detected per visitor (`x-vercel-ip-country`, else IP lookup / time zone), guest mode in `localStorage`, optional Supabase sign-in to sync (RLS on every table); desktop-only features show an "Available on Omnia Desktop" badge. It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to `/app` by design.
 
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 

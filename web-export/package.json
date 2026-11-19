@@ -20,7 +20,8 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "server-only": "^0.0.1",
-    "three": "^0.187.0"
+    "three": "^0.187.0",
+    "zustand": "^5.0.8"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -5,21 +5,14 @@ type CookieToSet = { name: string; value: string; options: CookieOptions };
 
 /**
  * Runs only for the web app under /app (the landing page at / is public and static).
- * Refreshes the Supabase session cookie and keeps signed-out users on /app/login.
+ *
+ * There is no login wall: guests can browse, search and track in their own browser. When
+ * Supabase is configured this only refreshes a signed-in user's session cookie.
  */
 export async function middleware(request: NextRequest) {
-  const path = request.nextUrl.pathname;
-  const isPublic = path.startsWith("/app/login") || path.startsWith("/app/auth");
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  // Not configured yet (e.g. a fresh Vercel deploy): the login page explains what's missing.
-  if (!url || !anon) {
-    if (isPublic) return NextResponse.next();
-    const to = request.nextUrl.clone();
-    to.pathname = "/app/login";
-    return NextResponse.redirect(to);
-  }
+  if (!url || !anon) return NextResponse.next();
 
   let response = NextResponse.next({ request });
   const supabase = createServerClient(url, anon, {
@@ -32,18 +25,12 @@ export async function middleware(request: NextRequest) {
       },
     },
   });
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user && !isPublic) {
-    const to = request.nextUrl.clone();
-    to.pathname = "/app/login";
-    return NextResponse.redirect(to);
-  }
+  // Touching the session refreshes an expiring token; signed-out visitors pass straight through.
+  await supabase.auth.getUser();
   return response;
 }
 
 export const config = {
-  matcher: ["/app", "/app/:path*"],
+  // Skip the title-summary API (it never needs the session).
+  matcher: ["/app", "/app/((?!api/).*)"],
 };

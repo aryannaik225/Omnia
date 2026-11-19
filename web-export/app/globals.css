@@ -2,57 +2,635 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Liquid Glass tokens, as in the desktop app (src/styles/liquid-glass.css). */
+/* ───────────────────────── Web app (/app) ─────────────────────────
+ * The desktop app's design system, verbatim from src/styles/liquid-glass.css (2026 Apple TV
+ * "Liquid Glass"). Only the window-level rules are scoped to the .omnia-app shell so the landing
+ * page keeps its own look. Keep this block in sync with the desktop file. */
+/*
+ * Omnia — 2026 Apple TV "Liquid Glass" design tokens (tvOS 26 / macOS 26).
+ * Refractive translucent surfaces, specular top edges, concentric radii, ambient bleed.
+ */
+
 :root {
   color-scheme: dark;
-  --glass-bg: rgba(18, 18, 22, 0.65);
-  --glass-border: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+
+  /* Material */
+  --glass-blur: 24px;
+  --glass-saturate: 180%;
+  --glass-base: rgba(18, 18, 22, 0.65); /* guarantees WCAG 4.5:1 for white text over any artwork */
+  --glass-strong: rgba(18, 18, 22, 0.82);
+  --glass-tint: rgba(255, 255, 255, 0.06);
+  --glass-hover: rgba(255, 255, 255, 0.12);
+  --glass-edge: rgba(255, 255, 255, 0.22);
+  --glass-hairline: rgba(255, 255, 255, 0.06);
+  --specular-top: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+
+  /* Concentric geometry */
+  --radius-panel: 24px;
+  --radius-card: 16px;
+  --radius-pill: 12px;
+
+  /* Labels */
+  --label-primary: rgba(255, 255, 255, 0.96);
+  --label-secondary: rgba(235, 235, 245, 0.72);
+  --label-tertiary: rgba(235, 235, 245, 0.5);
+  --accent: #0a84ff;
+
+  /* Ambient bleed — updated at runtime from the focused artwork's dominant palette. */
+  --ambient-1: 40, 60, 120;
+  --ambient-2: 120, 40, 90;
+  --ambient-3: 20, 90, 110;
+
+  /* Motion */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --sidebar-expanded: 248px;
+  --sidebar-collapsed: 76px;
 }
 
-html,
-body {
-  @apply bg-ink-900 text-label-primary antialiased;
-}
+@layer base {
+  html,
+  body {
+    background: #0b0b0f;
+  }
+  body {
+    margin: 0;
+    color: var(--label-primary);
+    -webkit-font-smoothing: antialiased;
+  }
 
-body {
-  background-image: radial-gradient(90% 60% at 15% 0%, rgba(88, 70, 180, 0.28) 0%, transparent 60%),
-    radial-gradient(80% 60% at 100% 10%, rgba(10, 132, 255, 0.16) 0%, transparent 55%);
-  background-attachment: fixed;
-  min-height: 100vh;
+  /* The web app shell (app/app/(main)): like the desktop window, <main> is the scroll container. */
+  .omnia-app {
+    height: 100dvh;
+    overflow: hidden;
+    font-feature-settings: "ss01", "cv11";
+  }
+  .omnia-app ::selection {
+    background: rgba(10, 132, 255, 0.4);
+  }
+
+  /* Thin, glassy scrollbars inside content grids. */
+  .omnia-app * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  }
+
+  .omnia-app :focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.85);
+    outline-offset: 3px;
+    border-radius: var(--radius-pill);
+  }
 }
 
 @layer components {
-  /* Display type: Plus Jakarta Sans, heavy and tightly tracked (utilities can still override). */
+  /* Base refractive surface. */
+  .glass {
+    position: relative;
+    background: var(--glass-base);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px var(--glass-hairline),
+      0 12px 40px rgba(0, 0, 0, 0.45);
+  }
+
+  /* Diagonal specular rim highlight layered over the material. */
+  .glass::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.14) 0%,
+      rgba(255, 255, 255, 0.02) 32%,
+      transparent 60%,
+      rgba(255, 255, 255, 0.05) 100%
+    );
+    mix-blend-mode: screen;
+  }
+
+  .glass-strong {
+    background: var(--glass-strong);
+  }
+
+  .glass-panel {
+    @apply glass;
+    border-radius: var(--radius-panel);
+  }
+
+  .glass-card {
+    @apply glass;
+    border-radius: var(--radius-card);
+  }
+
+  .glass-pill {
+    @apply glass;
+    border-radius: var(--radius-pill);
+  }
+
+  .glass-button {
+    @apply glass-pill inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold;
+    color: var(--label-primary);
+    transition:
+      transform 220ms var(--ease-spring),
+      background-color 220ms var(--ease-spring),
+      box-shadow 220ms var(--ease-spring);
+  }
+
+  .glass-button:hover {
+    background: rgba(40, 40, 48, 0.72);
+    transform: translateY(-1px) scale(1.02);
+  }
+
+  .glass-button:active {
+    transform: scale(0.97);
+  }
+
+  .glass-button:disabled,
+  .icon-button:disabled,
+  .chip:disabled {
+    opacity: 0.42;
+    cursor: default;
+    pointer-events: none;
+  }
+
+  /* Primary CTA: bright, opaque "Play Now". */
+  .glass-button-primary {
+    @apply glass-button;
+    background: rgba(255, 255, 255, 0.92);
+    color: #0b0b0f;
+  }
+
+  .glass-button-primary:hover {
+    background: #ffffff;
+  }
+
+  /* Card specular sheen that follows the cursor (set --mx / --my in px from JS). */
+  .specular-sheen {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 240ms var(--ease-spring);
+    background: radial-gradient(
+      420px circle at var(--mx, 50%) var(--my, 0%),
+      rgba(255, 255, 255, 0.22),
+      rgba(255, 255, 255, 0.06) 30%,
+      transparent 60%
+    );
+    mix-blend-mode: soft-light;
+  }
+
+  .group:hover .specular-sheen,
+  .group:focus-visible .specular-sheen {
+    opacity: 1;
+  }
+
+  /* Progress bar used on Continue Watching cards and episode rows. */
+  .progress-track {
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.22);
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: rgba(255, 255, 255, 0.95);
+  }
+
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.04) 0%,
+      rgba(255, 255, 255, 0.1) 50%,
+      rgba(255, 255, 255, 0.04) 100%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+}
+
+@layer components {
+  /* ---- Controls ------------------------------------------------------------------------- */
+  .glass-input {
+    @apply glass-pill w-full px-4 py-2.5 text-sm outline-none placeholder:text-[color:var(--label-tertiary)];
+    color: var(--label-primary);
+  }
+  .glass-input:focus {
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+      0 0 0 4px rgba(10, 132, 255, 0.25);
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap px-3.5 py-1.5 text-[13px] font-medium;
+    border-radius: 999px;
+    background: var(--glass-tint);
+    color: var(--label-secondary);
+    box-shadow: inset 0 0 0 1px var(--glass-hairline);
+    transition: background-color 200ms var(--ease-spring), color 200ms var(--ease-spring);
+  }
+  .chip:hover {
+    background: var(--glass-hover);
+    color: var(--label-primary);
+  }
+  .chip[data-active="true"] {
+    background: rgba(255, 255, 255, 0.92);
+    color: #0b0b0f;
+  }
+
+  .segmented {
+    @apply glass-pill inline-flex p-1 gap-1;
+  }
+  .segmented > button {
+    @apply px-3.5 py-1.5 text-[13px] font-semibold;
+    border-radius: 9px;
+    color: var(--label-secondary);
+    transition: background-color 200ms var(--ease-spring), color 200ms var(--ease-spring);
+  }
+  .segmented > button[data-active="true"] {
+    background: rgba(255, 255, 255, 0.16);
+    color: var(--label-primary);
+    box-shadow: var(--specular-top);
+  }
+
+  .switch {
+    @apply relative inline-flex h-[26px] w-[44px] shrink-0 items-center rounded-full;
+    background: rgba(120, 120, 128, 0.36);
+    transition: background-color 220ms var(--ease-spring);
+  }
+  .switch[data-on="true"] {
+    background: #30d158;
+  }
+  .switch::after {
+    content: "";
+    @apply absolute h-[22px] w-[22px] rounded-full bg-white;
+    left: 2px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    transition: transform 260ms var(--ease-spring);
+  }
+  .switch[data-on="true"]::after {
+    transform: translateX(18px);
+  }
+
+  .icon-button {
+    @apply glass-pill inline-flex h-10 w-10 items-center justify-center;
+    transition: transform 200ms var(--ease-spring), background-color 200ms var(--ease-spring);
+  }
+  .icon-button:hover {
+    background: rgba(40, 40, 48, 0.75);
+    transform: scale(1.05);
+  }
+
+  /* ---- Cards ---------------------------------------------------------------------------- */
+  .media-card {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius-card);
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: inset 0 0 0 1px var(--glass-hairline), 0 8px 24px rgba(0, 0, 0, 0.35);
+    transition: box-shadow 300ms var(--ease-spring);
+    content-visibility: auto;
+    contain-intrinsic-size: 200px 300px;
+  }
+  .media-card:hover,
+  .media-card:focus-visible {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 28px 60px rgba(0, 0, 0, 0.6);
+  }
+
+  .row-scroller {
+    @apply flex gap-4 overflow-x-auto scroll-smooth scrollbar-none;
+    scroll-snap-type: x proximity;
+    padding: 18px 8px 26px;
+    margin: -18px -8px -26px;
+  }
+  .row-scroller > * {
+    scroll-snap-align: start;
+  }
+
+  .section-title {
+    @apply text-[19px] font-semibold tracking-tight;
+    color: var(--label-primary);
+  }
+
+  /* ---- Top 10 ---------------------------------------------------------------------------- */
+  /* The numeral sits behind the poster; the poster overlaps its right edge (bottom-left). */
+  .top10-card {
+    --top10-poster: min(150px, var(--poster-max, 150px));
+    --top10-offset: calc(var(--top10-poster) * 0.42);
+    width: calc(var(--top10-poster) + var(--top10-offset));
+  }
+  .top10-card--wide {
+    --top10-offset: calc(var(--top10-poster) * 0.78);
+  }
+  .top10-poster {
+    width: var(--top10-poster);
+    margin-left: var(--top10-offset);
+  }
+  .top10-rank {
+    position: absolute;
+    left: 0;
+    bottom: -0.11em;
+    font-size: calc(var(--top10-poster) * 1.12);
+    font-weight: 900;
+    line-height: 1;
+    letter-spacing: -0.09em;
+    color: rgba(10, 10, 14, 0.9);
+    -webkit-text-stroke: 3px rgba(255, 255, 255, 0.82);
+    paint-order: stroke fill;
+    text-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+    user-select: none;
+    pointer-events: none;
+  }
+
+  /* ---- View More / row extras ---------------------------------------------------------- */
+  .view-more-card {
+    border-radius: var(--radius-card);
+    background: rgba(18, 18, 22, 0.55);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), inset 0 0 0 1px var(--glass-hairline), 0 8px 24px rgba(0, 0, 0, 0.35);
+    color: var(--label-primary);
+  }
+  .view-more-card:hover,
+  .view-more-card:focus-visible {
+    background: rgba(40, 40, 48, 0.6);
+  }
+  .provider-chip {
+    @apply relative h-7 w-7 shrink-0 overflow-hidden rounded-[8px] opacity-55 transition-[opacity,transform,box-shadow] duration-200;
+    box-shadow: inset 0 0 0 1px var(--glass-hairline);
+  }
+  .provider-chip:hover {
+    @apply opacity-90;
+  }
+  .provider-chip[aria-pressed="true"] {
+    @apply scale-110 opacity-100;
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9), 0 4px 14px rgba(0, 0, 0, 0.45);
+  }
+
+  /* ---- Hero ----------------------------------------------------------------------------- */
+  .glass-select {
+    @apply rounded-pill px-3 py-2 pr-8 text-[13px] font-medium text-label-primary outline-none;
+    appearance: none;
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center,
+      rgba(255, 255, 255, 0.1);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  }
+  .glass-select:focus-visible {
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.8);
+  }
+  .glass-select option {
+    background: #1c1c22;
+    color: #fff;
+  }
+  .hero-mask {
+    /* Fades to transparent (never to a colour), so the artwork dissolves into whatever ambient
+       background is behind it. A short top fade sits under the floating header. */
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 28px, #000 50%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 28px, #000 50%, transparent 100%);
+  }
+  .hero-trailer-mask {
+    /* The trailer stays fully opaque; only its last few pixels feather so there is no hard edge. */
+    -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 88%, transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 0, #000 88%, transparent 100%);
+  }
+  .hero-art {
+    /* Backdrops are framed for faces near the top: crop from the bottom, never the heads. */
+    object-fit: cover;
+    object-position: center top;
+  }
+  .hero-scrim {
+    /* Text-legibility shade on the left only; it is masked like the artwork, so there is no
+       solid dark band at the bottom: everything fades to transparent. */
+    background: linear-gradient(90deg, rgba(8, 8, 12, 0.82) 0%, rgba(8, 8, 12, 0.5) 38%, transparent 70%);
+    -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 50%, transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 0, #000 50%, transparent 100%);
+    transition: opacity 0.8s ease;
+  }
+  /* While a trailer plays it stays fully opaque: only a thin bottom band keeps the row edge
+     clean, and the copy steps back. */
+  .hero-trailer-on .hero-scrim {
+    opacity: 0.3;
+  }
+  .hero-trailer-on .hero-copy {
+    opacity: 0.35;
+  }
+  .hero-trailer-on .hero-copy:hover,
+  .hero-trailer-on .hero-copy:focus-within {
+    opacity: 1;
+  }
+
+  /* ---- Release status card (web: Where to watch while a title isn't streaming yet) -------- */
+  .release-card {
+    --tint: 100, 190, 255;
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 20px;
+    overflow: hidden;
+    border-radius: var(--radius-panel);
+    padding: 18px 22px 18px 18px;
+    background:
+      radial-gradient(120% 140% at 0% 0%, rgba(var(--tint), 0.2) 0%, rgba(var(--tint), 0.06) 38%, transparent 70%),
+      linear-gradient(135deg, rgba(var(--tint), 0.08), rgba(18, 18, 22, 0.7) 60%);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px rgba(var(--tint), 0.32),
+      0 18px 50px -18px rgba(var(--tint), 0.55),
+      0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+  .release-card::after {
+    /* Specular sweep along the top edge. */
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--tint), 0.9) 30%, rgba(255, 255, 255, 0.7) 50%, rgba(var(--tint), 0.9) 70%, transparent);
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  .release-card--amber {
+    --tint: 255, 176, 64;
+  }
+  .release-card--indigo {
+    --tint: 138, 128, 255;
+  }
+  .release-card--cyan {
+    --tint: 80, 200, 255;
+  }
+  .release-tile {
+    position: relative;
+    display: flex;
+    width: 76px;
+    flex-shrink: 0;
+    flex-direction: column;
+    align-items: center;
+    overflow: hidden;
+    border-radius: 16px;
+    background: rgba(10, 10, 14, 0.55);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2), inset 0 0 0 1px rgba(var(--tint), 0.28), 0 10px 26px rgba(0, 0, 0, 0.4);
+  }
+  .release-tile-month {
+    width: 100%;
+    padding: 4px 0 3px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #0b0b0f;
+    background: linear-gradient(180deg, rgb(var(--tint)), rgba(var(--tint), 0.78));
+  }
+  .release-tile-day {
+    padding-top: 4px;
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1.05;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+  .release-tile-week {
+    padding-bottom: 7px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--label-tertiary);
+  }
+  .release-icon {
+    display: inline-flex;
+    height: 30px;
+    width: 30px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: rgb(var(--tint));
+    background: rgba(var(--tint), 0.16);
+    box-shadow: inset 0 0 0 1px rgba(var(--tint), 0.3);
+  }
+  .release-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    border-radius: 999px;
+    padding: 5px 11px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #0b0b0f;
+    background: linear-gradient(135deg, rgb(var(--tint)), rgba(var(--tint), 0.75));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 4px 16px -4px rgba(var(--tint), 0.8);
+  }
+  .release-live-dot {
+    height: 7px;
+    width: 7px;
+    border-radius: 999px;
+    background: #0b0b0f;
+    animation: release-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes release-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.7); }
+  }
+
+  .badge {
+    @apply inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide;
+    background: rgba(255, 255, 255, 0.14);
+    color: var(--label-primary);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  }
+
+}
+
+@layer utilities {
+  .text-label-secondary {
+    color: var(--label-secondary);
+  }
+
+  .text-label-tertiary {
+    color: var(--label-tertiary);
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  .mask-fade-x {
+    mask-image: linear-gradient(to right, transparent 0, #000 48px, #000 calc(100% - 48px), transparent 100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Fallback for environments without backdrop-filter: keep contrast with a more opaque base. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass {
+    background: var(--glass-strong);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Phones (the LAN companion in Safari): notch-safe edges, no rubber-band on the shell.
+ * ------------------------------------------------------------------------------------------- */
+@media (max-width: 767px) {
+  :root {
+    /* Row cards: ~3 posters / ~1.3 landscape cards per screen, the next one peeking in. */
+    --poster-max: 30vw;
+    --landscape-max: 74vw;
+  }
+  .omnia-app {
+    overscroll-behavior: none;
+    overflow-x: hidden;
+    max-width: 100%;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  .row-scroller {
+    gap: 12px;
+    /* End rows inside the gutter instead of flush against the screen edge. */
+    scroll-padding-inline: 16px;
+  }
+  .row-scroller::after {
+    content: "";
+    flex: 0 0 8px;
+  }
+  /* Touch screens have no hover: show the hover-only card actions. */
+  @media (hover: none) {
+    .media-card .group-hover\:opacity-100 {
+      opacity: 1;
+    }
+  }
+}
+
+@layer components {
+  /* Landing display type: Plus Jakarta Sans, heavy and tightly tracked. */
   .font-display {
     font-weight: 700;
     letter-spacing: -0.035em;
     word-spacing: 0.08em;
-  }
-
-  .glass {
-    background: var(--glass-bg);
-    backdrop-filter: blur(24px) saturate(180%);
-    -webkit-backdrop-filter: blur(24px) saturate(180%);
-    box-shadow: var(--glass-border), 0 18px 48px rgba(0, 0, 0, 0.45);
-  }
-  .glass-button {
-    @apply glass inline-flex items-center justify-center gap-2 rounded-pill px-5 py-2.5 text-[15px] font-medium transition-colors hover:bg-white/[0.14];
-  }
-  .glass-button-primary {
-    @apply inline-flex items-center justify-center gap-2 rounded-pill bg-label-primary px-6 py-2.5 text-[15px] font-semibold text-black transition-transform hover:scale-[1.02];
-  }
-  .glass-input {
-    @apply w-full rounded-pill bg-white/10 px-4 py-3 text-[15px] outline-none placeholder:text-label-tertiary focus-visible:ring-2 focus-visible:ring-white/70;
-  }
-  .row-scroller {
-    @apply flex gap-4 overflow-x-auto pb-4;
-    scroll-snap-type: x proximity;
-    scrollbar-width: none;
-  }
-  .poster {
-    @apply relative block shrink-0 overflow-hidden rounded-card bg-white/5 transition-transform duration-300 hover:scale-[1.06];
-    scroll-snap-align: start;
-    box-shadow: var(--glass-border), 0 10px 28px rgba(0, 0, 0, 0.45);
   }
 }
 
