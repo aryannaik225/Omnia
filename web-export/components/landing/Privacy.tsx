@@ -8,9 +8,9 @@ type ModId = "ui" | "player" | "core" | "db" | "onnx" | "lan";
 type Mod = { id: ModId; x: number; y: number; w: number; h: number; title: string; sub: string; detail: string; rows?: string[] };
 
 const MODS: Mod[] = [
-  { id: "ui", x: 60, y: 92, w: 250, h: 92, title: "Omnia UI", sub: "React 19 · main window", detail: "The catalog, title pages and settings. It talks to the Rust core over Tauri IPC, never to a server of ours: there isn't one." },
+  { id: "ui", x: 60, y: 92, w: 250, h: 92, title: "Omnia UI", sub: "React 19 · main window", detail: "The catalog, title pages and settings. It talks only to the Rust core over Tauri IPC: even TMDB is reached through the core, so no API key ever sits in the UI." },
   { id: "player", x: 450, y: 92, w: 250, h: 92, title: "Player window", sub: "WebView2 · per-profile data dir", detail: "Each Omnia profile gets its own isolated WebView2 folder. OTT cookies live there and are never read into the backend. An injected observer reports only playback time to the core." },
-  { id: "core", x: 250, y: 236, w: 260, h: 104, title: "Rust core", sub: "Tauri 2 · tokio · reqwest", detail: "Resolves deep links, records telemetry, runs the recommender and owns the database. Every outbound request it can make is on the allow-list to the right." },
+  { id: "core", x: 250, y: 236, w: 260, h: 104, title: "Rust core", sub: "Tauri 2 · tokio · reqwest", detail: "Resolves deep links, records telemetry, runs the recommender and owns the database. Its everyday traffic goes only to the hosts on the right; the few one-off and opt-in ones are listed below the drawing." },
   { id: "db", x: 60, y: 392, w: 240, h: 128, title: "SQLite", sub: "omnia.db · local app data", detail: "History, playback events, taste vectors, profiles and settings, all in one file on your disk. Delete the file and Omnia forgets you.", rows: ["watch_history", "playback_events", "media_embeddings", "title_vectors", "favorites · watchlist"] },
   { id: "onnx", x: 318, y: 392, w: 170, h: 104, title: "ONNX Runtime", sub: "MiniLM-L6 · int8", detail: "The sentence-embedding model runs on your CPU. Plots and keywords become 384-d vectors locally; nothing is sent out to be embedded." },
   { id: "lan", x: 506, y: 392, w: 212, h: 112, title: "LAN server", sub: "axum · port 8765", detail: "Off until you flip it on. Then it serves Omnia to paired phones and TVs on your Wi-Fi only: IP-literal hosts, PIN pairing, hashed device tokens." },
@@ -46,7 +46,7 @@ const BLOCKED = [
 ];
 
 const PROMISES = [
-  { t: "Local-first, always", d: "History, embeddings, profiles and settings live in SQLite on your PC." },
+  { t: "Local-first, always", d: "History, embeddings, profiles and settings live in SQLite on your PC. Sync is opt-in and never carries telemetry or taste data." },
   { t: "Zero telemetry", d: "No analytics SDKs. No crash reporters phoning home. Nothing to opt out of." },
   { t: "Sessions stay sealed", d: "OTT sign-ins live in an isolated WebView2 profile per person. Cookies are never read into Omnia's backend." },
   { t: "Family-proof", d: "Each Omnia profile maps to its own Netflix or Prime profile, so one person's binge never shapes another's picks." },
@@ -282,7 +282,7 @@ export function Privacy() {
           <Heading>
             What happens on your PC <span className="italic text-white/55">stays on your PC.</span>
           </Heading>
-          <Lede>Your viewing habits say a lot about you. Omnia is built so that none of it ever needs to leave the room: there&apos;s no Omnia server to send it to. Here is the whole machine, and every door out of it.</Lede>
+          <Lede>Your viewing habits say a lot about you. Omnia is built so that none of it needs to leave the room: no account, no analytics, and cloud sync only if you ask for it. Here is the whole machine, and every door out of it.</Lede>
         </div>
 
         <motion.div
@@ -311,7 +311,7 @@ export function Privacy() {
                   </>
                 ) : (
                   <>
-                    <span className="font-semibold text-white">Five hosts, all named.</span> Three are two-way (⇄): a search goes to TMDB, a title to JustWatch, and your own OTT streams into its sealed window. Two are one-way (←): a signed update from GitHub and your region, once, from ipwho.is; nothing about you goes with them. Analytics, ads and crash reporters don&apos;t have a door, so nothing ever travels that way. Cloud sync is opt-in: it stays off until you sign in, and then carries only your watchlist, what you&apos;ve watched and a profile picture (<a href="/privacy" className="underline decoration-white/30 underline-offset-2 hover:text-white">Privacy Policy</a>).
+                    <span className="font-semibold text-white">Five hosts, all named.</span> Three are two-way (⇄): a search goes to TMDB, a title to JustWatch, and your own OTT streams into its sealed window. Two are one-way (←): a signed update from GitHub and your region, once, from ipwho.is; nothing about you goes with them. Analytics, ads and crash reporters don&apos;t have a door, so nothing ever travels that way. Beyond these: a one-time, checksum-verified download of the recommendation model (Hugging Face, GitHub), and trailers from youtube-nocookie.com when one plays (autoplay can be turned off). Cloud sync is opt-in: it stays off until you sign in, and then carries only your watchlist, what you&apos;ve watched, your Home layout and a profile name and picture (<a href="/privacy" className="underline decoration-white/30 underline-offset-2 hover:text-white">Privacy Policy</a>).
                   </>
                 )}
               </motion.p>

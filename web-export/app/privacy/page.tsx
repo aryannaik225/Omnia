@@ -25,7 +25,7 @@ export default function PrivacyPolicy() {
           </p>
           <p className="mt-3 text-white/60">
             In short: the desktop app keeps everything on your PC. Your streaming-service logins, cookies and on-device taste model never leave it. Cloud sync is optional, off until you
-            sign in, and stores only your account details, an optional profile picture and a list of what you&apos;ve saved and watched. We don&apos;t use analytics, ads or trackers, and we
+            sign in, and stores only your account details, a display name and optional profile picture, your Home layout and a list of what you&apos;ve saved and watched. We don&apos;t use analytics, ads or trackers, and we
             never sell data.
           </p>
         </>
@@ -61,6 +61,10 @@ export default function PrivacyPolicy() {
             country for regional availability (these services see your IP address, as any website does).
           </li>
           <li>
+            <strong className="text-white/90">Hugging Face</strong> and <strong className="text-white/90">GitHub</strong>, once, to download the recommendation model and its runtime (pinned
+            versions, checksum-verified), and <strong className="text-white/90">YouTube</strong> (youtube-nocookie.com) when a trailer plays. Trailer autoplay can be turned off in Settings.
+          </li>
+          <li>
             <strong className="text-white/90">Supabase</strong>, only if you sign in to cloud sync (section 3).
           </li>
         </ul>
@@ -73,7 +77,8 @@ export default function PrivacyPolicy() {
       <Section id="web" n={2} title="The web app">
         <p>
           You can use the web app as a guest: your library is saved in your browser&apos;s local storage and never sent to us. To show the catalog, your browser asks our server, which
-          forwards the request to TMDB, so TMDB never sees your IP address and our API key stays private. We detect your country from your connection (our host&apos;s IP-country header, or an
+          forwards the request to TMDB, so TMDB&apos;s API never sees your IP address and our API key stays private. Posters and backdrops load straight from TMDB&apos;s image
+          servers (image.tmdb.org), and trailers from youtube-nocookie.com when one plays, so those services see your IP address as any website would. We detect your country from your connection (our host&apos;s IP-country header, or an
           IP lookup) to show regional availability; we don&apos;t store it on our servers.
         </p>
         <p>
@@ -91,6 +96,7 @@ export default function PrivacyPolicy() {
           rows={[
             ["Account", "Your email address and an account ID. With Google sign-in: the basic profile Google shares (your name, email address, profile-picture link and Google account ID). With email sign-in: a securely hashed password."],
             ["Profile", "A display name and, if you add one, a profile picture, shrunk on your device to a 256×256 image (about 30–50 KB) before upload. If you paste an image link instead, our server downloads that image once (without sending anything about you) so your browser can shrink it the same way. Pictures are stored at an unguessable link that anyone with the link can open, so only upload a picture you're happy to share."],
+            ["Home Page Layout", "The order you chose for the Home rows (a list of row names), so your layout is the same on every device."],
             ["Watchlist", "The TMDB ID and type of each title you save, and when you saved it."],
             ["Watched movies & episodes", "TMDB IDs, season and episode numbers, when you watched them and the runtime (used for your watch-time totals), plus timestamps that keep your devices in sync. For an episode your streaming service didn't number, its title is kept instead so it can be shown."],
           ]}

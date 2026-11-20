@@ -41,8 +41,27 @@ jobs:
             echo "::error::Repository secret TAURI_PRIVATE_KEY is missing: updater artifacts can't be signed."
             exit 1
           fi
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::warning::SUPABASE_URL / SUPABASE_ANON_KEY are not set: this release will ship with cloud sync disabled."
+          fi
         env:
           SIGNING_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+
+      # The installers and latest.json take their version from tauri.conf.json, not the tag. A
+      # mismatch would publish e.g. "v1.2.0" assets that still say 1.1.0, and installed copies
+      # would never see the update.
+      - name: Check the tag matches the app version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          pkg=$(node -p "require('./package.json').version")
+          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          echo "tag=$tag tauri.conf.json=$conf package.json=$pkg Cargo.toml=$cargo"
+          if [ "$tag" != "$conf" ] || [ "$tag" != "$pkg" ] || [ "$tag" != "$cargo" ]; then
+            echo "::error::Tag v$tag doesn't match the app version (tauri.conf.json $conf, package.json $pkg, Cargo.toml $cargo). Bump all three before tagging."
+            exit 1
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4

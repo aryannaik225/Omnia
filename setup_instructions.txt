@@ -8,6 +8,7 @@ This guide walks you through three things:
   PART 1.  Installing Omnia on your Windows PC
   PART 2.  Finding the PIN and QR code in Omnia's settings
   PART 3.  Opening Omnia on your phone or TV using a web browser
+  PART 4.  (Optional) Syncing your library with Omnia on the web
 
 No technical knowledge is needed. It takes about 5 minutes.
 
@@ -17,7 +18,8 @@ No technical knowledge is needed. It takes about 5 minutes.
 -------------------------------------------------------------------------------
 
   * A Windows 10 or Windows 11 PC, connected to the internet.
-  * The Omnia installer file:  Omnia_1.0.0_x64-setup.exe
+  * The Omnia installer file:  Omnia_<version>_x64-setup.exe
+    (for example Omnia_1.2.0_x64-setup.exe, from the GitHub Releases page)
   * For phones / TVs: the phone or TV must be on the SAME Wi-Fi as the PC.
 
 
@@ -25,7 +27,7 @@ No technical knowledge is needed. It takes about 5 minutes.
  PART 1 - INSTALL OMNIA ON YOUR PC
 ===============================================================================
 
- 1. Find the file "Omnia_1.0.0_x64-setup.exe" (usually in your Downloads
+ 1. Find the file "Omnia_<version>_x64-setup.exe" (usually in your Downloads
     folder) and double-click it.
 
  2. Windows might show a blue box that says "Windows protected your PC".
@@ -61,8 +63,10 @@ No technical knowledge is needed. It takes about 5 minutes.
    * Closing the Omnia window keeps it running in the background, as a small
      icon near the clock at the bottom right of your screen (the "tray"). To
      fully quit, right-click that icon and choose Quit.
-   * Everything Omnia knows about you stays on THIS PC. Nothing is sent to an
-     Omnia server; there isn't one.
+   * Everything Omnia knows about you stays on THIS PC. Nothing is uploaded
+     unless you choose to sign in to sync (see PART 4).
+   * Omnia updates itself: when a new version is ready it asks you to
+     "Restart to Install".
 
 
 ===============================================================================
@@ -158,6 +162,27 @@ No technical knowledge is needed. It takes about 5 minutes.
 
 
 ===============================================================================
+ PART 4 - (OPTIONAL) SYNC YOUR LIBRARY WITH OMNIA ON THE WEB
+===============================================================================
+
+ Omnia also runs in any web browser (the "web app" at /app on Omnia's
+ website), as a simple tracker: mark movies and episodes as watched, keep a
+ watchlist, see what's coming up. It works as a guest with no account.
+
+ To keep the PC and the web app in step:
+
+ 1. In Omnia on your PC, open Settings and find "Sign in to Sync".
+ 2. Sign in with Google, or with an email and password.
+ 3. Sign in with the SAME account in the web app.
+
+ Your watchlist, watched movies and episodes, Home page layout, profile name
+ and picture then show up on both. Only the Omnia profile you signed in with
+ syncs. Your streaming-service logins, detailed viewing data and
+ recommendation data never leave your PC. Sign out at any time to stop
+ syncing; your local data stays.
+
+
+===============================================================================
  TROUBLESHOOTING
 ===============================================================================
 
@@ -199,7 +224,8 @@ No technical knowledge is needed. It takes about 5 minutes.
 ===============================================================================
 
   * Your watch history, profiles and recommendations are stored only on your
-    PC. Omnia has no cloud and no account.
+    PC. No account is needed. Cloud sync is optional and off until you sign
+    in (PART 4), and even then your streaming logins never leave the PC.
   * Phones and TVs read everything directly from your PC over your own
     Wi-Fi. Only devices you paired with the PIN can get in, and you can
     revoke any of them at any time.

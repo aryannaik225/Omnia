@@ -9,6 +9,7 @@ two-way with Omnia Web (`/app`), so what you track on your phone shows up on the
 | Watchlist entries | OTT logins, cookies, WebView2 sessions |
 | Watched movies / episodes (ids, watched-at, runtime), including what the OTT player and history importer recorded | Playback telemetry & events, progress ticks |
 | Profile name and picture (256×256 WebP in Storage; only its URL in `profiles.avatar_url`) | Taste vectors / embeddings, the TMDB metadata cache, deep links, other profiles |
+| Home Page Layout (row order, `profiles.home_row_order`) | Other settings (region, subscriptions, LAN, `cloud_*`, `tmdb_api_key`) |
 
 ## How it syncs
 

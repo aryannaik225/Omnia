@@ -1,7 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion, useInView } from "framer-motion";
-import { Baby, Check, Globe2, Link2, Search, Sparkles, Zap } from "lucide-react";
+import { Baby, CalendarClock, Check, Cloud, Globe2, Library, Link2, ListOrdered, Search, Sparkles, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { Catalog, ShowPoster } from "@/lib/landing";
 import { Heading, Lede, PosterArt, ProviderChip, Reel, TiltCard, type ProviderKey } from "./ui";
@@ -231,7 +231,11 @@ const SPEC = [
   { icon: Globe2, t: "Region + VPN aware", d: "Detects your country on first launch, flips UK → US in one tap." },
   { icon: Check, t: "My Subscriptions only", d: "Hide everything you'd have to rent, or show it all with clear badges." },
   { icon: Sparkles, t: "Brand & studio hubs", d: "Apple Originals, A24, Ghibli, Pixar, Netflix and Prime exclusives." },
-  { icon: Zap, t: "Smart filters", d: "4K HDR & Atmos, under 90 minutes, release era, audio language, leaving soon." },
+  { icon: Zap, t: "Smart filters", d: "Under 90 minutes or epic 2.5h+, release era, original language, kids-safe. Combine them in any hub." },
+  { icon: Library, t: "My Library & watch stats", d: "Total days watched, movies and episodes, plus Watchlist, Upcoming, Ongoing and Completed series in one place." },
+  { icon: CalendarClock, t: "Release-aware title pages", d: "Not streaming yet? See the digital date with a countdown, In Theatres Now, or Releasing Today." },
+  { icon: ListOrdered, t: "Your Home, your order", d: "Reorder the Home rows in Settings. The layout is saved per profile and follows you when you sync." },
+  { icon: Cloud, t: "Optional sync", d: "Sign in with email or Google to sync your watchlist and watched list between Desktop and the web. Off by default." },
 ];
 
 export function Features({ catalog }: { catalog: Catalog }) {

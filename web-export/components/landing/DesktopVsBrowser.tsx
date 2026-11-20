@@ -9,8 +9,11 @@ import { Heading, Lede, Reel, WindowsIcon } from "./ui";
 const ROWS: Array<{ f: string; desktop: string | true; web: string | false }> = [
   { f: "Every service in one catalog", desktop: true, web: "Yes" },
   { f: "Native low-RAM player window", desktop: "Rust + Tauri, WebView2", web: false },
-  { f: "Second-accurate history from every OTT", desktop: "Live telemetry + auto-import", web: "CSV / JSON import" },
-  { f: "Where your data lives", desktop: "Your PC, SQLite", web: "Your Supabase project" },
+  { f: "Watch history", desktop: "Live telemetry + OTT auto-import", web: "Mark as watched + JSON import" },
+  { f: "My Library & watch stats", desktop: true, web: "Yes" },
+  { f: "Custom Home Page Layout", desktop: true, web: "Yes" },
+  { f: "Where your data lives", desktop: "Your PC, SQLite", web: "This browser, or your account" },
+  { f: "Account", desktop: "Optional: sign in to sync", web: "Optional: guest mode works" },
   { f: "Local AI recommendations", desktop: "ONNX vectors on-device", web: false },
   { f: "Phone & TV handoff", desktop: "LAN pairing", web: false },
   { f: "Updates", desktop: "Signed, silent, one restart", web: "Always the latest" },
@@ -28,7 +31,7 @@ export function DesktopVsBrowser({ version }: { version: string }) {
             The director&apos;s cut, <span className="italic text-white/55">or the trailer.</span>
           </Heading>
           <Lede>
-            The browser edition is a quick taste you can open right now. The desktop app is the full feature: native player, real history, recommendations that run on your own hardware.
+            The browser edition is a manual tracker you can open right now, no account needed. The desktop app is the full feature: native player, real history, recommendations that run on your own hardware. Sign in on both and your library follows you.
           </Lede>
         </div>
 
@@ -50,7 +53,7 @@ export function DesktopVsBrowser({ version }: { version: string }) {
                     <span className="flex h-11 w-11 items-center justify-center rounded-[14px] bg-white/10">{desk ? <Monitor size={20} /> : <Globe size={20} />}</span>
                     <div>
                       <h3 className="text-[20px] font-semibold tracking-tight text-white sm:text-[22px]">{desk ? "Omnia for Windows" : "Omnia on the web"}</h3>
-                      <p className="text-[13px] text-white/45">{desk ? `v${version} · Windows 10 & 11 · x64` : "Any modern browser · sign in to sync"}</p>
+                      <p className="text-[13px] text-white/45">{desk ? `v${version} · Windows 10 & 11 · x64` : "Any modern browser · guest mode or sign in"}</p>
                     </div>
                   </div>
                   {desk && <span className="shrink-0 rounded-full bg-gold-400/15 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-gold-300">Recommended</span>}

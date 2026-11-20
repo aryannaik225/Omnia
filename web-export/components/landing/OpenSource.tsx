@@ -76,7 +76,7 @@ function Terminal() {
 export function OpenSource({ repoUrl }: { repoUrl: string }) {
   const cards = [
     { icon: Bug, t: "Report a bug", d: "Something off with a provider or a deep link? Open an issue with the title and region.", href: `${repoUrl}/issues/new` },
-    { icon: GitPullRequest, t: "Send a pull request", d: "New hub, a smarter resolver, a better embedding. Small, focused PRs land fastest.", href: `${repoUrl}/pulls` },
+    { icon: GitPullRequest, t: "Send a pull request", d: "New hub, a smarter resolver, a better embedding. Small, focused PRs land fastest: start with the contributing guide.", href: `${repoUrl}/blob/main/CONTRIBUTING.md` },
     { icon: MapIcon, t: "Read the blueprint", d: "CLAUDE.md maps every module: resolver, player, importer, recommender, LAN server.", href: `${repoUrl}/blob/main/CLAUDE.md` },
     { icon: Star, t: "Star the repo", d: "The cheapest way to tell us to keep the projector running.", href: repoUrl },
   ];
