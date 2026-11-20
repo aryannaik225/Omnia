@@ -18,9 +18,13 @@ jobs:
   build-windows:
     runs-on: windows-latest
     env:
-      # build.rs bakes this into the Rust binary (env!("OMNIA_TMDB_API_KEY")), and Vite
-      # exposes it to the catalog UI (envPrefix "TMDB_"). No .env file is needed on the runner.
+      # build.rs bakes these into the Rust binary only (never into the JS bundle; the UI reaches
+      # TMDB through the `tmdb_get` command). No .env file is needed on the runner.
       TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      # Optional cloud sync: public project URL + anon / publishable key (empty = sync disabled).
+      # build.rs refuses a service-role / secret key.
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
 
     steps:
       - name: Checkout
@@ -65,6 +69,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           # Updater signing (Tauri 2 variable names). Signs the installers (.sig) and makes
           # tauri-action upload latest.json, which installed copies poll for updates.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}

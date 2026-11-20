@@ -12,6 +12,7 @@ import { useLibrary } from "@/components/tracker/useLibrary";
 import { flag } from "../../lib/format";
 import { requestScrollTop } from "../../lib/scrollTop";
 import { useAppStore, type View } from "../../store/useAppStore";
+import { UserAvatar, accountName } from "../common/UserAvatar";
 import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, SearchIcon, SidebarIcon, TvIcon } from "../common/Icons";
 
 const wordmark = "/omnia-wordmark.png";
@@ -145,11 +146,9 @@ export function LiquidSidebar() {
         className="flex items-center gap-3 rounded-pill px-1.5 py-1.5 text-left hover:bg-white/[0.07]"
         title={tracker.user ? "Account" : tracker.canSignIn ? "Sign in to save & sync" : "Guest"}
       >
-        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-[#5e5ce6] to-[#0a84ff] text-[16px] font-bold shadow-specular">
-          {(tracker.user?.email?.[0] ?? "G").toUpperCase()}
-        </span>
+        <UserAvatar size={40} />
         <m.span animate={{ opacity: collapsed ? 0 : 1 }} className="min-w-0 whitespace-nowrap">
-          <span className="block truncate text-[14px] font-semibold">{tracker.user ? tracker.user.email?.split("@")[0] ?? "Signed in" : "Guest"}</span>
+          <span className="block truncate text-[14px] font-semibold">{tracker.user ? accountName(tracker) : "Guest"}</span>
           <span className="block text-[12px] text-label-tertiary">
             {flag(region)} {region} · {tracker.user ? "Synced" : tracker.canSignIn ? "Sign in to sync" : "Saved in this browser"}
           </span>

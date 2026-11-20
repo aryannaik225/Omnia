@@ -7,7 +7,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { flag, regionName } from "../../lib/format";
 import { groupByFamily, providerFamily } from "../../lib/providers";
 import { useAsync } from "../../lib/hooks";
-import { envTmdbKey, img, regionProviders } from "../../services/tmdbClient";
+import { img, regionProviders } from "../../services/tmdbClient";
 import { BACKGROUND_SYNC_SETTING, recommendations, settings as settingsApi, type Affinity, type SubscribedProvider } from "../../services/tauriBridge";
 import { useAppStore } from "../../store/useAppStore";
 import { usePlayerStore } from "../../store/usePlayerStore";
@@ -18,6 +18,8 @@ import { PageHeader } from "../views/BrowseViews";
 import { useDevMode } from "../../services/devMode";
 import { isRemote, platformMode, setTvNavigation, tvNavigation } from "../../services/platform";
 import { LinkedDevicesSection } from "./LinkedDevices";
+import { CloudSyncSection } from "./CloudSyncSection";
+import { cloud } from "../../services/tauriBridge";
 
 function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
@@ -75,6 +77,8 @@ function ProfileSection() {
               onClick={async () => {
                 await saveProfile({ profileId: profile.profileId, name: name.trim(), isKids: kids, avatar });
                 toast({ kind: "success", title: "Profile updated" });
+                // Signed in to sync? Push the new name / picture now (no-op and no request otherwise).
+                if (platformMode === "desktop") void cloud.syncNow().catch(() => undefined);
               }}
             >
               Save
@@ -324,6 +328,7 @@ function PrivacySection() {
   const kidsSafeMode = useAppStore((s) => s.kidsSafeMode);
   const setKidsSafeMode = useAppStore((s) => s.setKidsSafeMode);
   const tmdbReady = useAppStore((s) => s.tmdbReady);
+  const tmdbSource = useAppStore((s) => s.tmdbSource);
   const setTmdbKey = useAppStore((s) => s.setTmdbKey);
   const [key, setKey] = useState("");
 
@@ -344,9 +349,10 @@ function PrivacySection() {
       <div className="mt-4">
         <p className="text-[15px] font-medium">TMDB API key</p>
         <p className="text-[13px] text-label-tertiary">
-          {envTmdbKey ? "Loaded from TMDB_API_KEY in .env" : tmdbReady ? "Set in Omnia" : "Not configured — catalog browsing is unavailable"}
+          {tmdbSource === "bundled" ? "Built into this copy of Omnia (TMDB_API_KEY)" : tmdbReady ? "Set in Omnia" : "Not configured — catalog browsing is unavailable"}
+          {tmdbReady && " · stored on this PC only; catalog requests go through the app, never with the key in the page"}
         </p>
-        {!envTmdbKey && (
+        {tmdbSource !== "bundled" && !isRemote && (
           <div className="mt-2 flex max-w-xl flex-wrap gap-3">
             <input className="glass-input" type="password" placeholder="v3 API key or v4 read token" value={key} onChange={(e) => setKey(e.target.value)} />
             <button className="glass-button-primary" disabled={!key.trim()} onClick={() => void setTmdbKey(key).then(() => setKey(""))}>
@@ -435,6 +441,7 @@ export function SettingsView() {
       <RegionSection />
       <SubscriptionsSection />
       <AccountsSection />
+      {platformMode === "desktop" && <CloudSyncSection Section={Section} />}
       {platformMode === "desktop" && <LinkedDevicesSection Section={Section} Toggle={Toggle} />}
       <RecommendationsSection />
       <PrivacySection />

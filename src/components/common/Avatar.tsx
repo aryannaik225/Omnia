@@ -88,7 +88,14 @@ async function cropAvatar(url: string): Promise<string> {
   const ctx = canvas.getContext("2d")!;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, 0, 0, 256, 256);
-  let data = canvas.toDataURL("image/webp", 0.86);
+  // 256×256 WebP of ~30–50 KB: small enough to store locally and, when cloud sync is on, upload.
+  const TARGET_CHARS = Math.ceil((50 * 1024 * 4) / 3) + 32;
+  let data = "";
+  for (const q of [0.86, 0.76, 0.66, 0.5]) {
+    data = canvas.toDataURL("image/webp", q);
+    if (!data.startsWith("data:image/webp")) break;
+    if (data.length <= TARGET_CHARS) return data;
+  }
   if (!data.startsWith("data:image/webp")) data = canvas.toDataURL("image/jpeg", 0.86);
   if (data.length > MAX_AVATAR_CHARS) data = canvas.toDataURL("image/jpeg", 0.7);
   return data;

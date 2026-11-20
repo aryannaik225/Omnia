@@ -22,6 +22,7 @@ pub mod player {
 #[cfg(desktop)]
 pub mod sync {
     pub mod airing;
+    pub mod cloud;
     pub mod background;
     pub mod history_importer;
 }

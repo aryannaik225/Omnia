@@ -25,7 +25,7 @@ const NAV: { view: View; label: string; icon: ComponentType<{ size?: number }> }
   { view: "continue", label: "Watching Now", icon: PlayCircleIcon },
   { view: "myotts", label: "My OTTs", icon: TvIcon },
   { view: "hubs", label: "Franchises & Hubs", icon: GridIcon },
-  { view: "watchlist", label: "Watchlist", icon: BookmarkIcon },
+  { view: "library", label: "My Library", icon: BookmarkIcon },
   { view: "collections", label: "Collections", icon: StackIcon },
   { view: "settings", label: "Settings", icon: GearIcon },
 ];

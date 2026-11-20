@@ -253,7 +253,7 @@ export const LandscapeCard = memo(function LandscapeCard({ title, imagePath, sub
           {subtitle && <span className="mt-0.5 block truncate text-[12px] text-white/75">{subtitle}</span>}
           {progress != null && (
             <span className="progress-track mt-2 block">
-              <span className="progress-fill block" style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }} />
+              <span className={`progress-fill block ${progress >= 1 ? "!bg-[#30d158]" : "!bg-[#0a84ff]"}`} style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }} />
             </span>
           )}
         </span>

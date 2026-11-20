@@ -22,6 +22,7 @@ use ml::embeddings::EmbeddingService;
 use ml::recommender::{self, Recommender};
 use player::window_manager::{self, PlayerManager};
 use resolver::justwatch::{JustWatchResolver, ResolveRequest, ResolveResponse, ResolvedLink};
+use sync::cloud::{self, CloudSync};
 use sync::history_importer::{self, HistoryImporter};
 
 // ---------------------------------------------------------------------------------------------
@@ -86,6 +87,8 @@ pub struct AppState {
     pub player: PlayerManager,
     pub importer: HistoryImporter,
     pub recommender: Recommender,
+    /// Optional cloud sync session (signed out by default).
+    pub cloud: CloudSync,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -100,7 +103,7 @@ async fn list_profiles(state: State<'_, AppState>) -> AppResult<Vec<AppProfile>>
 /// Largest image accepted from a pasted avatar URL.
 const MAX_AVATAR_DOWNLOAD: usize = 10 * 1024 * 1024;
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -253,8 +256,17 @@ async fn delete_profile(app: tauri::AppHandle, state: State<'_, AppState>, profi
 // Settings commands
 // ---------------------------------------------------------------------------------------------
 
+/// Settings the UI never reads back: the TMDB credential (used only by Rust, see `tmdb_get`) and
+/// the cloud session (`cloud_*`: refresh token, account id, sync cursors).
+pub(crate) fn secret_setting(key: &str) -> bool {
+    key == queries::keys::TMDB_API_KEY || key.starts_with(cloud::keys::PREFIX)
+}
+
 #[tauri::command]
 async fn get_setting(state: State<'_, AppState>, key: String) -> AppResult<Option<String>> {
+    if secret_setting(&key) {
+        return Ok(None);
+    }
     state.db.run(move |c| queries::get_setting(c, &key)).await
 }
 
@@ -262,6 +274,9 @@ async fn get_setting(state: State<'_, AppState>, key: String) -> AppResult<Optio
 async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> AppResult<()> {
     if key.trim().is_empty() {
         return Err(invalid("setting key cannot be empty"));
+    }
+    if key.starts_with(cloud::keys::PREFIX) {
+        return Err(invalid("cloud sync settings are managed by Omnia"));
     }
     if key == queries::keys::REGION_CODE {
         let region = check_region(&value)?;
@@ -275,12 +290,89 @@ async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> 
 
 #[tauri::command]
 async fn get_all_settings(state: State<'_, AppState>) -> AppResult<HashMap<String, String>> {
-    state.db.run(|c| queries::get_all_settings(c)).await
+    let all = state.db.run(|c| queries::get_all_settings(c)).await?;
+    Ok(all.into_iter().filter(|(k, _)| !secret_setting(k)).collect())
 }
 
 #[tauri::command]
 async fn delete_setting(state: State<'_, AppState>, key: String) -> AppResult<bool> {
+    if key.starts_with(cloud::keys::PREFIX) {
+        return Err(invalid("cloud sync settings are managed by Omnia"));
+    }
     state.db.run(move |c| queries::delete_setting(c, &key)).await
+}
+
+// ---------------------------------------------------------------------------------------------
+// TMDB proxy: the catalog UI asks Rust, so the API key never enters a webview, the JS bundle
+// (which the LAN server also serves to phones) or a request a browser could inspect.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TmdbStatus {
+    configured: bool,
+    /// "settings" (pasted in Settings) or "bundled" (compiled into this build).
+    source: Option<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct TmdbResponse {
+    status: u16,
+    body: serde_json::Value,
+}
+
+const TMDB_ROOTS: &[&str] = &[
+    "trending", "discover", "movie", "tv", "search", "person", "collection", "watch", "network", "company", "genre", "configuration", "find", "keyword",
+];
+
+/// Read-only GET of a public TMDB catalog endpoint (`/movie/603`, `/discover/tv`, ...).
+#[tauri::command]
+pub(crate) async fn tmdb_get(state: State<'_, AppState>, path: String, params: Option<HashMap<String, String>>) -> AppResult<TmdbResponse> {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let safe = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if segments.is_empty() || segments.len() > 6 || !segments.iter().all(|s| safe(s)) || !TMDB_ROOTS.contains(&segments[0]) {
+        return Err(invalid("TMDB path not allowed"));
+    }
+    let key = state
+        .db
+        .run(|c| queries::tmdb_api_key(c))
+        .await?
+        .ok_or_else(|| invalid("TMDB API key missing. Add TMDB_API_KEY to .env or in Settings."))?;
+    let bearer = key.starts_with("eyJ");
+    let query: Vec<(String, String)> = params
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, v)| k != "api_key" && k.len() <= 64 && v.len() <= 512)
+        .collect();
+    let url = format!("https://api.themoviedb.org/3/{}", segments.join("/"));
+    for attempt in 0..3u64 {
+        let mut req = state.http.get(&url).query(&query).header("Accept", "application/json");
+        req = if bearer { req.bearer_auth(&key) } else { req.query(&[("api_key", &key)]) };
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        if status == 429 {
+            tokio::time::sleep(Duration::from_millis(700 * (attempt + 1))).await;
+            continue;
+        }
+        let body = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+        return Ok(TmdbResponse { status, body });
+    }
+    Ok(TmdbResponse { status: 429, body: serde_json::Value::Null })
+}
+
+#[tauri::command]
+pub(crate) async fn tmdb_status(state: State<'_, AppState>) -> AppResult<TmdbStatus> {
+    let stored = state.db.run(|c| queries::get_setting(c, queries::keys::TMDB_API_KEY)).await?.unwrap_or_default();
+    let stored = stored.trim();
+    let bundled = queries::BUNDLED_TMDB_API_KEY.trim();
+    let source = if !stored.is_empty() && stored != bundled {
+        Some("settings")
+    } else if !bundled.is_empty() || !stored.is_empty() {
+        Some("bundled")
+    } else {
+        None
+    };
+    Ok(TmdbStatus { configured: source.is_some(), source })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1163,6 +1255,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 fn wake_main_window(app: &tauri::AppHandle) {
     window_manager::focus_main_window(app);
     sync::background::on_wake(app);
+    cloud::on_wake(app);
 }
 
 fn quit_app(app: tauri::AppHandle) {
@@ -1220,7 +1313,10 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     // Coming back to Omnia (alt-tab, click): catch up (debounced, throttled).
-                    tauri::WindowEvent::Focused(true) => sync::background::on_wake(window.app_handle()),
+                    tauri::WindowEvent::Focused(true) => {
+                        sync::background::on_wake(window.app_handle());
+                        cloud::on_wake(window.app_handle());
+                    }
                     _ => {}
                 }
             }
@@ -1305,7 +1401,11 @@ pub fn run() {
                 player: PlayerManager::default(),
                 importer: HistoryImporter::default(),
                 recommender: Recommender::new(EmbeddingService::new(data_dir.join("models"))),
+                cloud: CloudSync::default(),
             });
+
+            // Optional cloud sync: does nothing (no requests) unless the user signed in.
+            cloud::spawn_loop(app.handle().clone());
 
             // Phones / TVs on the same Wi-Fi (Settings → Linked Devices), when enabled.
             app.manage(mobile_server::LanServer::default());
@@ -1427,6 +1527,16 @@ pub fn run() {
             // Self-update
             check_for_update,
             install_update,
+            // TMDB proxy
+            tmdb_get,
+            tmdb_status,
+            // Optional cloud sync
+            cloud::cloud_status,
+            cloud::cloud_sign_in,
+            cloud::cloud_sign_up,
+            cloud::cloud_sign_in_google,
+            cloud::cloud_sign_out,
+            cloud::cloud_sync_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Omnia");

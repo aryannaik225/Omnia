@@ -10,6 +10,7 @@ import { requestScrollTop } from "../../lib/scrollTop";
 import { useAppStore, type View } from "../../store/useAppStore";
 import Link from "next/link";
 import { useTracker } from "@/components/tracker/TrackerProvider";
+import { UserAvatar, accountName } from "../common/UserAvatar";
 import { BookmarkIcon, GearIcon, GridIcon, HomeIcon, SearchIcon, TvIcon } from "../common/Icons";
 
 type Icon = ComponentType<{ size?: number }>;
@@ -82,11 +83,9 @@ export function MobileTabBar() {
                 onClick={() => setMoreOpen(false)}
                 className="flex w-full items-center gap-3 rounded-[14px] px-3 py-2.5 text-left hover:bg-white/[0.07]"
               >
-                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-[#5e5ce6] to-[#0a84ff] text-[14px] font-bold">
-                  {(tracker.user?.email?.[0] ?? "G").toUpperCase()}
-                </span>
+                <UserAvatar size={32} />
                 <span className="min-w-0">
-                  <span className="block truncate text-[15px] font-semibold">{tracker.user ? tracker.user.email : "Guest"}</span>
+                  <span className="block truncate text-[15px] font-semibold">{tracker.user ? accountName(tracker) : "Guest"}</span>
                   <span className="block text-[12px] text-label-tertiary">{tracker.user ? "Synced to your account" : tracker.canSignIn ? "Sign in to save & sync" : "Saved in this browser"}</span>
                 </span>
               </Link>

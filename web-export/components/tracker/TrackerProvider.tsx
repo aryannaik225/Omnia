@@ -4,7 +4,9 @@
  *
  * - Guest: saved in this browser (localStorage), no account needed.
  * - Signed in: the user's own Supabase rows (RLS). Anything tracked as a guest in this browser
- *   is uploaded once on sign-in and then cleared locally.
+ *   is merged into the account once on sign-in (last-write-wins, so nothing newer is lost) and
+ *   then cleared locally. The library then stays live: Supabase Realtime (plus a refetch when the
+ *   tab comes back) brings in whatever the desktop app or another browser synced.
  *
  * Every change is applied optimistically and rolled back if the server refuses it.
  */
@@ -13,6 +15,7 @@ import type { MediaType } from "@/lib/media";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import { supabaseConfigured } from "@/lib/supabase/env";
 import { countItems, emptyData, epKey, episodeRuntimeKey, isEmpty, itemKey, merge, movieRuntimeKey, validRuntime, type TrackerData } from "@/lib/tracker";
+import { compressAvatar } from "@/lib/avatar-image";
 import * as cloud from "@/lib/tracker-cloud";
 import { useAppStore } from "@/omnia/store/useAppStore";
 
@@ -31,6 +34,12 @@ interface TrackerApi {
   status: Status;
   mode: "guest" | "cloud";
   user: SessionUser | null;
+  /** The account's synced display name / avatar (null for guests). */
+  profile: cloud.CloudProfile | null;
+  /** Compresses to a 256x256 WebP, uploads it and syncs its URL; null removes the picture. */
+  setAvatar: (file: File | null) => Promise<void>;
+  /** Permanently deletes the account and everything synced to it. */
+  deleteAccount: () => Promise<void>;
   canSignIn: boolean;
   inWatchlist: (t: MediaType, id: number) => boolean;
   toggleWatchlist: (t: MediaType, id: number) => void;
@@ -79,11 +88,13 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
   const mode: "guest" | "cloud" = user && canSignIn ? "cloud" : "guest";
   const [data, setData] = useState<TrackerData>(emptyData);
   const [status, setStatus] = useState<Status>("loading");
+  const [profile, setProfile] = useState<cloud.CloudProfile | null>(null);
   const ctxRef = useRef<cloud.CloudCtx | null>(null);
+  /** Writes still in flight: a live refresh waits for them so it can't undo an optimistic change. */
+  const pendingRef = useRef(0);
   const dataRef = useRef(data);
   dataRef.current = data;
 
-  const userEmail = user?.email ?? null;
   /** Desktop-style toasts (omnia/components/common/Toasts); `cta` adds a "Sign in" action. */
   const notify = useCallback((msg: string, cta = false) => {
     const error = /^Couldn/.test(msg);
@@ -101,27 +112,52 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
     setStatus("loading");
     if (mode === "guest") {
       ctxRef.current = null;
+      setProfile(null);
       setData(readGuest());
       setStatus("ready");
       return;
     }
     const userId = user!.id;
+    const sb = supabaseBrowser();
+    const c: cloud.CloudCtx = { sb, userId };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastRefresh = 0;
+
+    /** Re-reads the account (debounced; deferred while local writes are in flight). */
+    const refresh = (delay = 400) => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        if (pendingRef.current > 0) return refresh(600);
+        lastRefresh = Date.now();
+        try {
+          const [d, p] = await Promise.all([cloud.loadCloud(c), cloud.loadProfile(c)]);
+          if (cancelled || pendingRef.current > 0) return;
+          dataRef.current = d;
+          setData(d);
+          setProfile(p);
+        } catch (e) {
+          console.warn("library refresh failed", errText(e));
+        }
+      }, delay);
+    };
+
     (async () => {
       try {
-        const sb = supabaseBrowser();
-        const profileId = await cloud.resolveProfile(sb, userId, userEmail);
-        const c = { sb, userId, profileId };
         const guest = readGuest();
         if (!isEmpty(guest)) {
           await cloud.pushAll(c, guest);
           writeGuest(null);
           if (!cancelled) notify(`Synced ${countItems(guest)} item${countItems(guest) === 1 ? "" : "s"} from this browser to your account`);
         }
-        const d = await cloud.loadCloud(c);
+        const [d, p] = await Promise.all([cloud.loadCloud(c), cloud.loadProfile(c)]);
         if (cancelled) return;
         ctxRef.current = c;
+        dataRef.current = d;
         setData(d);
+        setProfile(p);
         setStatus("ready");
+        lastRefresh = Date.now();
       } catch (e) {
         if (cancelled) return;
         console.error(e);
@@ -129,11 +165,29 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
         notify(`Couldn't load your library: ${errText(e)}`);
       }
     })();
+
+    // Live: rows synced from the desktop app or another browser (RLS: own rows only).
+    const channel = sb.channel(`omnia-library-${userId}`);
+    for (const table of cloud.SYNC_TABLES) {
+      channel.on("postgres_changes", { event: "*", schema: "public", table, filter: `user_id=eq.${userId}` }, () => refresh());
+    }
+    channel.subscribe();
+    // Fallback when Realtime is off or the tab slept: refetch on return (at most every 15 s).
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && Date.now() - lastRefresh > 15_000) refresh(0);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+
     return () => {
       cancelled = true;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      void sb.removeChannel(channel);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by identity, not the prop object
-  }, [mode, user?.id, userEmail, notify]);
+  }, [mode, user?.id, notify]);
 
   /** Optimistic local update, then the remote write (rolled back on failure). */
   const mutate = useCallback(
@@ -156,12 +210,17 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
       }
       const c = ctxRef.current;
       if (!c) return;
-      remote(c).catch((e) => {
-        console.error(e);
-        dataRef.current = prev;
-        setData(prev);
-        notify(`Couldn't save: ${errText(e)}`);
-      });
+      pendingRef.current++;
+      remote(c)
+        .catch((e) => {
+          console.error(e);
+          dataRef.current = prev;
+          setData(prev);
+          notify(`Couldn't save: ${errText(e)}`);
+        })
+        .finally(() => {
+          pendingRef.current--;
+        });
     },
     [mode, canSignIn, notify],
   );
@@ -173,6 +232,23 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
       status,
       mode,
       user: mode === "cloud" ? user : null,
+      profile: mode === "cloud" ? profile : null,
+      setAvatar: async (file) => {
+        const c = ctxRef.current;
+        if (mode !== "cloud" || !c) throw new Error("Sign in to set a profile picture.");
+        if (!file) {
+          await cloud.removeAvatar(c);
+          setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: null }));
+          return;
+        }
+        const url = await cloud.uploadAvatar(c, await compressAvatar(file));
+        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url }));
+      },
+      deleteAccount: async () => {
+        const c = ctxRef.current;
+        if (mode !== "cloud" || !c) throw new Error("Not signed in.");
+        await cloud.deleteAccount(c);
+      },
       canSignIn,
       notify: (m) => notify(m),
       inWatchlist: (t, id) => !!data.watchlist[itemKey(t, id)],
@@ -246,8 +322,11 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
         const c = ctxRef.current;
         if (mode === "cloud" && c) {
           if (how === "replace") await cloud.clearCloud(c);
-          await cloud.pushAll(c, next);
-          setData(await cloud.loadCloud(c));
+          // "Replace": stamp the upload now so it wins over the tombstones just written.
+          await cloud.pushAll(c, next, how === "replace" ? new Date().toISOString() : undefined);
+          const d = await cloud.loadCloud(c);
+          dataRef.current = d;
+          setData(d);
         } else {
           writeGuest(next);
           setData(next);
@@ -260,7 +339,7 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
         setData(emptyData());
       },
     };
-  }, [data, status, mode, user, canSignIn, mutate, notify]);
+  }, [data, status, mode, user, profile, canSignIn, mutate, notify]);
 
   return (
     <Ctx.Provider value={api}>

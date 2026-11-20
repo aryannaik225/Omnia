@@ -5,7 +5,11 @@
 import { AnimatePresence, m } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { extractPalette } from "../../lib/color";
-import { formatRuntime, MONETIZATION_LABEL } from "../../lib/format";
+import { episodeLabel, formatRuntime, MONETIZATION_LABEL, regionName } from "../../lib/format";
+import { countdownLabel, formatDay, isAired } from "../../lib/dates";
+import { relativeRelease, releaseStatus, type ReleaseStatus } from "../../lib/releaseStatus";
+import { showProgress, epKey } from "../../lib/tracker";
+import { cachedSummary, loadSummaries } from "../../services/librarySummary";
 import { useAsync } from "../../lib/hooks";
 import { groupLinks, isSubscribedLink, providerLogo } from "../../services/catalog";
 import { providerFamily } from "../../lib/providers";
@@ -33,6 +37,175 @@ import { useDevMode } from "../../services/devMode";
 // ---------------------------------------------------------------------------------------------
 // Provider / deep-link selector
 // ---------------------------------------------------------------------------------------------
+
+const longDate = (iso: string) => formatDay(iso, { weekday: "short", day: "numeric", month: "long", year: "numeric" });
+const shortDate = (iso: string) => formatDay(iso, { day: "numeric", month: "short", year: "numeric" });
+
+const Glyph = ({ d, size = 20 }: { d: string; size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    <path d={d} />
+  </svg>
+);
+/** Cinema ticket, TV, calendar. */
+const TICKET = "M4 7.5A1.5 1.5 0 0 1 5.5 6h13A1.5 1.5 0 0 1 20 7.5V10a2 2 0 0 0 0 4v2.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 16.5V14a2 2 0 0 0 0-4zM14 6v2.2M14 10.9v2.2M14 15.8V18";
+const SCREEN = "M3.5 5.5h17v11h-17zM8 20h8M12 16.5V20";
+const CALENDAR = "M4 6h16v14.5H4zM4 10.5h16M8.5 3.5v4M15.5 3.5v4";
+
+type Tint = "amber" | "indigo" | "cyan";
+/** Literal class names, so Tailwind keeps the tint rules in the build. */
+const TINT_CLASS: Record<Tint, string> = { amber: "release-card--amber", indigo: "release-card--indigo", cyan: "release-card--cyan" };
+
+/** Calendar-style tile: month band, big day, weekday. */
+function DateTile({ iso, caption }: { iso: string | null; caption?: string }) {
+  if (!iso) {
+    return (
+      <div className="release-tile">
+        <span className="release-tile-month">Date</span>
+        <span className="release-tile-day !text-[22px]">TBA</span>
+        <span className="release-tile-week">&nbsp;</span>
+      </div>
+    );
+  }
+  const [y, m, day] = iso.split("-").map(Number) as [number, number, number];
+  const dt = new Date(y, m - 1, day);
+  return (
+    <div className="release-tile" title={longDate(iso) ?? undefined}>
+      <span className="release-tile-month">{caption ?? dt.toLocaleDateString("en-GB", { month: "short" })}</span>
+      <span className="release-tile-day">{day}</span>
+      <span className="release-tile-week">{caption ? dt.toLocaleDateString("en-GB", { month: "short" }) : dt.toLocaleDateString("en-GB", { weekday: "short" })}</span>
+    </div>
+  );
+}
+
+/** "RELEASING TOMORROW", "IN 14 DAYS", "NOW PLAYING". */
+function countdown(days: number | null, verb: string) {
+  if (days == null) return "Date to be announced";
+  if (days <= 0) return `${verb} today`;
+  if (days === 1) return `${verb} tomorrow`;
+  return relativeRelease(days) ?? "";
+}
+
+/**
+ * Shown instead of "Not available" while a title has no providers: its upcoming release (exact
+ * date, countdown, cinemas vs streaming platform), "In Theatres Now", or a series' next air date.
+ */
+function ReleaseNotice({ status, d }: { status: Exclude<ReleaseStatus, { kind: "none" }>; d: MediaDetails }) {
+  const region = useAppStore((s) => s.region);
+  const toggleWatchlist = useAppStore((s) => s.toggleWatchlist);
+  const inWatchlist = useAppStore((s) => s.isInWatchlist);
+  useAppStore((s) => s.watchlistKeys); // re-render on watchlist changes
+  const listed = inWatchlist(d.id, d.mediaType);
+  const place = regionName(region);
+  const where = (regional: boolean) => (regional ? `in ${place}` : "");
+
+  let tint: Tint = "cyan";
+  let icon = SCREEN;
+  let pill: string;
+  let live = false;
+  let date: string | null;
+  let tileCaption: string | undefined;
+  let headline: string;
+  const details: string[] = [];
+
+  if (status.kind === "theatres") {
+    tint = "amber";
+    icon = TICKET;
+    pill = "Now playing";
+    live = true;
+    date = status.since;
+    tileCaption = "Since";
+    headline = `In theatres ${where(status.regional) || "now"}`.trim();
+    details.push(`Released ${longDate(status.since)}`);
+    details.push(status.digital ? `Streaming${status.platform ? ` on ${status.platform}` : ""} from ${shortDate(status.digital)}` : "Not on streaming or digital yet");
+  } else if (status.kind === "fresh") {
+    date = status.date;
+    live = true;
+    const on = status.platform ? ` on ${status.platform}` : "";
+    if (status.days === 0) {
+      pill = status.channel === "tv" ? "Premieres today" : "Releasing today";
+      headline =
+        status.channel === "tv" ? `Series premiere today${on}` : status.platform ? `Releasing today${on}` : status.channel === "digital" ? "Digital / Streaming release today" : "Releasing today";
+      details.push(longDate(status.date) ?? "");
+      details.push("Streaming links appear once it drops");
+    } else {
+      pill = "Just released";
+      headline = `Just released${on} — streaming links updating`;
+      details.push(`Released ${longDate(status.date)}`);
+    }
+    if (!status.regional && d.mediaType === "movie" && status.channel === "digital") details.push(`Worldwide date · none listed for ${place} yet`);
+  } else if (status.kind === "airing") {
+    date = status.date;
+    pill = countdown(status.days, "Airs");
+    headline = status.label;
+    details.push(longDate(status.date) ?? "");
+    details.push(`Not streaming in ${place} yet`);
+  } else {
+    date = status.date;
+    const tv = d.mediaType === "tv";
+    switch (status.channel) {
+      case "cinemas":
+        tint = "indigo";
+        icon = TICKET;
+        pill = countdown(status.days, "Releasing");
+        headline = `In cinemas ${where(status.regional)}`.trim();
+        if (status.digital) details.push(`Streaming${status.platform ? ` on ${status.platform}` : ""} from ${shortDate(status.digital)}`);
+        break;
+      case "digital":
+        pill = countdown(status.days, "Releasing");
+        headline = status.platform ? `Releasing on ${status.platform}` : "Digital / Streaming release";
+        if (status.alsoInCinemas) details.push("Also in select cinemas");
+        break;
+      case "tv":
+        pill = countdown(status.days, "Premieres");
+        headline = status.label ?? (tv ? "Series premiere" : "TV premiere");
+        break;
+      default:
+        icon = CALENDAR;
+        pill = countdown(status.days, "Releasing");
+        headline = status.date ? `Releasing ${longDate(status.date)}` : status.label ? `${status.label} · release date not announced yet` : "Release date not announced yet";
+    }
+    if (status.date && status.channel !== "unknown") details.unshift(longDate(status.date) ?? "");
+    if (status.date && !status.regional && status.channel !== "tv" && d.mediaType === "movie") details.push(`Worldwide date · none listed for ${place} yet`);
+  }
+
+  return (
+    <m.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ type: "spring", stiffness: 260, damping: 28 }}
+      className={`release-card ${TINT_CLASS[tint]}`}
+    >
+      <DateTile iso={date} caption={tileCaption} />
+      <div className="relative min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="release-icon">
+            <Glyph d={icon} size={18} />
+          </span>
+          <span className="release-pill">
+            {live && <span className="release-live-dot" />}
+            {pill}
+          </span>
+        </div>
+        <p className="mt-2.5 text-[21px] font-bold leading-tight tracking-tight max-md:text-[18px]">{headline}</p>
+        {details.length > 0 && <p className="mt-1 text-[13px] text-label-secondary">{details.filter(Boolean).join("  ·  ")}</p>}
+      </div>
+      {status.kind !== "theatres" &&
+        (listed ? (
+          <span className="relative flex shrink-0 items-center gap-1.5 text-[13px] font-medium text-label-secondary max-md:w-full">
+            <CheckIcon size={15} className="text-[#30d158]" /> In your Upcoming
+          </span>
+        ) : (
+          <button
+            className="glass-button relative shrink-0 !px-4 !py-2 text-[13px] max-md:w-full"
+            onClick={() => void toggleWatchlist(d)}
+            title="Adds it to your watchlist and My Library → Upcoming"
+          >
+            <PlusIcon size={15} /> Remind me
+          </button>
+        ))}
+    </m.div>
+  );
+}
 
 function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedLink) => void }) {
   const resolveLinks = usePlayerStore((s) => s.resolveLinks);
@@ -63,8 +236,14 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   }
   if (links.error) return <p className="text-[13px] text-label-secondary">Couldn't resolve streaming links: {links.error}</p>;
   const all = links.data ?? [];
-  if (!all.length) return <p className="text-label-secondary">Not available to stream or buy in {region}.</p>;
+  // Not streaming yet (only provider-search fallbacks, or nothing): say when / where it releases.
+  const status = all.every((l) => l.isFallback) ? releaseStatus(d, region) : ({ kind: "none" } as const);
+  if (!all.length) {
+    if (status.kind !== "none") return <ReleaseNotice status={status} d={d} />;
+    return <p className="text-label-secondary">Not available to stream or buy in {regionName(region)}.</p>;
+  }
 
+  const notice = status.kind !== "none" ? <ReleaseNotice status={status} d={d} /> : null;
   const primary = all.filter((l) => !subscriptionsOnly || isSubscribedLink(l, subs) || ["free", "ads"].includes(l.monetizationType));
   const shown = showAll || !subscriptionsOnly ? all : primary.length ? primary : all;
 
@@ -72,6 +251,7 @@ function WatchOptions({ d, onPlay }: { d: MediaDetails; onPlay: (link: ResolvedL
   const prefName = groupLinks(all).find((g) => g.key === prefKey)?.name ?? pref.data?.providerName;
   return (
     <div>
+      {notice && <div className="mb-4">{notice}</div>}
       <div className="flex flex-wrap gap-3">
         {groups.map((g) => {
           const l = g.primary;
@@ -174,35 +354,70 @@ function Episodes({
     setExpanded((x) => !x);
   };
 
-  /** Marks every aired, not-yet-finished episode of the open season (watched elsewhere). */
-  const markSeason = async () => {
-    if (!profile || !episodes.data) return;
-    const today = new Date().toISOString().slice(0, 10);
-    const todo = episodes.data.filter((ep) => !byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`)?.isCompleted && (!ep.airDate || ep.airDate <= today));
-    if (!todo.length) return;
+  const isDone = (season: number, episode: number) => !!byKey.get(`${season}-${episode}`)?.isCompleted;
+  const airedEps = allEpisodes.filter((ep) => isAired(ep.airDate));
+  const todo = airedEps.filter((ep) => !isDone(ep.seasonNumber, ep.episodeNumber));
+  const seasonDone = airedEps.length > 0 && todo.length === 0;
+  /** Marks played on a service stay (real progress); only "Mark as Watched" rows can be undone. */
+  const handMade = allEpisodes.filter((ep) => {
+    const p = byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`);
+    return p?.isCompleted && !p.providerName;
+  });
+  // "Also mark the earlier episodes?" after ticking one off.
+  const [offer, setOffer] = useState<typeof allEpisodes | null>(null);
+  useEffect(() => setOffer(null), [seasonNo, d.id]);
+
+  const afterChange = () => {
+    onChanged();
+    void refreshContinueWatching();
+    markRecsStale();
+  };
+
+  /** Marks the given aired, not-yet-finished episodes (watched elsewhere) in one go. */
+  const markMany = async (list: typeof allEpisodes, label: string) => {
+    if (!profile || !list.length) return;
     setMarkingSeason(true);
     try {
       await history.markEpisodesWatched(
         profile.profileId,
         d.id,
-        todo.map((ep) => ({
+        list.map((ep) => ({
           seasonNumber: ep.seasonNumber,
           episodeNumber: ep.episodeNumber,
           episodeTitle: ep.name,
           durationSeconds: ep.runtimeMins ? ep.runtimeMins * 60 : null,
         })),
       );
-      toast({ kind: "success", title: "Season marked as watched", body: `${todo.length} episode${todo.length > 1 ? "s" : ""} of ${d.title}` });
-      onChanged();
-      void refreshContinueWatching();
-      markRecsStale();
+      toast({ kind: "success", title: label, body: `${list.length} episode${list.length > 1 ? "s" : ""} of ${d.title}` });
+      setOffer(null);
+      afterChange();
     } catch (e) {
       toast({ kind: "error", title: "Couldn't update history", body: e instanceof Error ? e.message : String(e) });
     } finally {
       setMarkingSeason(false);
     }
   };
-  const seasonDone = !!episodes.data?.length && episodes.data.every((ep) => byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`)?.isCompleted);
+  const markSeason = () => markMany(todo, "Season marked as watched");
+
+  /** Undo "Mark Season as Watched": removes this season's hand-made marks (service plays stay). */
+  const undoSeason = async () => {
+    if (!profile || !handMade.length) return;
+    setMarkingSeason(true);
+    try {
+      for (const ep of handMade) await history.unmarkWatched(profile.profileId, d.id, "tv", ep.seasonNumber, ep.episodeNumber);
+      toast({ kind: "info", title: "Season unmarked", body: `${handMade.length} episode${handMade.length > 1 ? "s" : ""} of ${d.title}` });
+      afterChange();
+    } catch (e) {
+      toast({ kind: "error", title: "Couldn't update history", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setMarkingSeason(false);
+    }
+  };
+
+  const onMarked = (episode: number) => {
+    const earlier = airedEps.filter((ep) => ep.episodeNumber < episode && !isDone(ep.seasonNumber, ep.episodeNumber));
+    setOffer(earlier.length ? earlier : null);
+  };
 
   if (!d.seasons.length) return null;
   return (
@@ -210,11 +425,21 @@ function Episodes({
       <div className="mb-4 flex items-center justify-between gap-4 max-md:flex-col max-md:items-stretch max-md:gap-3">
         <div className="flex shrink-0 items-center gap-3 max-md:justify-between">
           <h2 className="section-title whitespace-nowrap">Episodes</h2>
-          {episodes.data && !seasonDone && (
+          {episodes.data && !seasonDone && todo.length > 0 && (
             <button className="glass-button shrink-0 whitespace-nowrap !px-3.5 !py-1.5 text-[13px] leading-none max-md:!px-3 max-md:text-[12px]" disabled={markingSeason} onClick={() => void markSeason()} title="Seen this season elsewhere? Track every aired episode at once">
               <CheckIcon size={14} /> {markingSeason ? "Marking…" : "Mark Season as Watched"}
             </button>
           )}
+          {seasonDone &&
+            (handMade.length ? (
+              <button className="chip shrink-0" disabled={markingSeason} onClick={() => void undoSeason()} title="Unmark this season's hand-marked episodes (episodes played on a service stay)">
+                <CheckIcon size={13} className="text-[#30d158]" /> Season watched · Undo
+              </button>
+            ) : (
+              <span className="chip shrink-0 !cursor-default">
+                <CheckIcon size={13} className="text-[#30d158]" /> Season watched
+              </span>
+            ))}
         </div>
         <div className="flex min-w-0 gap-2 overflow-x-auto scrollbar-none">
           {d.seasons.map((s) => (
@@ -224,12 +449,28 @@ function Episodes({
           ))}
         </div>
       </div>
+      <AnimatePresence>
+        {offer && (
+          <m.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} className="glass-pill mb-3 flex flex-wrap items-center gap-3 px-4 py-2.5 text-[14px]">
+            <span className="flex-1">
+              Also mark the {offer.length} earlier episode{offer.length === 1 ? "" : "s"} as watched?
+            </span>
+            <button className="glass-button-primary !px-3.5 !py-1.5 !text-[13px]" disabled={markingSeason} onClick={() => void markMany(offer, "Earlier episodes marked")}>
+              Mark them
+            </button>
+            <button className="chip" onClick={() => setOffer(null)}>
+              No thanks
+            </button>
+          </m.div>
+        )}
+      </AnimatePresence>
       <div className="flex flex-col gap-2">
         {episodes.loading &&
           Array.from({ length: 4 }, (_, i) => <div key={i} className="skeleton h-[96px] rounded-card" />)}
         {shownEpisodes.map((ep) => {
           const p = byKey.get(`${ep.seasonNumber}-${ep.episodeNumber}`);
           const ratio = p ? (p.isCompleted ? 1 : p.completionRatio) : 0;
+          const aired = isAired(ep.airDate);
           const still = img(ep.stillPath, "w300");
           return (
             <div key={ep.episodeNumber} className="flex items-center gap-2 rounded-card pr-3 transition-colors hover:bg-white/[0.06]">
@@ -238,13 +479,22 @@ function Episodes({
               className="group flex min-w-0 flex-1 items-center gap-4 rounded-card p-2 text-left"
             >
               <span className="relative aspect-video w-[168px] max-md:w-[116px] shrink-0 overflow-hidden rounded-[12px] bg-white/5">
-                {still && <img src={still} alt="" loading="lazy" className="h-full w-full object-cover" />}
-                <span className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
-                  <PlayIcon size={26} />
-                </span>
+                {still && <img src={still} alt="" loading="lazy" className={`h-full w-full object-cover ${aired ? "" : "opacity-50"}`} />}
+                {aired ? (
+                  <span className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
+                    <PlayIcon size={26} />
+                  </span>
+                ) : (
+                  <span className="absolute inset-0 flex items-center justify-center">
+                    <span className="badge !bg-black/55">{countdownLabel(ep.airDate) ?? "TBA"}</span>
+                  </span>
+                )}
                 {ratio > 0 && (
                   <span className="progress-track absolute inset-x-2 bottom-2 block !h-[3px]">
-                    <span className="progress-fill block" style={{ width: `${Math.max(3, ratio * 100)}%` }} />
+                    <span
+                      className={`progress-fill block ${ratio >= 1 ? "!bg-[#30d158]" : "!bg-[#0a84ff]"}`}
+                      style={{ width: `${Math.max(3, ratio * 100)}%` }}
+                    />
                   </span>
                 )}
               </span>
@@ -254,7 +504,12 @@ function Episodes({
                   {p?.isCompleted && <CheckIcon size={14} className="ml-2 inline text-[#30d158]" />}
                 </span>
                 <span className="mt-0.5 block text-[12px] text-label-tertiary">
-                  {[formatRuntime(ep.runtimeMins), ep.airDate].filter(Boolean).join(" · ")}
+                  {[
+                    formatRuntime(ep.runtimeMins),
+                    aired ? formatDay(ep.airDate) : ep.airDate ? `Airs ${formatDay(ep.airDate, { weekday: "short", day: "numeric", month: "short" })}` : "Air date TBA",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </span>
                 <span className="mt-1 line-clamp-2 block text-[13px] text-label-secondary">{ep.overview}</span>
               </span>
@@ -266,7 +521,9 @@ function Episodes({
               episodeTitle={ep.name}
               runtimeMins={ep.runtimeMins}
               entry={p}
+              aired={aired}
               onChanged={onChanged}
+              onMarked={() => onMarked(ep.episodeNumber)}
             />
             </div>
           );
@@ -282,6 +539,49 @@ function Episodes({
         )}
       </div>
     </section>
+  );
+}
+
+/** Your progress through the series (local history), and a countdown to its next episode. */
+function SeriesStatus({ d, progress }: { d: MediaDetails; progress: WatchHistoryEntry[] }) {
+  const region = useAppStore((s) => s.region);
+  const key = `tv:${d.id}`;
+  const sum = useAsync(() => loadSummaries([key], region).then(() => cachedSummary(region, key) ?? null), [key, region]);
+  const watched = useMemo(() => {
+    const w: Record<string, string> = {};
+    for (const p of progress) if (p.isCompleted && p.episodeNumber > 0) w[epKey(p.seasonNumber, p.episodeNumber)] = p.lastWatchedAt;
+    return w;
+  }, [progress]);
+  if (!sum.data) return null;
+  const p = showProgress(sum.data, watched);
+  const nextAir = sum.data.nextEpisode?.airDate && !isAired(sum.data.nextEpisode.airDate) ? sum.data.nextEpisode : null;
+  if (!p.airedTotal && !nextAir) return null;
+  const done = p.airedTotal > 0 && p.watchedAired >= p.airedTotal;
+  return (
+    <div className="mt-6 grid max-w-[640px] gap-3 sm:grid-cols-2">
+      {p.airedTotal > 0 && (
+        <div className="glass-card px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-label-tertiary">Your progress</p>
+          <p className="mt-1 text-[15px] font-semibold">{p.watchedAired ? `${p.watchedAired} of ${p.airedTotal} episodes` : `${p.airedTotal} episodes aired`}</p>
+          <span className="progress-track mt-2 block">
+            <span className={`progress-fill block transition-[width] duration-500 ${done ? "!bg-[#30d158]" : "!bg-[#0a84ff]"}`} style={{ width: `${(p.watchedAired / p.airedTotal) * 100}%` }} />
+          </span>
+          <p className="mt-1.5 text-[12px] text-label-secondary">
+            {p.next && p.started ? `Up Next: ${episodeLabel(p.next.season, p.next.episode)}` : p.caughtUp ? (p.ended ? "Finished" : "All caught up") : "Play or tick off episodes below to follow it"}
+          </p>
+        </div>
+      )}
+      {nextAir && (
+        <div className="glass-card px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-label-tertiary">Next episode</p>
+          <p className="mt-1 text-[22px] font-bold leading-tight tracking-tight">{countdownLabel(nextAir.airDate)}</p>
+          <p className="mt-0.5 truncate text-[12px] text-label-secondary">
+            {episodeLabel(nextAir.season, nextAir.episode)}
+            {nextAir.name && !/^Episode \d+$/.test(nextAir.name) ? ` · ${nextAir.name}` : ""} · {formatDay(nextAir.airDate, { weekday: "short", day: "numeric", month: "short" })}
+          </p>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -403,6 +703,7 @@ function TitleView({ entry }: { entry: Extract<ModalEntry, { kind: "title" }> })
                 </button>
               )}
             </div>
+            {d?.mediaType === "tv" && !kidsBlocked && <SeriesStatus d={d} progress={progress.data ?? []} />}
           </div>
           {d && (
             <dl className="grid content-start gap-3 text-[13px]">

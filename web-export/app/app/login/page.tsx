@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { GoogleSignIn } from "@/components/auth/GoogleSignIn";
 import { supabaseServer } from "@/lib/supabase/server";
 import { APP_BASE, supabaseConfigured } from "@/lib/supabase/env";
 
@@ -39,7 +40,15 @@ export default async function Login({ searchParams }: { searchParams: Promise<{ 
         <p className="mt-1 text-label-secondary">Sign in to save and sync your library</p>
         {configured ? (
           <>
-            <input name="email" type="email" required autoComplete="email" placeholder="E-mail" className="glass-input mt-6" />
+            <div className="mt-6">
+              <GoogleSignIn />
+            </div>
+            <div className="mt-5 flex items-center gap-3 text-[12px] uppercase tracking-wider text-label-tertiary">
+              <span className="h-px flex-1 bg-white/10" />
+              or with e-mail
+              <span className="h-px flex-1 bg-white/10" />
+            </div>
+            <input name="email" type="email" required autoComplete="email" placeholder="E-mail" className="glass-input mt-5" />
             <input name="password" type="password" required minLength={8} autoComplete="current-password" placeholder="Password" className="glass-input mt-3" />
             {error && <p className="mt-3 text-[14px] text-[#ff6961]">{error}</p>}
             {message && <p className="mt-3 text-[14px] text-[#30d158]">{message}</p>}

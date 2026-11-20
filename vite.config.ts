@@ -23,8 +23,9 @@ export default defineConfig(({ mode }) => ({
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: { ignored: ["**/src-tauri/**"] },
   },
-  // `TMDB_` exposes TMDB_API_KEY from .env to the catalog UI (it is copied into local settings for Rust).
-  envPrefix: ["VITE_", "TAURI_ENV_", "TMDB_"],
+  // Only non-secret build flags reach the bundle. TMDB_API_KEY and the Supabase values are read
+  // by src-tauri/build.rs into the Rust binary; the UI reaches TMDB through `tmdb_get`.
+  envPrefix: ["VITE_OMNIA_", "TAURI_ENV_"],
   build: {
     // WebView2 / Android WebView are evergreen Chromium; iPhones open the LAN companion in Safari.
     target: ["chrome120", "safari16"],

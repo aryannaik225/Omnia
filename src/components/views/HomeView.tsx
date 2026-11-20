@@ -60,7 +60,7 @@ function MyListRow() {
     [list],
   );
   if (!items.length) return null;
-  return <StaticRow title="My List" subtitle="Saved with + Up Next, newest first" items={items} ignoreSubscriptions onViewMore={() => navigate("watchlist")} />;
+  return <StaticRow title="My List" subtitle="Saved with + Up Next, newest first" items={items} ignoreSubscriptions onViewMore={() => navigate("library", { librarySection: "watchlist" })} />;
 }
 
 /** Which titles seed the personal rows: Loved titles first, else watch history, else none. */

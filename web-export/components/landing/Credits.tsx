@@ -50,6 +50,8 @@ export function Credits({ repoUrl, version }: { repoUrl: string; version: string
           <Link href="/app" className="hover:text-white">Web app</Link>
           <a href={repoUrl} target="_blank" rel="noreferrer" className="hover:text-white">GitHub</a>
           <a href={`${repoUrl}/issues`} target="_blank" rel="noreferrer" className="hover:text-white">Issues</a>
+          <Link href="/privacy" className="hover:text-white">Privacy Policy</Link>
+          <Link href="/terms" className="hover:text-white">Terms of Service</Link>
           <a href="#top" className="hover:text-white">Back to the top ↑</a>
         </nav>
       </div>

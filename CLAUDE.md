@@ -38,7 +38,7 @@ The UI must strictly emulate Apple's 2026 **Liquid Glass** design language intro
 - **Refractive Translucent Surfaces:** Navigation sidebars, floating pills, filter bars, and modal overlays must use multi-layered frosted glass (`backdrop-filter: blur(24px) saturate(180%)`), subtle semi-opaque dark backing layers (`rgba(18, 18, 22, 0.65)`) for guaranteed WCAG 4.5:1 text contrast, and 1px specular top/inner borders (`inset 0 1px 0 rgba(255, 255, 255, 0.22)`).
 - **Dynamic Ambient Bleed:** The background of the app dynamically samples the dominant color palette of the currently focused hero artwork or movie backdrop, casting a soft, slow-moving ambient radial glow behind the glass layers.
 - **Concentric Geometry:** Consistent Apple-grade border radii (`24px` for large panels/modals, `16px` for poster cards and sidebars, `12px` for buttons and pills).
-- **Collapsible Floating Sidebar:** A sleek left-hand Liquid Glass navigation sidebar (Search, Home, WatchNow / Continue Watching, My OTTs, Franchises & Hubs, Watchlist, Settings) that refracts scrolling content beneath it and dynamically collapses when scrolling deep into content grids.
+- **Collapsible Floating Sidebar:** A sleek left-hand Liquid Glass navigation sidebar (Search, Home, WatchNow / Continue Watching, My Library, My OTTs, Franchises & Hubs, Collections, Settings) that refracts scrolling content beneath it and dynamically collapses when scrolling deep into content grids.
 
 ### 4.2 Component & Interaction Patterns
 - **Full-Bleed Hero Showcase:** Auto-playing muted 4K trailer preview (after a 2-second hover/focus delay) with crisp typography, provider badge ("Included with your JioHotstar subscription"), IMDb/RT/TMDB ratings, maturity badge, and primary "Play Now" + "+ Up Next" Liquid Glass buttons.
@@ -321,6 +321,10 @@ Migration v8 adds `title_vectors (tmdb_id, media_type, model_id, doc_hash, vecto
 
 **`web-export/`** is the public website, a separate Next.js project deployed to Vercel: the landing page at `/` (static, hourly ISR; reads the latest GitHub release server-side) and a manual tracker at `/app`: the desktop frontend ported into `web-export/omnia/` (same layout as `src/`; keep the two in sync when changing shared UI), TMDB through a server-side proxy, region auto-detected per visitor (`x-vercel-ip-country`, else IP lookup / time zone), guest mode in `localStorage`, optional Supabase sign-in to sync (RLS on every table); desktop-only features show an "Available on Omnia Desktop" badge. It is not part of the desktop build, and the desktop app's privacy rules (Section 2) don't apply to `/app` by design.
 
+**Optional cloud sync (Settings → Sign in to Sync, off by default; see `docs/CLOUD_SYNC.md`):** the one exception to "nothing leaves the PC", and only after the user signs in (Email/Password or Google PKCE via a `127.0.0.1:54365` loopback). `sync/cloud.rs` syncs the linked profile's watchlist and completed movies / episodes (incl. OTT-recorded completions) plus its name and 256×256 WebP picture two-way with Supabase (`supabase/schema.sql`: `profiles`, `watchlist`, `tracked_movies`, `tracked_episodes`, RLS on all, `avatars` bucket). Migration v9 adds `cloud_outbox` + triggers (they fire only for `cloud_sync_profile_id`); pushes carry each change's time as `updated_at`, removals are tombstones (`deleted_at`), the server keeps the newest write and pulls follow server `synced_at`. OTT cookies, telemetry, embeddings and caches never sync. `cloud_*` settings and `tmdb_api_key` are hidden from the UI and LAN devices; the UI reaches TMDB only through the Rust `tmdb_get` command (no key in the JS bundle). `SUPABASE_URL` / `SUPABASE_ANON_KEY` are compiled in by `build.rs`, which rejects secret keys. `.github/workflows/supabase-keep-alive.yml` pings `keep_alive()` every 3 days.
+
+**My Library (desktop & web, same layout):** a Watch Summary bar (Total Days Watched / Movies / Episodes from the runtime recorded with each watch, else TMDB's) above Watchlist · Upcoming · Ongoing Series · Completed Series · Tracked Movies rows (newest first, "Show more" opens a section grid). Desktop: `components/views/LibraryView.tsx` + `components/library/useLibrary.ts` read the profile's SQLite history (`export_watch_history`, OTT-synced and hand-marked alike) and watchlist, joined with TMDB summaries (`services/librarySummary.ts`, 12 h localStorage cache of public metadata). Progress bars: `#0a84ff` while 1–99 %, `#30d158` at 100 %. `lib/releaseStatus.ts` (shared verbatim with `web-export/omnia/lib/`) drives the detail sheet's release card when a title isn't streaming yet. Legal pages: `web-export/app/privacy`, `web-export/app/terms` (keep them in step with any data-handling change).
+
 **Browser session isolation:** every OTT webview (player and hidden importer windows) is created with its own WebView2 `data_directory` at `<local app data>/Profiles/<app_profile_id>` (a per-profile `data_store_identifier` on macOS). OTT cookies, cache and storage are never shared between app profiles; a deleted profile's folder is wiped.
 
 ---
@@ -380,13 +384,16 @@ Maintain this exact repository structure:
 │       │   ├── window_manager.rs         # Spawns chromeless WebView2 player & overlay pill
 │       │   └── telemetry_injector.js     # Injected DOM observer for <video> pause/seek/skip tracking
 │       ├── sync/
-│       │   └── history_importer.rs       # Hidden-WebView2 OTT watch history importer & TMDB matcher
+│       │   ├── history_importer.rs       # Hidden-WebView2 OTT watch history importer & TMDB matcher
+│       │   └── cloud.rs                  # Optional opt-in two-way Supabase sync (LWW, tombstones)
 │       ├── ml/
 │       │   ├── embeddings.rs             # Text feature extraction & ONNX / TF-IDF vectorization
 │       │   └── recommender.rs            # Behavioral affinity weights, time-of-day centroids, Cosine + MMR
 │       └── lan/
 │           └── mobile_server.rs          # Optional local Axum server for zero-install iPhone Safari access
 ├── docs/PHONE_AND_TV.md                  # LAN pairing, iPhone, Android TV APK build
+├── docs/CLOUD_SYNC.md                    # Optional Desktop ⇄ Web sync: setup, privacy boundary
+├── supabase/schema.sql                   # Idempotent Supabase schema (RLS, avatars bucket, keep-alive)
 └── web-export/                           # Website: landing page at /, optional Supabase cloud edition at /app
 ```
 

@@ -37,7 +37,7 @@ const TABS: { view: View; label: string; icon: Icon }[] = [
 ];
 
 const MORE: { view: View; label: string; icon: Icon }[] = [
-  { view: "watchlist", label: "My List", icon: BookmarkIcon },
+  { view: "library", label: "My Library", icon: BookmarkIcon },
   { view: "hubs", label: "Franchises & Hubs", icon: GridIcon },
   { view: "collections", label: "Collections", icon: StackIcon },
   { view: "myotts", label: "My OTTs", icon: TvIcon },

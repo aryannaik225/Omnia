@@ -18,6 +18,7 @@ import { useAppStore } from "../../store/useAppStore";
 import { DesktopBadge } from "../common/DesktopOnly";
 import { CheckIcon, DownloadIcon, GlobeIcon, RefreshIcon, TrashIcon, UploadIcon } from "../common/Icons";
 import { RegionSwitcher } from "../layout/TopFilterBar";
+import { UserAvatar, accountName } from "../common/UserAvatar";
 import { PageHeader } from "./BrowseViews";
 
 function Section({ id, title, subtitle, children }: { id?: string; title: string; subtitle?: string; children: ReactNode }) {
@@ -49,6 +50,76 @@ const DESKTOP_ONLY = [
   { title: "On-device recommendations", body: "“We Think You'll Love These” rows from a taste model that runs on your own PC." },
   { title: "Phone & TV pairing", body: "Browse from your phone or Android TV over your home Wi-Fi with a QR code and PIN." },
 ];
+
+/** Signed in: picture (compressed to a 256x256 WebP on this device, synced everywhere), name, sign out. */
+function AccountCard() {
+  const t = useTracker();
+  const toast = useAppStore((s) => s.toast);
+  const pickRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const run = async (file: File | null) => {
+    setBusy(true);
+    try {
+      await t.setAvatar(file);
+      toast({ kind: "success", title: file ? "Profile picture updated" : "Profile picture removed", body: "It syncs to Omnia Desktop and your other browsers." });
+    } catch (e) {
+      toast({ kind: "error", title: "Couldn't update your picture", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+      if (pickRef.current) pickRef.current.value = "";
+    }
+  };
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-4">
+      <div className="flex min-w-0 items-center gap-4">
+        <button type="button" className="group relative rounded-full" onClick={() => pickRef.current?.click()} disabled={busy} aria-label="Change profile picture">
+          <UserAvatar size={64} />
+          <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/50 text-[11px] font-semibold opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+            {busy ? "…" : "Change"}
+          </span>
+        </button>
+        <div className="min-w-0">
+          <p className="truncate text-[16px] font-semibold">{accountName(t)}</p>
+          <p className="truncate text-[13px] text-label-tertiary">{t.user?.email}</p>
+          <div className="mt-1.5 flex gap-3 text-[13px]">
+            <button type="button" className="font-medium text-[#0a84ff] hover:underline disabled:opacity-50" onClick={() => pickRef.current?.click()} disabled={busy}>
+              {t.profile?.avatarUrl ? "Change picture" : "Add a picture"}
+            </button>
+            {t.profile?.avatarUrl && (
+              <button type="button" className="text-label-tertiary hover:text-label-primary disabled:opacity-50" onClick={() => void run(null)} disabled={busy}>
+                Remove
+              </button>
+            )}
+          </div>
+        </div>
+        <input ref={pickRef} type="file" accept="image/*" hidden onChange={(e) => e.target.files?.[0] && void run(e.target.files[0])} />
+      </div>
+      <div className="flex flex-wrap gap-3">
+        <form action="/app/auth/signout" method="post">
+          <button className="glass-button">Sign out</button>
+        </form>
+        <button
+          type="button"
+          className="glass-button !text-[#ff6961]"
+          disabled={busy}
+          onClick={async () => {
+            if (!window.confirm("Delete your Omnia account? Your profile, picture, watchlist and watched history are removed from the cloud for good. Omnia Desktop keeps its own local copy.")) return;
+            setBusy(true);
+            try {
+              await t.deleteAccount();
+              window.location.assign("/app");
+            } catch (e) {
+              toast({ kind: "error", title: "Couldn't delete your account", body: e instanceof Error ? e.message : String(e) });
+              setBusy(false);
+            }
+          }}
+        >
+          Delete account
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function Subscriptions() {
   const region = useAppStore((s) => s.region);
@@ -171,16 +242,9 @@ export function SettingsView() {
     <div className="pb-16">
       <PageHeader title="Settings" subtitle="Region, services, preferences and your library" />
       <div className="flex max-w-[920px] flex-col gap-6">
-        <Section title="Account" subtitle={t.user ? "Your library syncs to every browser you sign in on." : "Omnia works without an account: your library is saved in this browser."}>
+        <Section title="Account" subtitle={t.user ? "Your library syncs with Omnia Desktop and every browser you sign in on." : "Omnia works without an account: your library is saved in this browser."}>
           {t.user ? (
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-[14px] text-label-secondary">
-                Signed in as <span className="font-semibold text-label-primary">{t.user.email}</span>
-              </p>
-              <form action="/app/auth/signout" method="post">
-                <button className="glass-button">Sign out</button>
-              </form>
-            </div>
+            <AccountCard />
           ) : t.canSignIn ? (
             <div className="flex flex-wrap items-center justify-between gap-4">
               <p className="max-w-[540px] text-[14px] text-label-secondary">Sign in to keep your library safe and use it on your other devices. Everything you've tracked in this browser comes with you.</p>

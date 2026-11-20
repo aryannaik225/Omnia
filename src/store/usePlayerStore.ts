@@ -215,6 +215,14 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         app().markRecsStale();
         app().toast({ kind: "info", title: `Synced from ${e.providerName}`, body: `${e.updated} new ${e.updated === 1 ? "entry" : "entries"} from your other devices.` });
       }),
+      events.onCloudSync((e) => {
+        if (e.profileUpdated) void app().reloadProfiles();
+        if (e.appProfileId !== app().activeProfile?.profileId || !e.applied) return;
+        void app().refreshContinueWatching();
+        void app().refreshWatchlist();
+        app().markRecsStale();
+        app().toast({ kind: "info", title: "Synced from your account", body: `${e.applied} change${e.applied === 1 ? "" : "s"} from Omnia Web or your other devices.` });
+      }),
       events.onHistoryImportFinished((e) => {
         if (e.ok) {
           const r = e.report;

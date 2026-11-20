@@ -89,6 +89,16 @@ const COMMANDS: &[&str] = &[
     // Self-update
     "check_for_update",
     "install_update",
+    // TMDB proxy (the key stays in Rust)
+    "tmdb_get",
+    "tmdb_status",
+    // Optional cloud sync
+    "cloud_status",
+    "cloud_sign_in",
+    "cloud_sign_up",
+    "cloud_sign_in_google",
+    "cloud_sign_out",
+    "cloud_sync_now",
     // Injected OTT script (remote origins)
     "sync_playback_telemetry",
     "player_back_to_hub",
@@ -128,8 +138,92 @@ fn embed_tmdb_key() {
     println!("cargo:rustc-env=OMNIA_TMDB_API_KEY={key}");
 }
 
+/// `KEY=value` from the repo-root `.env` (local builds), or None.
+fn dotenv_value(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string("../.env").ok()?;
+    let prefix = format!("{name}=");
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix("export ").unwrap_or(line).strip_prefix(prefix.as_str())?;
+        Some(value.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+    })
+}
+
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let clean: Vec<u8> = s.bytes().filter(|c| *c != b'=').collect();
+    let mut out = Vec::new();
+    for chunk in clean.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Optional cloud sync: the Supabase project URL and its *public* anon / publishable key
+/// (`SUPABASE_URL`, `SUPABASE_ANON_KEY`; env var first, then `../.env`). Both are safe to ship
+/// because Row Level Security limits every row to the signed-in user. A secret / service-role
+/// key fails the build instead of ever being compiled into the app.
+fn embed_supabase() {
+    for name in ["SUPABASE_URL", "SUPABASE_ANON_KEY"] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let get = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| dotenv_value(name))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let url = get("SUPABASE_URL");
+    let key = get("SUPABASE_ANON_KEY");
+    if url.contains(['\n', '\r']) || key.contains(['\n', '\r']) {
+        panic!("SUPABASE_URL / SUPABASE_ANON_KEY must be single lines");
+    }
+    if !url.is_empty() && !url.starts_with("https://") {
+        panic!("SUPABASE_URL must start with https://");
+    }
+    if key.starts_with("sb_secret_") {
+        panic!("SUPABASE_ANON_KEY is a Supabase *secret* key. Use the anon / publishable key; secrets must never ship in the app.");
+    }
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() == 3 {
+        let role = b64url_decode(parts[1])
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|json| json.split("\"role\"").nth(1).map(|rest| rest.trim_start_matches([':', ' ', '"']).split('"').next().unwrap_or("").to_string()));
+        if role.as_deref().is_some_and(|r| r != "anon") {
+            panic!("SUPABASE_ANON_KEY has role {role:?}. Use the anon key; the service-role key must never ship in the app.");
+        }
+    }
+    if url.is_empty() || key.is_empty() {
+        println!("cargo:warning=SUPABASE_URL / SUPABASE_ANON_KEY not set: this build has cloud sync disabled (everything stays local).");
+    }
+    println!("cargo:rustc-env=OMNIA_SUPABASE_URL={url}");
+    println!("cargo:rustc-env=OMNIA_SUPABASE_ANON_KEY={key}");
+}
+
 fn main() {
     embed_tmdb_key();
+    embed_supabase();
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),

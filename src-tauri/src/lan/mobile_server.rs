@@ -813,8 +813,9 @@ macro_rules! call {
     }};
 }
 
+/// This server's own settings, plus secrets (TMDB key, cloud session) no device may read or change.
 fn private_setting(key: &str) -> bool {
-    key.starts_with(PRIVATE_SETTING_PREFIX)
+    key.starts_with(PRIVATE_SETTING_PREFIX) || super::secret_setting(key)
 }
 
 /// Runs an allow-listed desktop command for a paired device. Everything that opens windows on
@@ -869,6 +870,9 @@ async fn dispatch(app: &AppHandle, command: &str, v: Value) -> Result<Value, Str
         "cache_media_metadata" => call!(app, v, d::cache_media_metadata, [state], entries: Vec<queries::MediaCatalogEntry>),
         "get_cached_media" => call!(app, v, d::get_cached_media, [state], tmdb_id: i64, media_type: String),
         "list_custom_hubs" => call!(app, v, d::list_custom_hubs, [state], category_type: Option<String>),
+        // TMDB through the PC (the key never reaches the device).
+        "tmdb_get" => call!(app, v, d::tmdb_get, [state], path: String, params: Option<HashMap<String, String>>),
+        "tmdb_status" => call!(app, v, d::tmdb_status, [state]),
         "upsert_custom_hubs" => call!(app, v, d::upsert_custom_hubs, [state], hubs: Vec<queries::CustomHub>),
 
         // Deep links & provider choice.

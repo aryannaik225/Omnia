@@ -42,7 +42,7 @@ const ALLOWED: Array<{ label: string; sub: string; y: number; from: ModId; d: st
 const BLOCKED = [
   { label: "Analytics", y: 412, d: "M510 320 C600 320 660 420 736 420" },
   { label: "Ad networks", y: 452, d: "M510 328 C590 328 650 460 736 460" },
-  { label: "Cloud sync", y: 492, d: "M510 334 C580 334 640 500 736 500" },
+  { label: "Crash reporters", y: 492, d: "M510 334 C580 334 640 500 736 500" },
 ];
 
 const PROMISES = [
@@ -311,7 +311,7 @@ export function Privacy() {
                   </>
                 ) : (
                   <>
-                    <span className="font-semibold text-white">Five hosts, all named.</span> Three are two-way (⇄): a search goes to TMDB, a title to JustWatch, and your own OTT streams into its sealed window. Two are one-way (←): a signed update from GitHub and your region, once, from ipwho.is; nothing about you goes with them. Analytics, ads and cloud sync don&apos;t have a door, so nothing ever travels that way.
+                    <span className="font-semibold text-white">Five hosts, all named.</span> Three are two-way (⇄): a search goes to TMDB, a title to JustWatch, and your own OTT streams into its sealed window. Two are one-way (←): a signed update from GitHub and your region, once, from ipwho.is; nothing about you goes with them. Analytics, ads and crash reporters don&apos;t have a door, so nothing ever travels that way. Cloud sync is opt-in: it stays off until you sign in, and then carries only your watchlist, what you&apos;ve watched and a profile picture (<a href="/privacy" className="underline decoration-white/30 underline-offset-2 hover:text-white">Privacy Policy</a>).
                   </>
                 )}
               </motion.p>

@@ -49,6 +49,8 @@ interface PosterCardProps {
   width?: number | "fill";
   /** 0..1 progress bar over the bottom of the artwork. */
   progress?: number | null;
+  /** Bar colour: white (default), the in-progress accent, or the completed green. */
+  progressTone?: "default" | "progress" | "complete";
   /** Secondary line under the title (e.g. "S2 E1 · Episode title"). */
   subtitle?: string | null;
   /** Element shown in the artwork's top-right corner on hover (e.g. remove). */
@@ -67,6 +69,7 @@ export const PosterCard = memo(function PosterCard({
   caption,
   width = 168,
   progress,
+  progressTone = "default",
   subtitle,
   cornerAction,
   hideMeta = false,
@@ -101,7 +104,10 @@ export const PosterCard = memo(function PosterCard({
         {progress != null && (
           <span className="absolute inset-x-2.5 bottom-2.5 block">
             <span className="progress-track block !bg-black/40">
-              <span className="progress-fill block" style={{ width: `${Math.max(3, Math.min(100, progress * 100))}%` }} />
+              <span
+                className={`progress-fill block ${progressTone === "progress" ? "!bg-[#0a84ff]" : progressTone === "complete" ? "!bg-[#30d158]" : ""}`}
+                style={{ width: `${Math.max(3, Math.min(100, progress * 100))}%` }}
+              />
             </span>
           </span>
         )}
@@ -246,7 +252,7 @@ export const LandscapeCard = memo(function LandscapeCard({ title, imagePath, sub
           {subtitle && <span className="mt-0.5 block truncate text-[12px] text-white/75">{subtitle}</span>}
           {progress != null && (
             <span className="progress-track mt-2 block">
-              <span className="progress-fill block" style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }} />
+              <span className={`progress-fill block ${progress >= 1 ? "!bg-[#30d158]" : "!bg-[#0a84ff]"}`} style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }} />
             </span>
           )}
         </span>

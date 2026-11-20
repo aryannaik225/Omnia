@@ -422,6 +422,123 @@
     opacity: 1;
   }
 
+  /* ---- Release status card (Where to watch while a title isn't streaming yet) -------- */
+  .release-card {
+    --tint: 100, 190, 255;
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 20px;
+    overflow: hidden;
+    border-radius: var(--radius-panel);
+    padding: 18px 22px 18px 18px;
+    background:
+      radial-gradient(120% 140% at 0% 0%, rgba(var(--tint), 0.2) 0%, rgba(var(--tint), 0.06) 38%, transparent 70%),
+      linear-gradient(135deg, rgba(var(--tint), 0.08), rgba(18, 18, 22, 0.7) 60%);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+    box-shadow:
+      var(--specular-top),
+      inset 0 0 0 1px rgba(var(--tint), 0.32),
+      0 18px 50px -18px rgba(var(--tint), 0.55),
+      0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+  .release-card::after {
+    /* Specular sweep along the top edge. */
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(var(--tint), 0.9) 30%, rgba(255, 255, 255, 0.7) 50%, rgba(var(--tint), 0.9) 70%, transparent);
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  .release-card--amber {
+    --tint: 255, 176, 64;
+  }
+  .release-card--indigo {
+    --tint: 138, 128, 255;
+  }
+  .release-card--cyan {
+    --tint: 80, 200, 255;
+  }
+  .release-tile {
+    position: relative;
+    display: flex;
+    width: 76px;
+    flex-shrink: 0;
+    flex-direction: column;
+    align-items: center;
+    overflow: hidden;
+    border-radius: 16px;
+    background: rgba(10, 10, 14, 0.55);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2), inset 0 0 0 1px rgba(var(--tint), 0.28), 0 10px 26px rgba(0, 0, 0, 0.4);
+  }
+  .release-tile-month {
+    width: 100%;
+    padding: 4px 0 3px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #0b0b0f;
+    background: linear-gradient(180deg, rgb(var(--tint)), rgba(var(--tint), 0.78));
+  }
+  .release-tile-day {
+    padding-top: 4px;
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1.05;
+    letter-spacing: -0.04em;
+    font-variant-numeric: tabular-nums;
+  }
+  .release-tile-week {
+    padding-bottom: 7px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--label-tertiary);
+  }
+  .release-icon {
+    display: inline-flex;
+    height: 30px;
+    width: 30px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: rgb(var(--tint));
+    background: rgba(var(--tint), 0.16);
+    box-shadow: inset 0 0 0 1px rgba(var(--tint), 0.3);
+  }
+  .release-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    border-radius: 999px;
+    padding: 5px 11px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #0b0b0f;
+    background: linear-gradient(135deg, rgb(var(--tint)), rgba(var(--tint), 0.75));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 4px 16px -4px rgba(var(--tint), 0.8);
+  }
+  .release-live-dot {
+    height: 7px;
+    width: 7px;
+    border-radius: 999px;
+    background: #0b0b0f;
+    animation: release-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes release-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.7); }
+  }
+
   .badge {
     @apply inline-flex items-center rounded-md px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide;
     background: rgba(255, 255, 255, 0.14);

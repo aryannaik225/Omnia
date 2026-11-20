@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tmdb-status"
+description = "Enables the tmdb_status command without any pre-configured scope."
+commands.allow = ["tmdb_status"]
+
+[[permission]]
+identifier = "deny-tmdb-status"
+description = "Denies the tmdb_status command without any pre-configured scope."
+commands.deny = ["tmdb_status"]

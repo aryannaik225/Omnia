@@ -7,7 +7,7 @@ import { isRemote } from "../services/platform";
 import { create } from "zustand";
 import { registryAsCustomHubs } from "../config/hubsRegistry";
 import { detectRegionByIp } from "../services/catalog";
-import { envTmdbKey, hasTmdbCredential, setTmdbCredential, summaryToCatalogEntry, type CatalogContext, type MediaSummary } from "../services/tmdbClient";
+import { hasTmdbCredential, setTmdbConfigured, summaryToCatalogEntry, tmdbStatus, type CatalogContext, type MediaSummary, type TmdbStatus } from "../services/tmdbClient";
 import {
   catalog,
   history,
@@ -29,7 +29,7 @@ import {
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
 import { providerFamily } from "../lib/providers";
 
-export type View = "home" | "search" | "continue" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote" | "browse";
+export type View = "home" | "search" | "continue" | "library" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote" | "browse";
 
 /** A Home row registry entry (see config/homeRows): `arg` / `label` parameterise it (provider ids, seed titles). */
 export interface RowRef {
@@ -77,12 +77,16 @@ interface AppState {
   kidsSafeMode: boolean;
   trailerAutoplay: boolean;
   tmdbReady: boolean;
+  /** Where the backend's TMDB key comes from (the key itself never reaches the UI). */
+  tmdbSource: TmdbStatus["source"];
 
   view: View;
   activeHub: string | null;
   /** Full-page grid target while `view === "browse"`, and the view Back returns to. */
   browse: BrowseTarget | null;
   browseFrom: View;
+  /** My Library: a section's full grid ("watchlist", "ongoing", …), or null for the overview. */
+  librarySection: string | null;
   /** Provider family key (see lib/providers) shown exclusively, or null. */
   providerFilter: string | null;
   searchQuery: string;
@@ -100,6 +104,8 @@ interface AppState {
   continueWatchingLoaded: boolean;
   watchlist: WatchlistItem[];
   watchlistKeys: Set<string>;
+  /** Bumped whenever watch history may have changed (My Library re-reads it). */
+  libraryVersion: number;
   recs: RecommendationsResponse | null;
   recsLoading: boolean;
   recsError: string | null;
@@ -124,7 +130,7 @@ interface AppState {
   setTrailerAutoplay: (on: boolean) => Promise<void>;
   setTmdbKey: (key: string) => Promise<void>;
 
-  navigate: (view: View, opts?: { hub?: string | null; browse?: BrowseTarget }) => void;
+  navigate: (view: View, opts?: { hub?: string | null; browse?: BrowseTarget; librarySection?: string | null }) => void;
   rememberScroll: (view: View, top: number) => void;
   setSearchQuery: (q: string) => void;
   setProviderFilter: (familyKey: string | null) => void;
@@ -170,11 +176,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   kidsSafeMode: false,
   trailerAutoplay: true,
   tmdbReady: false,
+  tmdbSource: null,
 
   view: "home",
   activeHub: null,
   browse: null,
   browseFrom: "home",
+  librarySection: null,
   providerFilter: null,
   searchQuery: "",
   sidebarPinned: false,
@@ -189,6 +197,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   continueWatchingLoaded: false,
   watchlist: [],
   watchlistKeys: new Set(),
+  libraryVersion: 0,
   recs: null,
   recsLoading: false,
   recsError: null,
@@ -204,13 +213,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       let all = await settingsApi.getAll();
 
-      // TMDB credential: .env wins and is mirrored into local settings for the Rust side.
-      const stored = all[SettingKeys.tmdbApiKey] ?? "";
-      if (envTmdbKey && envTmdbKey !== stored) {
-        await settingsApi.set(SettingKeys.tmdbApiKey, envTmdbKey);
-      } else if (!envTmdbKey && stored) {
-        setTmdbCredential(stored);
-      }
+      // TMDB: the key lives in Rust (bundled at build time or pasted in Settings); ask if there is one.
+      const tmdb = await tmdbStatus().catch((): TmdbStatus => ({ configured: false, source: null }));
+      setTmdbConfigured(tmdb.configured);
 
       // Region: IP geolocation on first launch, and on every launch while in auto mode
       // (travellers); a manual (VPN) choice is never overridden.
@@ -240,6 +245,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         trailerAutoplay: all[TRAILER_AUTOPLAY] !== "false",
         sidebarPinned: all[SIDEBAR_PINNED] === "true",
         tmdbReady: hasTmdbCredential(),
+        tmdbSource: tmdb.source,
         hubs: hubList,
         profiles: profileList,
         profileGateOpen: true,
@@ -354,8 +360,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setTmdbKey: async (key) => {
     await settingsApi.set(SettingKeys.tmdbApiKey, key.trim());
-    setTmdbCredential(key);
-    set({ tmdbReady: hasTmdbCredential() });
+    const tmdb = await tmdbStatus();
+    setTmdbConfigured(tmdb.configured);
+    set({ tmdbReady: hasTmdbCredential(), tmdbSource: tmdb.source });
     void get().loadRecommendations(true);
   },
 
@@ -365,7 +372,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   navigate: (view, opts) =>
     set((s) => {
-      const base = { view, activeHub: opts?.hub !== undefined ? opts.hub : view === "hubs" ? s.activeHub : null };
+      const base = {
+        view,
+        activeHub: opts?.hub !== undefined ? opts.hub : view === "hubs" ? s.activeHub : null,
+        librarySection: view === "library" ? (opts?.librarySection !== undefined ? opts.librarySection : null) : null,
+      };
       if (view !== "browse") return { ...base, browse: null };
       // Every grid opens at the top; Back returns to the view (and scroll position) it came from.
       return {
@@ -399,7 +410,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const p = get().activeProfile;
     if (!p) return;
     const items = await history.continueWatching(p.profileId, 30);
-    if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: items, continueWatchingLoaded: true });
+    if (get().activeProfile?.profileId === p.profileId) set((s) => ({ continueWatching: items, continueWatchingLoaded: true, libraryVersion: s.libraryVersion + 1 }));
   },
 
   hideFromContinueWatching: async (tmdbId, mediaType, title) => {
@@ -421,7 +432,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!p) return false;
     try {
       const r = await history.clearAll(p.profileId);
-      if (get().activeProfile?.profileId === p.profileId) set({ continueWatching: [], recsStale: true });
+      if (get().activeProfile?.profileId === p.profileId) set((s) => ({ continueWatching: [], recsStale: true, libraryVersion: s.libraryVersion + 1 }));
       get().toast({
         kind: "success",
         title: "Watch history cleared",

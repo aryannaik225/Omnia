@@ -30,6 +30,7 @@ import wordmark from "./assets/omnia-wordmark.png";
 
 // Secondary screens load on demand to keep the startup bundle small.
 const SettingsView = lazy(() => import("./components/settings/SettingsView").then((mod) => ({ default: mod.SettingsView })));
+const MyLibraryView = lazy(() => import("./components/views/LibraryView").then((mod) => ({ default: mod.MyLibraryView })));
 const CollectionsView = lazy(() => import("./components/views/CollectionsView").then((mod) => ({ default: mod.CollectionsView })));
 const HubsView = lazy(() => import("./components/views/HubsView").then((mod) => ({ default: mod.HubsView })));
 const BrowseCategoryView = lazy(() => import("./components/views/BrowseCategoryView").then((mod) => ({ default: mod.BrowseCategoryView })));
@@ -45,6 +46,8 @@ function CurrentView({ view }: { view: View }) {
       return <SearchView />;
     case "continue":
       return <ContinueWatchingView />;
+    case "library":
+      return <MyLibraryView />;
     case "myotts":
       return <MyOttsView />;
     case "hubs":
@@ -66,6 +69,7 @@ function Shell() {
   const view = useAppStore((s) => s.view);
   const activeHub = useAppStore((s) => s.activeHub);
   const browse = useAppStore((s) => browseKey(s.browse));
+  const librarySection = useAppStore((s) => s.librarySection);
   const pinned = useAppStore((s) => s.sidebarPinned);
   const rememberScroll = useAppStore((s) => s.rememberScroll);
   const profileId = useAppStore((s) => s.activeProfile?.profileId);
@@ -132,7 +136,7 @@ function Shell() {
         </header>
         <AnimatePresence mode="wait" onExitComplete={finishRestore}>
           <m.div
-            key={view === "browse" ? `browse:${browse}` : view}
+            key={view === "browse" ? `browse:${browse}` : view === "library" ? `library:${librarySection ?? ""}` : view}
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
@@ -200,6 +204,10 @@ function appBack(): boolean {
   }
   if (s.view === "hubs" && s.activeHub) {
     s.navigate("hubs", { hub: null });
+    return true;
+  }
+  if (s.view === "library" && s.librarySection) {
+    s.navigate("library", { librarySection: null });
     return true;
   }
   if (s.view !== "home" && !s.profileGateOpen) {

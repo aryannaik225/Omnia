@@ -1,21 +1,30 @@
 /**
  * TMDB client for the catalog UI: regional discovery, search, details, hubs.
  * Only public catalog metadata is requested; no user data is ever sent.
+ * Requests go through the Rust backend (`tmdb_get`), which adds the API key: the key is never
+ * in this bundle, in the webview or in a request a browser could inspect (phones and TVs reach
+ * TMDB through the PC the same way). Images load straight from image.tmdb.org (no key needed).
  * Responses are cached in memory (with in-flight de-duplication) to keep the UI instant.
  */
+import { invoke } from "./platform";
 import type { MediaCatalogEntry, MediaType, TmdbProviderHint } from "./tauriBridge";
 
-const ENV_KEY = (import.meta.env.TMDB_API_KEY || import.meta.env.VITE_TMDB_API_KEY || "").trim();
-let credential = ENV_KEY;
+let configured = false;
 
-export const envTmdbKey = ENV_KEY;
-export const setTmdbCredential = (key: string) => {
-  credential = key.trim();
+/** Whether the backend has a TMDB key (see `tmdb.status()`); set by the app store. */
+export const setTmdbConfigured = (on: boolean) => {
+  configured = on;
   cache.clear();
 };
-export const hasTmdbCredential = () => credential.length > 0;
+export const hasTmdbCredential = () => configured;
 
-const API = "https://api.themoviedb.org/3";
+export interface TmdbStatus {
+  configured: boolean;
+  /** "settings" (pasted in Settings) or "bundled" (TMDB_API_KEY at build time). */
+  source: "settings" | "bundled" | null;
+}
+export const tmdbStatus = () => invoke<TmdbStatus>("tmdb_status");
+
 const IMG = "https://image.tmdb.org/t/p";
 
 export type ImageSize = "w92" | "w154" | "w185" | "w300" | "w342" | "w500" | "w780" | "w1280" | "original" | "h632";
@@ -36,15 +45,17 @@ const cache = new Map<string, { at: number; data: unknown }>();
 const inflight = new Map<string, Promise<unknown>>();
 const DEFAULT_TTL = 10 * 60_000;
 
+export async function tmdbRequest<T>(path: string, params: Params = {}, ttl = DEFAULT_TTL): Promise<T> {
+  return request<T>(path, params, ttl);
+}
+
 async function request<T>(path: string, params: Params = {}, ttl = DEFAULT_TTL): Promise<T> {
-  if (!credential) throw new TmdbError("TMDB API key missing. Add TMDB_API_KEY to .env or in Settings.");
-  const url = new URL(API + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
+  if (!configured) throw new TmdbError("TMDB API key missing. Add TMDB_API_KEY to .env or in Settings.");
+  const query: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params).sort(([a], [b]) => a.localeCompare(b))) {
+    if (v !== undefined && v !== null && v !== "") query[k] = String(v);
   }
-  const bearer = credential.startsWith("eyJ");
-  if (!bearer) url.searchParams.set("api_key", credential);
-  const key = url.toString();
+  const key = `${path}?${new URLSearchParams(query).toString()}`;
 
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return hit.data as T;
@@ -53,16 +64,15 @@ async function request<T>(path: string, params: Params = {}, ttl = DEFAULT_TTL):
 
   const run = (async () => {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const res = await fetch(key, {
-        headers: bearer ? { Authorization: `Bearer ${credential}`, Accept: "application/json" } : { Accept: "application/json" },
-      });
+      // Rust retries rate limits itself; this loop only covers a 429 that outlasted those.
+      const res = await invoke<{ status: number; body: unknown }>("tmdb_get", { path, params: query });
       if (res.status === 429) {
         await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
         continue;
       }
       if (res.status === 401) throw new TmdbError("TMDB rejected the API key.", 401);
-      if (!res.ok) throw new TmdbError(`TMDB request failed (${res.status})`, res.status);
-      const data = (await res.json()) as T;
+      if (res.status < 200 || res.status >= 300) throw new TmdbError(`TMDB request failed (${res.status})`, res.status);
+      const data = res.body as T;
       cache.set(key, { at: Date.now(), data });
       if (cache.size > 800) cache.delete(cache.keys().next().value as string);
       return data;
@@ -287,6 +297,14 @@ export interface SeasonSummary {
   airDate: string | null;
 }
 
+export interface ReleaseDate {
+  region: string;
+  type: number;
+  /** YYYY-MM-DD */
+  date: string;
+  note: string | null;
+}
+
 export interface MediaDetails extends MediaSummary {
   tagline: string | null;
   runtimeMins: number | null;
@@ -304,6 +322,10 @@ export interface MediaDetails extends MediaSummary {
   recommendations: MediaSummary[];
   seasons: SeasonSummary[];
   numberOfSeasons: number | null;
+  /** Movie release dates per region (TMDB types: 1 premiere, 2 limited, 3 theatrical, 4 digital, 5 physical, 6 TV). */
+  releaseDates: ReleaseDate[];
+  /** TV: the next scheduled episode, if TMDB has one. */
+  nextEpisodeToAir: { seasonNumber: number; episodeNumber: number; name: string; airDate: string | null } | null;
   imdbId: string | null;
   providersByRegion: Record<string, RegionProviders>;
   status: string | null;
@@ -405,6 +427,19 @@ export async function details(mt: MediaType, id: number, region: string): Promis
         airDate: s.air_date ?? null,
       })),
     numberOfSeasons: raw.number_of_seasons ?? null,
+    releaseDates: (raw.release_dates?.results ?? []).flatMap((r: any) =>
+      (r.release_dates ?? [])
+        .filter((x: any) => typeof x.release_date === "string" && x.release_date.length >= 10)
+        .map((x: any) => ({ region: r.iso_3166_1, type: Number(x.type) || 0, date: x.release_date.slice(0, 10), note: x.note || null })),
+    ),
+    nextEpisodeToAir: raw.next_episode_to_air
+      ? {
+          seasonNumber: raw.next_episode_to_air.season_number,
+          episodeNumber: raw.next_episode_to_air.episode_number,
+          name: raw.next_episode_to_air.name ?? "",
+          airDate: raw.next_episode_to_air.air_date || null,
+        }
+      : null,
     imdbId: raw.external_ids?.imdb_id ?? raw.imdb_id ?? null,
     providersByRegion: mapProviders(raw["watch/providers"]),
     status: raw.status ?? null,

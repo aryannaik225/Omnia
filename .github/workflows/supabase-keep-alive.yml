@@ -1,0 +1,50 @@
+name: Supabase keep-alive
+
+# Free-tier Supabase projects pause after a week without activity. This pings the database
+# every 3 days through the public `keep_alive()` function (supabase/schema.sql), which returns
+# only the server time: no user data is read and only the public anon key is used.
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   SUPABASE_URL       https://<project-ref>.supabase.co
+#   SUPABASE_ANON_KEY  the anon / publishable key (never the service-role key)
+
+on:
+  schedule:
+    - cron: "0 0 */3 * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "::error::Set the SUPABASE_URL and SUPABASE_ANON_KEY repository secrets."
+            exit 1
+          fi
+          case "$SUPABASE_ANON_KEY" in
+            sb_secret_*) echo "::error::SUPABASE_ANON_KEY is a secret key. Use the anon / publishable key."; exit 1 ;;
+          esac
+          url="${SUPABASE_URL%/}/rest/v1/rpc/keep_alive"
+          for attempt in 1 2 3; do
+            status=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 30 -X POST "$url" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{}' || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "Supabase is awake (server time $(cat /tmp/body))."
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $status"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Supabase keep-alive ping failed (last HTTP status $status). Was supabase/schema.sql run?"
+          exit 1

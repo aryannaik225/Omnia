@@ -219,6 +219,7 @@ export const OmniaEvents = {
   historyImportProgress: "omnia://history-import-progress",
   historyImportFinished: "omnia://history-import-finished",
   backgroundSync: "omnia://background-sync",
+  cloudSync: "omnia://cloud-sync",
 } as const;
 
 export const BACK_TO_HUB_EVENT = OmniaEvents.backToHub;
@@ -600,6 +601,8 @@ export const events = {
   onHistoryImportFinished: on<ImportFinishedEvent>(OmniaEvents.historyImportFinished),
   /** A quiet background delta sync stored new activity (e.g. watched on another device). */
   onBackgroundSync: on<{ appProfileId: number; providerName: string; updated: number }>(OmniaEvents.backgroundSync),
+  /** Optional cloud sync applied changes made on the web app / another device. */
+  onCloudSync: on<{ appProfileId: number; applied: number; profileUpdated: boolean }>(OmniaEvents.cloudSync),
   /** A key from the phone remote aimed at this PC (the open player handles its own keys). */
   onRemoteKey: on<{ key: string }>("omnia://remote-key"),
 };
@@ -751,6 +754,42 @@ export interface LanStatus {
   devices: LanDevice[];
   error: string | null;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Optional cloud sync (desktop only; Rust holds the session, the UI never sees a token)
+// ---------------------------------------------------------------------------------------------
+
+export interface CloudStatus {
+  /** This build has SUPABASE_URL / SUPABASE_ANON_KEY. */
+  configured: boolean;
+  signedIn: boolean;
+  email: string | null;
+  /** The local profile synced with the account. */
+  profileId: number | null;
+  profileName: string | null;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  /** Local changes waiting to upload. */
+  pending: number;
+  googleRedirect: string;
+}
+
+export interface CloudSyncReport {
+  pushed: number;
+  applied: number;
+  profileUpdated: boolean;
+}
+
+export const cloud = {
+  status: () => invoke<CloudStatus>("cloud_status"),
+  signIn: (email: string, password: string, appProfileId: number) => invoke<CloudStatus>("cloud_sign_in", { email, password, appProfileId }),
+  signUp: (email: string, password: string, appProfileId: number) =>
+    invoke<{ signedIn: boolean; status: CloudStatus }>("cloud_sign_up", { email, password, appProfileId }),
+  signInWithGoogle: (appProfileId: number) => invoke<CloudStatus>("cloud_sign_in_google", { appProfileId }),
+  signOut: () => invoke<CloudStatus>("cloud_sign_out"),
+  /** `null` when signed out (nothing is sent). */
+  syncNow: () => invoke<CloudSyncReport | null>("cloud_sync_now"),
+};
 
 export const LAN_CHANGED_EVENT = "omnia://lan-changed";
 

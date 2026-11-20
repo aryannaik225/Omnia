@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tmdb-get"
+description = "Enables the tmdb_get command without any pre-configured scope."
+commands.allow = ["tmdb_get"]
+
+[[permission]]
+identifier = "deny-tmdb-get"
+description = "Denies the tmdb_get command without any pre-configured scope."
+commands.deny = ["tmdb_get"]

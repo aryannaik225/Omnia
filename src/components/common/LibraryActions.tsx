@@ -128,7 +128,9 @@ export function EpisodeWatchedToggle({
   episodeTitle,
   runtimeMins,
   entry,
+  aired = true,
   onChanged,
+  onMarked,
 }: {
   tmdbId: number;
   seasonNumber: number;
@@ -136,7 +138,11 @@ export function EpisodeWatchedToggle({
   episodeTitle: string;
   runtimeMins: number | null | undefined;
   entry: WatchHistoryEntry | undefined;
+  /** Unaired episodes can't be marked yet. */
+  aired?: boolean;
   onChanged: () => void;
+  /** After a new mark (not an undo): e.g. offer to mark the earlier episodes too. */
+  onMarked?: () => void;
 }) {
   const profile = useAppStore((s) => s.activeProfile);
   const toast = useAppStore((s) => s.toast);
@@ -159,6 +165,7 @@ export function EpisodeWatchedToggle({
         });
       onChanged();
       refresh();
+      if (!handMade && !watched) onMarked?.();
     } catch (e) {
       toast({ kind: "error", title: "Couldn't update history", body: errorText(e) });
     } finally {
@@ -166,12 +173,18 @@ export function EpisodeWatchedToggle({
     }
   };
 
-  const label = handMade ? `Unmark episode ${episodeNumber}` : watched ? `Episode ${episodeNumber} watched: record a rewatch` : `Mark episode ${episodeNumber} as watched`;
+  const label = !aired && !watched
+    ? `Episode ${episodeNumber} hasn't aired yet`
+    : handMade
+      ? `Unmark episode ${episodeNumber}`
+      : watched
+        ? `Episode ${episodeNumber} watched: record a rewatch`
+        : `Mark episode ${episodeNumber} as watched`;
   return (
     <button
       type="button"
       onClick={() => void run()}
-      disabled={busy}
+      disabled={busy || (!aired && !watched)}
       aria-label={label}
       title={label}
       className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
