@@ -350,7 +350,7 @@ fn seed_outbox(c: &Connection, profile_id: i64) -> rusqlite::Result<()> {
                 CASE WHEN media_type = 'movie' THEN 0 ELSE episode_number END,
                 COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', last_watched_at), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
            FROM watch_history
-          WHERE app_profile_id = ?1 AND is_completed = 1 AND (media_type = 'movie' OR episode_number > 0)",
+          WHERE app_profile_id = ?1 AND is_completed = 1",
         [profile_id],
     )?;
     Ok(())
@@ -546,6 +546,8 @@ struct OutboxItem {
     changed_at: String,
     /// Current local state: Some((added / watched at, duration seconds)) when present.
     present: Option<(Option<String>, f64)>,
+    /// Episode title (sent for unnumbered episodes, which have nothing else to show).
+    episode_title: Option<String>,
 }
 
 fn read_outbox(c: &Connection, profile_id: i64) -> rusqlite::Result<Vec<OutboxItem>> {
@@ -562,7 +564,9 @@ fn read_outbox(c: &Connection, profile_id: i64) -> rusqlite::Result<Vec<OutboxIt
                           AND h.season_number = o.season_number AND h.episode_number = o.episode_number)
                 END AS at,
                 COALESCE((SELECT h.duration_seconds FROM watch_history h WHERE o.kind <> 'watchlist' AND h.app_profile_id = o.app_profile_id AND h.tmdb_id = o.tmdb_id
-                          AND h.media_type = o.media_type AND h.season_number = o.season_number AND h.episode_number = o.episode_number), 0)
+                          AND h.media_type = o.media_type AND h.season_number = o.season_number AND h.episode_number = o.episode_number), 0),
+                (SELECT h.episode_title FROM watch_history h WHERE o.kind = 'episode' AND h.app_profile_id = o.app_profile_id AND h.tmdb_id = o.tmdb_id
+                          AND h.media_type = o.media_type AND h.season_number = o.season_number AND h.episode_number = o.episode_number)
            FROM cloud_outbox o
           WHERE o.app_profile_id = ?1
           ORDER BY o.changed_at",
@@ -577,6 +581,7 @@ fn read_outbox(c: &Connection, profile_id: i64) -> rusqlite::Result<Vec<OutboxIt
             episode: r.get(4)?,
             changed_at: r.get(5)?,
             present: present.map(|_| (r.get::<_, Option<String>>(7).ok().flatten(), r.get::<_, f64>(8).unwrap_or(0.0))),
+            episode_title: r.get::<_, Option<String>>(9).ok().flatten().map(|t| t.chars().take(200).collect()),
         })
     })?;
     rows.collect()
@@ -587,13 +592,20 @@ fn runtime_minutes(duration_seconds: f64) -> Option<i64> {
     (duration_seconds > 60.0).then(|| (duration_seconds / 60.0).round() as i64).filter(|m| (1..1000).contains(m))
 }
 
-async fn push(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<usize> {
-    let items = state.db.run(move |c| read_outbox(c, profile_id)).await?;
+/// Shown when the Supabase project predates unnumbered-episode support.
+const SCHEMA_UPGRADE_HINT: &str = "Some episodes without an episode number couldn't sync yet: re-run supabase/schema.sql in the Supabase SQL Editor.";
+
+/// Uploads the outbox. Returns how many items went up, and a warning when unnumbered episodes
+/// were refused (an older schema): those stay queued and everything else still syncs.
+async fn push(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<(usize, Option<String>)> {
+    let mut items = state.db.run(move |c| read_outbox(c, profile_id)).await?;
     if items.is_empty() {
-        return Ok(0);
+        return Ok((0, None));
     }
     let uid = api.user_id.as_str();
     let (mut wl_up, mut wl_del, mut mv_up, mut mv_del, mut ep_up, mut ep_del) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    // Unnumbered episodes (episode 0) carry their title and go in their own batch.
+    let (mut ep0_up, mut ep0_del) = (vec![], vec![]);
     for it in &items {
         let changed = to_iso(Some(&it.changed_at));
         match (it.kind.as_str(), &it.present) {
@@ -611,15 +623,23 @@ async fn push(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<usi
             ("movie", None) => mv_del.push(json!({
                 "user_id": uid, "tmdb_id": it.tmdb_id, "media_type": "movie", "updated_at": changed, "deleted_at": changed,
             })),
+            ("episode", Some((at, dur))) if it.episode == 0 => ep0_up.push(json!({
+                "user_id": uid, "tmdb_id": it.tmdb_id, "media_type": "tv", "season_number": it.season, "episode_number": 0,
+                "status": "watched", "runtime_minutes": runtime_minutes(*dur), "watched_at": to_iso(at.as_deref()),
+                "episode_title": it.episode_title, "updated_at": changed, "deleted_at": null,
+            })),
             ("episode", Some((at, dur))) => ep_up.push(json!({
                 "user_id": uid, "tmdb_id": it.tmdb_id, "media_type": "tv", "season_number": it.season, "episode_number": it.episode,
                 "status": "watched", "runtime_minutes": runtime_minutes(*dur), "watched_at": to_iso(at.as_deref()),
                 "updated_at": changed, "deleted_at": null,
             })),
-            ("episode", None) => ep_del.push(json!({
-                "user_id": uid, "tmdb_id": it.tmdb_id, "media_type": "tv", "season_number": it.season, "episode_number": it.episode,
-                "updated_at": changed, "deleted_at": changed,
-            })),
+            ("episode", None) => {
+                let row = json!({
+                    "user_id": uid, "tmdb_id": it.tmdb_id, "media_type": "tv", "season_number": it.season, "episode_number": it.episode,
+                    "updated_at": changed, "deleted_at": changed,
+                });
+                if it.episode == 0 { ep0_del.push(row) } else { ep_del.push(row) }
+            }
             _ => {}
         }
     }
@@ -632,6 +652,17 @@ async fn push(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<usi
     api.upsert("tracked_movies", MV, &mv_del).await?;
     api.upsert("tracked_episodes", EP, &ep_up).await?;
     api.upsert("tracked_episodes", EP, &ep_del).await?;
+    let mut warning = None;
+    let unnumbered = async {
+        api.upsert("tracked_episodes", EP, &ep0_up).await?;
+        api.upsert("tracked_episodes", EP, &ep0_del).await
+    }
+    .await;
+    if let Err(e) = unnumbered {
+        log::warn!("unnumbered episodes not synced ({e}); the Supabase schema needs updating");
+        items.retain(|it| !(it.kind == "episode" && it.episode == 0));
+        warning = Some(SCHEMA_UPGRADE_HINT.to_string());
+    }
 
     // Done: drop exactly what was sent (a change made meanwhile has a newer changed_at and stays).
     let n = items.len();
@@ -651,7 +682,7 @@ async fn push(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<usi
             tx.commit()
         })
         .await?;
-    Ok(n)
+    Ok((n, warning))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -670,6 +701,7 @@ struct Remote {
     /// added_at (watchlist) / watched_at.
     at: DateTime<Utc>,
     runtime_minutes: Option<i64>,
+    episode_title: Option<String>,
 }
 
 fn parse_remote(kind: &'static str, v: &Value) -> Option<Remote> {
@@ -683,7 +715,8 @@ fn parse_remote(kind: &'static str, v: &Value) -> Option<Remote> {
     let updated_at = s("updated_at").and_then(parse_ts)?;
     let at = s(if kind == "watchlist" { "added_at" } else { "watched_at" }).and_then(parse_ts).unwrap_or(updated_at);
     let (season, episode) = if kind == "episode" {
-        (v.get("season_number")?.as_i64().filter(|n| *n >= 0)?, v.get("episode_number")?.as_i64().filter(|n| *n > 0)?)
+        // Episode 0 = an unnumbered episode (kept under its season, like the importer does).
+        (v.get("season_number")?.as_i64().filter(|n| *n >= 0)?, v.get("episode_number")?.as_i64().filter(|n| *n >= 0)?)
     } else {
         (0, 0)
     };
@@ -697,6 +730,7 @@ fn parse_remote(kind: &'static str, v: &Value) -> Option<Remote> {
         deleted: v.get("deleted_at").is_some_and(|d| !d.is_null()),
         at,
         runtime_minutes: v.get("runtime_minutes").and_then(Value::as_i64).filter(|m| (1..1000).contains(m)),
+        episode_title: s("episode_title").map(|t| t.chars().take(200).collect()),
     })
 }
 
@@ -734,18 +768,19 @@ fn apply_remote(c: &mut Connection, profile_id: i64, rows: &[Remote]) -> rusqlit
                 let imported = r.at < live_after;
                 tx.execute(
                     "INSERT INTO watch_history
-                        (app_profile_id, tmdb_id, media_type, season_number, episode_number, provider_name,
+                        (app_profile_id, tmdb_id, media_type, season_number, episode_number, episode_title, provider_name,
                          progress_seconds, duration_seconds, is_completed, watch_count, abandoned, last_watched_at,
                          is_imported, is_manual)
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, 1, 1, 0, ?7, ?8, 1)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?9, NULL, ?6, ?6, 1, 1, 0, ?7, ?8, 1)
                      ON CONFLICT(app_profile_id, tmdb_id, media_type, season_number, episode_number) DO UPDATE SET
                         is_completed = 1,
+                        episode_title = COALESCE(watch_history.episode_title, excluded.episode_title),
                         abandoned = 0,
                         duration_seconds = MAX(watch_history.duration_seconds, excluded.duration_seconds),
                         progress_seconds = MAX(watch_history.duration_seconds, excluded.duration_seconds),
                         last_watched_at = MAX(watch_history.last_watched_at, excluded.last_watched_at)
                      WHERE watch_history.is_completed = 0",
-                    params![profile_id, r.tmdb_id, r.media_type, r.season, r.episode, duration, to_sqlite(r.at), imported],
+                    params![profile_id, r.tmdb_id, r.media_type, r.season, r.episode, duration, to_sqlite(r.at), imported, r.episode_title],
                 )?
             }
             (_, true) => tx.execute(
@@ -770,14 +805,18 @@ async fn pull(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<usi
     const TABLES: [(&str, &str, &str); 3] = [
         ("watchlist", "watchlist", "tmdb_id,media_type,added_at,updated_at,deleted_at,synced_at"),
         ("movie", "tracked_movies", "tmdb_id,runtime_minutes,watched_at,updated_at,deleted_at,synced_at"),
-        ("episode", "tracked_episodes", "tmdb_id,season_number,episode_number,runtime_minutes,watched_at,updated_at,deleted_at,synced_at"),
+        ("episode", "tracked_episodes", "tmdb_id,season_number,episode_number,episode_title,runtime_minutes,watched_at,updated_at,deleted_at,synced_at"),
     ];
     let mut applied = 0;
     for (kind, table, select) in TABLES {
         let cursor_key = format!("{}{table}", keys::CURSOR_PREFIX);
         let ck = cursor_key.clone();
         let since = state.db.run(move |c| queries::get_setting(c, &ck)).await?;
-        let rows = api.pull(table, select, since.as_deref()).await?;
+        let rows = match api.pull(table, select, since.as_deref()).await {
+            // An older schema has no episode_title column: pull without it.
+            Err(_) if select.contains(",episode_title") => api.pull(table, &select.replace(",episode_title", ""), since.as_deref()).await?,
+            r => r?,
+        };
         if rows.is_empty() {
             continue;
         }
@@ -1007,18 +1046,18 @@ pub async fn sync_once(app: &AppHandle) -> AppResult<Option<SyncReport>> {
         .await?;
     let Some(profile_id) = profile_id else { return Ok(None) };
 
-    let result: AppResult<SyncReport> = async {
+    let result: AppResult<(SyncReport, Option<String>)> = async {
         let (token, user_id) = access_token(&state).await?;
         let api = Api { http: &state.http, token, user_id };
-        let pushed = push(&state, &api, profile_id).await?;
+        let (pushed, warning) = push(&state, &api, profile_id).await?;
         let applied = pull(&state, &api, profile_id).await?;
         let profile_updated = sync_profile(&state, &api, profile_id).await?;
-        Ok(SyncReport { pushed, applied, profile_updated })
+        Ok((SyncReport { pushed, applied, profile_updated }, warning))
     }
     .await;
 
     let (ok, msg) = match &result {
-        Ok(_) => (true, None),
+        Ok((_, warning)) => (true, warning.clone()),
         Err(e) => (false, Some(e.to_string())),
     };
     let _ = state
@@ -1029,14 +1068,19 @@ pub async fn sync_once(app: &AppHandle) -> AppResult<Option<SyncReport>> {
             }
             if ok {
                 queries::set_setting(c, keys::LAST_SYNC, &now_iso())?;
-                queries::delete_setting(c, keys::LAST_ERROR)?;
+                match msg {
+                    Some(w) => queries::set_setting(c, keys::LAST_ERROR, &w)?,
+                    None => {
+                        queries::delete_setting(c, keys::LAST_ERROR)?;
+                    }
+                }
             } else if let Some(m) = msg {
                 queries::set_setting(c, keys::LAST_ERROR, &m)?;
             }
             Ok(())
         })
         .await;
-    let report = result?;
+    let (report, _) = result?;
     if report.applied > 0 || report.profile_updated {
         state.recommender.invalidate(profile_id);
         let _ = app.emit(EVT_CLOUD_SYNC, json!({ "appProfileId": profile_id, "applied": report.applied, "profileUpdated": report.profile_updated }));
@@ -1064,7 +1108,14 @@ pub fn spawn_loop(app: AppHandle) {
                     if !is_signed_in_locally(c)? {
                         return Ok(None);
                     }
-                    let pending: i64 = c.query_row("SELECT COUNT(*) FROM cloud_outbox", [], |r| r.get(0))?;
+                    // Unnumbered episodes refused by an outdated schema retry with the 2-minute pull, not every tick.
+                    let pending: i64 = c.query_row(
+                        "SELECT COUNT(*) FROM cloud_outbox
+                          WHERE NOT (kind = 'episode' AND episode_number = 0
+                                     AND EXISTS (SELECT 1 FROM app_settings WHERE key = ?1 AND value = ?2))",
+                        params![keys::LAST_ERROR, SCHEMA_UPGRADE_HINT],
+                        |r| r.get(0),
+                    )?;
                     Ok(Some(pending > 0))
                 })
                 .await
@@ -1312,9 +1363,9 @@ mod tests {
             queries::add_to_watchlist(c, 1, 700, "tv")?; // still pending, newer than the remote tombstone below
             let old = Utc::now() - chrono::Duration::days(1);
             let rows = vec![
-                Remote { kind: "watchlist", tmdb_id: 603, media_type: "movie".into(), season: 0, episode: 0, updated_at: Utc::now(), deleted: true, at: old, runtime_minutes: None },
-                Remote { kind: "watchlist", tmdb_id: 700, media_type: "tv".into(), season: 0, episode: 0, updated_at: old, deleted: true, at: old, runtime_minutes: None },
-                Remote { kind: "episode", tmdb_id: 1399, media_type: "tv".into(), season: 1, episode: 2, updated_at: Utc::now(), deleted: false, at: old, runtime_minutes: Some(55) },
+                Remote { kind: "watchlist", tmdb_id: 603, media_type: "movie".into(), season: 0, episode: 0, updated_at: Utc::now(), deleted: true, at: old, runtime_minutes: None, episode_title: None },
+                Remote { kind: "watchlist", tmdb_id: 700, media_type: "tv".into(), season: 0, episode: 0, updated_at: old, deleted: true, at: old, runtime_minutes: None, episode_title: None },
+                Remote { kind: "episode", tmdb_id: 1399, media_type: "tv".into(), season: 1, episode: 2, updated_at: Utc::now(), deleted: false, at: old, runtime_minutes: Some(55), episode_title: None },
             ];
             let applied = apply_remote(c, 1, &rows)?;
             assert_eq!(applied, 2);
@@ -1333,6 +1384,57 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unnumbered_episodes_sync_both_ways() {
+        let db = db_with_link().await;
+        db.run(|c| {
+            // An imported Netflix watch TMDB couldn't number: S2, episode 0, with its title.
+            c.execute(
+                "INSERT INTO watch_history (app_profile_id, tmdb_id, media_type, season_number, episode_number, episode_title, provider_name,
+                    progress_seconds, duration_seconds, is_completed) VALUES (1, 275204, 'tv', 2, 0, 'Saajan Chala Sasural', 'Netflix', 2700, 2700, 1)",
+                [],
+            )?;
+            let out = read_outbox(c, 1)?;
+            assert_eq!(out.len(), 1);
+            assert_eq!((out[0].season, out[0].episode), (2, 0));
+            assert_eq!(out[0].episode_title.as_deref(), Some("Saajan Chala Sasural"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let v = json!({ "tmdb_id": 99, "season_number": 3, "episode_number": 0, "episode_title": "Untitled", "watched_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-01T10:00:00Z", "deleted_at": null });
+        let r = parse_remote("episode", &v).expect("episode 0 is accepted");
+        assert_eq!((r.season, r.episode, r.episode_title.as_deref()), (3, 0, Some("Untitled")));
+        db.run(move |c| {
+            assert_eq!(apply_remote(c, 1, &[r])?, 1);
+            let t: Option<String> = c.query_row("SELECT episode_title FROM watch_history WHERE tmdb_id = 99 AND season_number = 3 AND episode_number = 0", [], |x| x.get(0))?;
+            assert_eq!(t.as_deref(), Some("Untitled"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_v10_queues_existing_unnumbered_rows_of_the_linked_profile() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let n = db
+            .run(|c| {
+                // Simulate a profile linked before v10: the row exists, nothing queued it.
+                c.execute(
+                    "INSERT INTO watch_history (app_profile_id, tmdb_id, media_type, season_number, episode_number, progress_seconds, duration_seconds, is_completed)
+                     VALUES (1, 275204, 'tv', 2, 0, 2700, 2700, 1)",
+                    [],
+                )?;
+                queries::set_setting(c, keys::PROFILE_ID, "1")?;
+                c.execute_batch(include_str!("../db/migrations/010_cloud_sync_unnumbered.sql"))?;
+                c.query_row("SELECT COUNT(*) FROM cloud_outbox WHERE episode_number = 0", [], |r| r.get::<_, i64>(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

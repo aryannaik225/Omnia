@@ -57,11 +57,15 @@ function AccountCard() {
   const toast = useAppStore((s) => s.toast);
   const pickRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
-  const run = async (file: File | null) => {
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [link, setLink] = useState("");
+  const update = async (job: () => Promise<void>, removed = false) => {
     setBusy(true);
     try {
-      await t.setAvatar(file);
-      toast({ kind: "success", title: file ? "Profile picture updated" : "Profile picture removed", body: "It syncs to Omnia Desktop and your other browsers." });
+      await job();
+      toast({ kind: "success", title: removed ? "Profile picture removed" : "Profile picture updated", body: "It syncs to Omnia Desktop and your other browsers." });
+      setLink("");
+      setLinkOpen(false);
     } catch (e) {
       toast({ kind: "error", title: "Couldn't update your picture", body: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -69,6 +73,8 @@ function AccountCard() {
       if (pickRef.current) pickRef.current.value = "";
     }
   };
+  const run = (file: File | null) => update(() => t.setAvatar(file), !file);
+  const linkValid = /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(link.trim());
   return (
     <div className="flex flex-wrap items-center justify-between gap-4">
       <div className="flex min-w-0 items-center gap-4">
@@ -85,12 +91,41 @@ function AccountCard() {
             <button type="button" className="font-medium text-[#0a84ff] hover:underline disabled:opacity-50" onClick={() => pickRef.current?.click()} disabled={busy}>
               {t.profile?.avatarUrl ? "Change picture" : "Add a picture"}
             </button>
+            <button type="button" className="font-medium text-[#0a84ff] hover:underline disabled:opacity-50" onClick={() => setLinkOpen((o) => !o)} disabled={busy} aria-expanded={linkOpen}>
+              Use an image URL
+            </button>
             {t.profile?.avatarUrl && (
               <button type="button" className="text-label-tertiary hover:text-label-primary disabled:opacity-50" onClick={() => void run(null)} disabled={busy}>
                 Remove
               </button>
             )}
           </div>
+          {linkOpen && (
+            <form
+              className="mt-3 flex max-w-[520px] flex-wrap gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (linkValid) void update(() => t.setAvatarFromUrl(link));
+              }}
+            >
+              <input
+                className="glass-input min-w-0 flex-1"
+                type="url"
+                inputMode="url"
+                placeholder="https://… link to a PNG, JPEG, WebP or GIF"
+                value={link}
+                onChange={(e) => setLink(e.target.value)}
+                aria-label="Image URL"
+                aria-invalid={!!link && !linkValid}
+                autoFocus
+              />
+              <button className="glass-button-primary" disabled={busy || !linkValid}>
+                {busy ? "Saving…" : "Use image"}
+              </button>
+              {!!link && !linkValid && <p className="w-full text-[12px] text-[#ff6961]">Paste a full link starting with https://</p>}
+              <p className="w-full text-[12px] text-label-tertiary">Downloaded once, cropped to a 256×256 WebP and saved to your account. The original site isn&apos;t contacted again.</p>
+            </form>
+          )}
         </div>
         <input ref={pickRef} type="file" accept="image/*" hidden onChange={(e) => e.target.files?.[0] && void run(e.target.files[0])} />
       </div>
@@ -127,19 +162,25 @@ function Subscriptions() {
   const save = useAppStore((s) => s.saveSubscriptions);
   const toast = useAppStore((s) => s.toast);
   const { data, loading, error } = useAsync(() => regionProviders(region), [region]);
-  const families = useMemo(() => groupByFamily(data ?? [], (p) => p.providerId, (p) => p.providerName).slice(0, 40), [data]);
+  // Every service TMDB lists for the region, grouped by family exactly like the desktop's
+  // Settings (src/components/settings/SettingsView.tsx: up to 200, first 30 shown).
+  const families = useMemo(() => groupByFamily(data ?? [], (p) => p.providerId, (p) => p.providerName).slice(0, 200), [data]);
   const [showAll, setShowAll] = useState(false);
   const savedIds = new Set(saved.map((p) => p.providerId));
-  const shown = showAll ? families : families.slice(0, 18);
+  const shown = showAll ? families : families.slice(0, 30);
 
-  const toggle = (members: { providerId: number; providerName: string; logoPath: string | null }[]) => {
+  const toggle = (familyName: string, members: { providerId: number; providerName: string; logoPath: string | null }[]) => {
     const on = members.some((m) => savedIds.has(m.providerId));
     const ids = new Set(members.map((m) => m.providerId));
     const next: SubscribedProvider[] = on
       ? saved.filter((p) => !ids.has(p.providerId))
-      : [...saved, ...members.map((m) => ({ providerId: m.providerId, providerName: m.providerName, logoPath: m.logoPath, regionCode: region, isActive: true }))];
+      : (() => {
+          // Every variant id under the family name (ad tiers, store channels), as on the desktop.
+          const logo = members.find((m) => m.logoPath)?.logoPath ?? null;
+          return [...saved, ...members.map((m) => ({ providerId: m.providerId, providerName: familyName, logoPath: logo, regionCode: region, isActive: true }))];
+        })();
     void save(next);
-    if (!on) toast({ kind: "success", title: `${members[0]!.providerName} added`, body: "“My Subscriptions” now includes it." });
+    if (!on) toast({ kind: "success", title: `${familyName} added`, body: "“My Subscriptions” now includes it." });
   };
 
   if (loading) return <div className="skeleton h-[120px] rounded-card" />;
@@ -155,7 +196,7 @@ function Subscriptions() {
               key={family.key}
               type="button"
               aria-pressed={on}
-              onClick={() => toggle(members)}
+              onClick={() => toggle(family.name, members)}
               className={`flex items-center gap-3 rounded-pill px-2.5 py-2 text-left transition-colors ${on ? "bg-white/[0.14] shadow-specular" : "bg-white/[0.04] hover:bg-white/[0.08]"}`}
             >
               {logo ? <img src={logo} alt="" className="h-9 w-9 shrink-0 rounded-[9px]" /> : <span className="h-9 w-9 shrink-0 rounded-[9px] bg-white/10" />}
@@ -165,7 +206,7 @@ function Subscriptions() {
           );
         })}
       </div>
-      {families.length > 18 && (
+      {families.length > 30 && (
         <button className="chip mt-4" onClick={() => setShowAll((x) => !x)}>
           {showAll ? "Show fewer" : `Show all ${families.length} services`}
         </button>
@@ -239,9 +280,10 @@ export function SettingsView() {
   };
 
   return (
-    <div className="pb-16">
+    // Centered column, same as the desktop's Settings (src/components/settings/SettingsView.tsx).
+    <div className="mx-auto w-full min-w-0 max-w-[980px] pb-16">
       <PageHeader title="Settings" subtitle="Region, services, preferences and your library" />
-      <div className="flex max-w-[920px] flex-col gap-6">
+      <div className="flex min-w-0 flex-col gap-6">
         <Section title="Account" subtitle={t.user ? "Your library syncs with Omnia Desktop and every browser you sign in on." : "Omnia works without an account: your library is saved in this browser."}>
           {t.user ? (
             <AccountCard />

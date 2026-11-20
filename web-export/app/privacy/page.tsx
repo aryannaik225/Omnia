@@ -90,9 +90,9 @@ export default function PrivacyPolicy() {
         <DataTable
           rows={[
             ["Account", "Your email address and an account ID. With Google sign-in: the basic profile Google shares (your name, email address, profile-picture link and Google account ID). With email sign-in: a securely hashed password."],
-            ["Profile", "A display name and, if you add one, a profile picture, shrunk on your device to a 256×256 image (about 30–50 KB) before upload. Pictures are stored at an unguessable link that anyone with the link can open, so only upload a picture you're happy to share."],
+            ["Profile", "A display name and, if you add one, a profile picture, shrunk on your device to a 256×256 image (about 30–50 KB) before upload. If you paste an image link instead, our server downloads that image once (without sending anything about you) so your browser can shrink it the same way. Pictures are stored at an unguessable link that anyone with the link can open, so only upload a picture you're happy to share."],
             ["Watchlist", "The TMDB ID and type of each title you save, and when you saved it."],
-            ["Watched movies & episodes", "TMDB IDs, season and episode numbers, when you watched them and the runtime (used for your watch-time totals), plus timestamps that keep your devices in sync."],
+            ["Watched movies & episodes", "TMDB IDs, season and episode numbers, when you watched them and the runtime (used for your watch-time totals), plus timestamps that keep your devices in sync. For an episode your streaming service didn't number, its title is kept instead so it can be shown."],
           ]}
         />
         <p>

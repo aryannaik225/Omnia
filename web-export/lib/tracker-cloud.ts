@@ -44,22 +44,15 @@ const check = ({ error }: { error: unknown }) => {
 
 type WatchlistRow = { tmdb_id: number; media_type: MediaType; added_at: string };
 type MovieRow = { tmdb_id: number; watched_at: string; runtime_minutes: number | null };
-type EpisodeRow = { tmdb_id: number; season_number: number; episode_number: number; watched_at: string; runtime_minutes: number | null };
+type EpisodeRow = { tmdb_id: number; season_number: number; episode_number: number; watched_at: string; runtime_minutes: number | null; episode_title?: string | null };
+
+const EPISODE_COLS = "tmdb_id, season_number, episode_number, watched_at, runtime_minutes";
 
 export async function loadCloud({ sb }: CloudCtx): Promise<TrackerData> {
   const [wl, movies, eps] = await Promise.all([
     all<WatchlistRow>((a, b) => sb.from("watchlist").select("tmdb_id, media_type, added_at").is("deleted_at", null).order("added_at").order("tmdb_id").range(a, b)),
     all<MovieRow>((a, b) => sb.from("tracked_movies").select("tmdb_id, watched_at, runtime_minutes").is("deleted_at", null).order("tmdb_id").range(a, b)),
-    all<EpisodeRow>((a, b) =>
-      sb
-        .from("tracked_episodes")
-        .select("tmdb_id, season_number, episode_number, watched_at, runtime_minutes")
-        .is("deleted_at", null)
-        .order("tmdb_id")
-        .order("season_number")
-        .order("episode_number")
-        .range(a, b),
-    ),
+    loadEpisodes(sb),
   ]);
   const d = emptyData();
   for (const r of wl) d.watchlist[itemKey(r.media_type, r.tmdb_id)] = r.added_at;
@@ -72,8 +65,23 @@ export async function loadCloud({ sb }: CloudCtx): Promise<TrackerData> {
     (d.episodes[r.tmdb_id] ??= {})[epKey(r.season_number, r.episode_number)] = r.watched_at;
     const mins = validRuntime(r.runtime_minutes);
     if (mins) d.runtimes[episodeRuntimeKey(r.tmdb_id, r.season_number, r.episode_number)] = mins;
+    if (r.episode_number === 0 && r.episode_title) d.episodeTitles![episodeRuntimeKey(r.tmdb_id, r.season_number, 0)] = r.episode_title;
   }
   return d;
+}
+
+/** Episodes, with episode_title when the project's schema has it (older schemas don't). */
+async function loadEpisodes(sb: SupabaseClient): Promise<EpisodeRow[]> {
+  const q = (cols: string) => (a: number, b: number) =>
+    sb.from("tracked_episodes").select(cols).is("deleted_at", null).order("tmdb_id").order("season_number").order("episode_number").range(a, b) as unknown as PromiseLike<{
+      data: EpisodeRow[] | null;
+      error: unknown;
+    }>;
+  try {
+    return await all<EpisodeRow>(q(`${EPISODE_COLS}, episode_title`));
+  } catch {
+    return all<EpisodeRow>(q(EPISODE_COLS));
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

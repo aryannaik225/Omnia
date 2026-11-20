@@ -16,9 +16,14 @@ export interface TrackerData {
    * recorded when it's marked; drives "Total Days Watched".
    */
   runtimes: Record<string, number>;
+  /**
+   * Titles of episodes stored without a number (`e:<id>:<s>:0`): a watch synced from Omnia Desktop
+   * that the streaming service didn't number and TMDB couldn't match by name.
+   */
+  episodeTitles?: Record<string, string>;
 }
 
-export const emptyData = (): TrackerData => ({ watchlist: {}, movies: {}, episodes: {}, runtimes: {} });
+export const emptyData = (): TrackerData => ({ watchlist: {}, movies: {}, episodes: {}, runtimes: {}, episodeTitles: {} });
 
 export const movieRuntimeKey = (id: number | string) => `m:${id}`;
 export const episodeRuntimeKey = (id: number | string, season: number, episode: number) => `e:${id}:${season}:${episode}`;
@@ -165,7 +170,7 @@ export function fromImport(json: unknown): TrackerData {
       if (r.media_type === "movie") {
         d.movies[r.tmdb_id] = at;
         if (mins) d.runtimes[movieRuntimeKey(r.tmdb_id)] = mins;
-      } else if (r.media_type === "tv" && okNum(r.season_number) && okId(r.episode_number)) {
+      } else if (r.media_type === "tv" && okNum(r.season_number) && okNum(r.episode_number)) {
         (d.episodes[r.tmdb_id] ??= {})[epKey(r.season_number, r.episode_number)] = at;
         if (mins) d.runtimes[episodeRuntimeKey(r.tmdb_id, r.season_number, r.episode_number)] = mins;
       }
@@ -182,7 +187,7 @@ export function fromImport(json: unknown): TrackerData {
       if (mins) d.runtimes[movieRuntimeKey(m.tmdbId)] = mins;
     }
   for (const e of f.episodes ?? [])
-    if (okId(e.tmdbId) && okNum(e.season) && okId(e.episode)) {
+    if (okId(e.tmdbId) && okNum(e.season) && okNum(e.episode)) {
       (d.episodes[e.tmdbId] ??= {})[epKey(e.season, e.episode)] = okDate(e.watchedAt);
       const mins = validRuntime(e.runtime);
       if (mins) d.runtimes[episodeRuntimeKey(e.tmdbId, e.season, e.episode)] = mins;
@@ -204,5 +209,6 @@ export function merge(a: TrackerData, b: TrackerData): TrackerData {
     out.episodes[id] = m;
   }
   out.runtimes = { ...b.runtimes, ...a.runtimes };
+  out.episodeTitles = { ...(b.episodeTitles ?? {}), ...(a.episodeTitles ?? {}) };
   return out;
 }

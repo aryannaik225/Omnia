@@ -84,7 +84,10 @@ create table if not exists public.tracked_episodes (
   tmdb_id         integer not null check (tmdb_id > 0),
   media_type      text not null default 'tv' check (media_type = 'tv'),
   season_number   integer not null check (season_number >= 0),
-  episode_number  integer not null check (episode_number > 0),
+  -- 0 = an episode the streaming service didn't number and TMDB couldn't match by name
+  -- (e.g. Netflix activity for a season TMDB lists only as "Episode 1…").
+  episode_number  integer not null check (episode_number >= 0),
+  episode_title   text check (episode_title is null or char_length(episode_title) <= 200),
   status          text not null default 'watched' check (status in ('watched')),
   runtime_minutes integer check (runtime_minutes is null or runtime_minutes between 1 and 999),
   watched_at      timestamptz not null default now(),
@@ -93,6 +96,14 @@ create table if not exists public.tracked_episodes (
   synced_at       timestamptz not null default now(),
   primary key (user_id, tmdb_id, season_number, episode_number)
 );
+
+-- Upgrades for projects created from an earlier version of this file (no-ops otherwise).
+alter table public.tracked_episodes add column if not exists episode_title text;
+alter table public.tracked_episodes drop constraint if exists tracked_episodes_episode_title_check;
+alter table public.tracked_episodes add constraint tracked_episodes_episode_title_check
+  check (episode_title is null or char_length(episode_title) <= 200);
+alter table public.tracked_episodes drop constraint if exists tracked_episodes_episode_number_check;
+alter table public.tracked_episodes add constraint tracked_episodes_episode_number_check check (episode_number >= 0);
 
 -- Delta pulls: "my rows changed since <cursor>".
 create index if not exists watchlist_user_synced        on public.watchlist        (user_id, synced_at);

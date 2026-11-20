@@ -38,6 +38,8 @@ interface TrackerApi {
   profile: cloud.CloudProfile | null;
   /** Compresses to a 256x256 WebP, uploads it and syncs its URL; null removes the picture. */
   setAvatar: (file: File | null) => Promise<void>;
+  /** Same, from a pasted image link (downloaded by /app/api/avatar-image, then compressed here). */
+  setAvatarFromUrl: (url: string) => Promise<void>;
   /** Permanently deletes the account and everything synced to it. */
   deleteAccount: () => Promise<void>;
   canSignIn: boolean;
@@ -67,7 +69,7 @@ function readGuest(): TrackerData {
     const raw = localStorage.getItem(GUEST_KEY);
     if (!raw) return emptyData();
     const d = JSON.parse(raw) as Partial<TrackerData>;
-    return { watchlist: d.watchlist ?? {}, movies: d.movies ?? {}, episodes: d.episodes ?? {}, runtimes: d.runtimes ?? {} };
+    return { watchlist: d.watchlist ?? {}, movies: d.movies ?? {}, episodes: d.episodes ?? {}, runtimes: d.runtimes ?? {}, episodeTitles: d.episodeTitles ?? {} };
   } catch {
     return emptyData();
   }
@@ -242,6 +244,19 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
           return;
         }
         const url = await cloud.uploadAvatar(c, await compressAvatar(file));
+        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url }));
+      },
+      setAvatarFromUrl: async (link) => {
+        const c = ctxRef.current;
+        if (mode !== "cloud" || !c) throw new Error("Sign in to set a profile picture.");
+        const trimmed = link.trim();
+        if (!/^https?:\/\/\S+$/i.test(trimmed)) throw new Error("Paste a full image link starting with https://");
+        const res = await fetch("/app/api/avatar-image", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: trimmed }) });
+        if (!res.ok) {
+          const body = (await res.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(body?.error ?? "That image couldn't be loaded.");
+        }
+        const url = await cloud.uploadAvatar(c, await compressAvatar(await res.blob()));
         setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url }));
       },
       deleteAccount: async () => {

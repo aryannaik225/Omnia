@@ -10,12 +10,20 @@ import { episodeRuntimeKey, itemKey, movieRuntimeKey, parseEpKey, showProgress, 
 const FALLBACK_MOVIE_MINUTES = 110;
 const FALLBACK_EPISODE_MINUTES = 45;
 
+/** The series' latest tracked episode, for the card's subtitle (same as Omnia Desktop). */
+export interface CurrentEpisode {
+  season: number;
+  /** 0 = an episode synced without a number (see TrackerData.episodeTitles). */
+  episode: number;
+  name: string | null;
+}
 export interface LibraryShow {
   key: string;
   title: TitleSummary;
   progress: ShowProgress;
   lastWatchedAt: string | null;
   inWatchlist: boolean;
+  current: CurrentEpisode | null;
 }
 export interface LibraryMovie {
   key: string;
@@ -32,6 +40,8 @@ export interface UpcomingItem {
 }
 
 const latest = (m: Record<string, string> | undefined) => (m ? Object.values(m).reduce<string | null>((a, b) => (!a || b > a ? b : a), null) : null);
+/** The most recently tracked episode key (`${season}:${episode}`). */
+const latestKey = (m: Record<string, string> | undefined) => (m ? Object.entries(m).reduce<[string, string] | null>((a, e) => (!a || e[1] > a[1] ? e : a), null)?.[0] ?? null : null);
 
 /** Everything the Library / Upcoming / Home rows need, joined with TMDB summaries. */
 export function useLibrary() {
@@ -48,7 +58,16 @@ export function useLibrary() {
       const inWatchlist = !!t.data.watchlist[key];
       if (title.mediaType === "tv") {
         const eps = t.data.episodes[title.id];
-        shows.push({ key, title, progress: showProgress(title, eps), lastWatchedAt: latest(eps), inWatchlist });
+        const lk = latestKey(eps);
+        const current = lk
+          ? (() => {
+              const { season, episode } = parseEpKey(lk);
+              return { season, episode, name: episode === 0 ? t.data.episodeTitles?.[episodeRuntimeKey(title.id, season, 0)] ?? null : null };
+            })()
+          : null;
+        // Unnumbered episodes never match an aired episode, so they start the series (Ongoing)
+        // without counting towards its progress.
+        shows.push({ key, title, progress: showProgress(title, eps), lastWatchedAt: latest(eps), inWatchlist, current });
       } else {
         movies.push({ key, title, watchedAt: t.data.movies[title.id] ?? null, inWatchlist });
       }
@@ -56,7 +75,7 @@ export function useLibrary() {
     const byRecent = <T extends { lastWatchedAt?: string | null; watchedAt?: string | null }>(a: T, b: T) =>
       (b.lastWatchedAt ?? b.watchedAt ?? "").localeCompare(a.lastWatchedAt ?? a.watchedAt ?? "");
 
-    const upNext = shows.filter((s) => s.progress.started && s.progress.next).sort(byRecent);
+    const upNext = shows.filter((s) => s.progress.started && s.progress.next && s.current?.episode !== 0).sort(byRecent);
     const watching = shows.filter((s) => s.progress.started && !(s.progress.caughtUp && s.progress.ended)).sort(byRecent);
     const finishedShows = shows.filter((s) => s.progress.caughtUp && s.progress.ended).sort(byRecent);
     const watchedMovies = movies.filter((m) => m.watchedAt).sort(byRecent);
@@ -85,7 +104,7 @@ export function useLibrary() {
     // My Library: every aired episode watched = Completed (also a caught-up returning series);
     // anything less = Ongoing. Both newest activity first.
     const started = shows.filter((s) => s.progress.started).sort(byRecent);
-    const completed = started.filter((s) => s.progress.airedTotal > 0 && s.progress.watchedAired >= s.progress.airedTotal);
+    const completed = started.filter((s) => s.progress.airedTotal > 0 && s.progress.watchedAired >= s.progress.airedTotal && s.current?.episode !== 0);
     const ongoing = started.filter((s) => !completed.includes(s));
 
     // Watch-time stats: each title's runtime recorded when it was marked; for older entries the
@@ -99,18 +118,25 @@ export function useLibrary() {
       minutes += mins ?? FALLBACK_MOVIE_MINUTES;
     }
     let episodeCount = 0;
+    let unplaced = 0;
     for (const [id, eps] of Object.entries(t.data.episodes)) {
       const typical = titles.get(itemKey("tv", Number(id)))?.runtime ?? null;
       for (const k of Object.keys(eps)) {
         const { season, episode } = parseEpKey(k);
+        // Only numbered episodes count (an unnumbered watch may stand for several).
+        if (episode === 0) {
+          unplaced++;
+          continue;
+        }
         const mins = t.data.runtimes[episodeRuntimeKey(id, season, episode)] ?? typical;
         if (mins == null) estimated++;
         minutes += mins ?? FALLBACK_EPISODE_MINUTES;
         episodeCount++;
       }
     }
-    const stats = { minutes, movies: movieIds.length, episodes: episodeCount, estimated };
+    const stats = { minutes, movies: movieIds.length, episodes: episodeCount, estimated, unplaced };
+    const seriesCount = Object.values(t.data.episodes).filter((m) => Object.keys(m).some((k) => parseEpKey(k).episode > 0)).length;
 
-    return { ready: t.status !== "loading" && !loading, empty: keys.length === 0, upNext, watching, finishedShows, watchedMovies, watchlist, upcoming, ongoing, completed, stats };
+    return { ready: t.status !== "loading" && !loading, empty: keys.length === 0, upNext, watching, finishedShows, watchedMovies, watchlist, upcoming, ongoing, completed, stats, seriesCount };
   }, [keys, titles, loading, t.data, t.status]);
 }

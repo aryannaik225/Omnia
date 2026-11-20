@@ -54,8 +54,15 @@ const SECTIONS: Record<LibrarySection, { title: string; subtitle: string; empty:
 
 const isSection = (s: string): s is LibrarySection => s in SECTIONS;
 
+/** "Watched S2 · Saajan Chala Sasural": the latest watch synced without an episode number. */
+function currentLabel(s: LibraryShow): string | null {
+  const c = s.current;
+  return c && c.episode === 0 ? `Watched S${c.season}${c.name ? ` · ${c.name}` : ""}` : null;
+}
+
 const showCard = (s: LibraryShow, done: boolean): Card => {
   const { watchedAired, airedTotal, next, ended } = s.progress;
+  const live = done ? null : currentLabel(s);
   return {
     key: s.key,
     id: s.title.id,
@@ -69,7 +76,7 @@ const showCard = (s: LibraryShow, done: boolean): Card => {
         : s.title.nextEpisode?.airDate
           ? `Caught up · new ${countdownLabel(s.title.nextEpisode.airDate)?.toLowerCase()}`
           : "Caught up"
-      : `${watchedAired} of ${airedTotal} episodes${next ? ` · next ${episodeLabel(next.season, next.episode)}` : ""}`,
+      : (live ?? `${watchedAired} of ${airedTotal} episodes${next ? ` · next ${episodeLabel(next.season, next.episode)}` : ""}`),
     // A sliver for the first episode, never a "full" blue bar.
     progress: done ? 1 : airedTotal ? Math.min(0.99, Math.max(0.03, watchedAired / airedTotal)) : 0.03,
     tone: done ? "complete" : "progress",
@@ -240,11 +247,16 @@ function WatchSummary() {
       <Stat icon="movie" tint="255,176,64" label="Movies Watched" value={movies.toLocaleString()} detail={movies === 1 ? "1 movie" : `${movies.toLocaleString()} movies`} />
       <span className="my-5 w-px shrink-0 bg-white/[0.08] max-md:mx-4 max-md:my-0 max-md:h-px max-md:w-auto" />
       <Stat
+        title={
+          lib.stats.unplaced
+            ? `Numbered episodes only. ${lib.stats.unplaced} synced watch${lib.stats.unplaced === 1 ? "" : "es"} without an episode number ${lib.stats.unplaced === 1 ? "isn't" : "aren't"} counted.`
+            : "Finished episodes"
+        }
         icon="episode"
         tint="48,209,88"
         label="Episodes Watched"
         value={episodes.toLocaleString()}
-        detail={`Across ${lib.ongoing.length + lib.completed.length} series`}
+        detail={`Across ${lib.seriesCount} series`}
       />
     </section>
   );
