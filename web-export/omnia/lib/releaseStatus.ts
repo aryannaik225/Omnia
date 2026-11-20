@@ -11,6 +11,9 @@
  *     cinemas anywhere near the viewer.
  * A digital (4) release names its platform from TMDB's `note` ("Netflix") when it is one.
  * Series use first_air_date, next_episode_to_air and status.
+ *
+ * A digital release dated today, or yesterday (24-hour grace for time zones and provider
+ * indexing lag), is "fresh" rather than "not available"; so is a title whose only date is today.
  */
 import type { MediaDetails, ReleaseDate } from "../services/tmdbClient";
 
@@ -34,6 +37,12 @@ export type ReleaseStatus =
     }
   | { kind: "theatres"; since: string; digital: string | null; platform: string | null; regional: boolean }
   | { kind: "airing"; date: string; days: number; label: string }
+  /**
+   * Out today (days 0) or, for a digital release, yesterday (days -1), but with no providers
+   * listed yet: the drop hasn't happened in this time zone, or TMDB / JustWatch haven't indexed
+   * it (that lag is often a few hours). Never returned once providers exist.
+   */
+  | { kind: "fresh"; date: string; days: 0 | -1; channel: ReleaseChannel; platform: string | null; regional: boolean }
   | { kind: "none" };
 
 /** How long after a theatrical release a title without providers still counts as "in theatres". */
@@ -115,6 +124,16 @@ export function releaseStatus(d: MediaDetails, region: string, today = todayIso(
     const home = earliest(list, HOME);
     const homeOut = !!home && home.date <= today;
 
+    // Streaming release today / yesterday that the provider lists haven't caught up with.
+    const digital = earliest(list, new Set([DIGITAL]));
+    const digitalDays = digital ? daysBetween(today, digital.date) : null;
+    if (digital && (digitalDays === 0 || digitalDays === -1)) {
+      return { kind: "fresh", date: digital.date, days: digitalDays, channel: "digital", platform: platformOf(digital), regional };
+    }
+    if (!all.length && d.releaseDate === today) {
+      return { kind: "fresh", date: today, days: 0, channel: "unknown", platform: null, regional: false };
+    }
+
     // Already in cinemas (and not yet out on digital / disc / TV here).
     if (cinema && cinema.date <= today && !homeOut && daysBetween(cinema.date, today) <= THEATRICAL_WINDOW_DAYS) {
       const next = home && home.date > today ? home : null;
@@ -169,6 +188,7 @@ export function releaseStatus(d: MediaDetails, region: string, today = todayIso(
 
   // Series
   const first = d.releaseDate ?? null;
+  if (first === today) return { kind: "fresh", date: first, days: 0, channel: "tv", platform: null, regional: false };
   if (first && first > today) {
     return { kind: "upcoming", date: first, days: daysBetween(today, first), channel: "tv", platform: null, digital: null, alsoInCinemas: false, regional: false, label: "Series premiere" };
   }

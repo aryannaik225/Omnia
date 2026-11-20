@@ -132,6 +132,22 @@ function ReleaseNotice({ status, d }: { status: Exclude<ReleaseStatus, { kind: "
     headline = `In theatres ${where(status.regional) || "now"}`.trim();
     details.push(`Released ${longDate(status.since)}`);
     details.push(status.digital ? `Streaming${status.platform ? ` on ${status.platform}` : ""} from ${shortDate(status.digital)}` : "Not on streaming or digital yet");
+  } else if (status.kind === "fresh") {
+    date = status.date;
+    live = true;
+    const on = status.platform ? ` on ${status.platform}` : "";
+    if (status.days === 0) {
+      pill = status.channel === "tv" ? "Premieres today" : "Releasing today";
+      headline =
+        status.channel === "tv" ? `Series premiere today${on}` : status.platform ? `Releasing today${on}` : status.channel === "digital" ? "Digital / Streaming release today" : "Releasing today";
+      details.push(longDate(status.date) ?? "");
+      details.push("Streaming links appear once it drops");
+    } else {
+      pill = "Just released";
+      headline = `Just released${on} — streaming links updating`;
+      details.push(`Released ${longDate(status.date)}`);
+    }
+    if (!status.regional && d.mediaType === "movie" && status.channel === "digital") details.push(`Worldwide date · none listed for ${place} yet`);
   } else if (status.kind === "airing") {
     date = status.date;
     pill = countdown(status.days, "Airs");
