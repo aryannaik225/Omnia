@@ -395,6 +395,7 @@ Maintain this exact repository structure:
 │           └── mobile_server.rs          # Optional local Axum server for zero-install iPhone Safari access
 ├── docs/PHONE_AND_TV.md                  # LAN pairing, iPhone, Android TV APK build
 ├── docs/CLOUD_SYNC.md                    # Optional Desktop ⇄ Web sync: setup, privacy boundary
+├── docs/RELEASING.md                     # Release checklist: version bumps, parity, checks, tag & publish
 ├── supabase/schema.sql                   # Idempotent Supabase schema (RLS, avatars bucket, keep-alive)
 └── web-export/                           # Website: landing page at /, optional Supabase cloud edition at /app
 ```
@@ -406,3 +407,16 @@ Maintain this exact repository structure:
 1. **No Placeholders or Mock Stubs:** Every module—including the JustWatch GraphQL query, the injected `<video>` telemetry script, the SQLite schema, the Hub filter mappings, and the cosine similarity recommendation engine—must be written with complete, working logic.
 2. **Performance & Low Memory Footprint:** Keep frontend bundle sizes minimal, debounce scroll/search listeners, virtualize long carousels, and properly destroy secondary WebView2 player windows when closed to preserve memory on 8GB RAM systems.
 3. **Graceful Fallbacks:** If JustWatch GraphQL does not return a direct deep link for an obscure title, automatically construct a deterministic provider search/watch URL fallback (e.g., `https://www.netflix.com/search?q=...`) so playback never fails.
+
+---
+
+## 9. Release Workflow
+
+Whenever the user asks to prepare a release, cut a release, or bump the version, follow **[`docs/RELEASING.md`](docs/RELEASING.md) step by step**. Don't skip a section, even for a patch release.
+
+- **Version bumps must cover every file in its step 1:** `package.json`, `package-lock.json` (both entries), `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and the `FALLBACK` release in `web-export/lib/release.ts`. `release.yml` fails when the tag and the versions disagree.
+- **Audit docs and copy parity** (README, `web-export/README.md`, `setup_instructions.txt`, `docs/CLOUD_SYNC.md`, the landing page, `/privacy`, `/terms`) against what actually changed since the last tag. Never advertise a feature, filter or data flow the code doesn't have.
+- **Flag schema changes:** if `supabase/schema.sql` changed, tell the user to re-run it in the Supabase SQL Editor before publishing.
+- **Run every build check** in its step 4 and report the results honestly.
+- **Draft the release notes** with absolute `https://omnia-tv.vercel.app` links and hand them to the user.
+- **Never commit, push, tag or delete tags/releases without the user's explicit confirmation for that release.** Approval for one release doesn't carry over to the next. Prepare everything, then stop and ask.

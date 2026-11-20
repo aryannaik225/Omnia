@@ -434,7 +434,7 @@ hub("a24", "A24", "studio", {
 
 ## Releasing
 
-Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) on a version tag:
+Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml) on a version tag. The full checklist (every file to bump, docs parity, build checks, secrets, publishing) is **[docs/RELEASING.md](docs/RELEASING.md)**; in short:
 
 1. Bump the version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` (then `cargo check` to refresh `Cargo.lock`). The workflow fails if the tag and these disagree.
 2. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
