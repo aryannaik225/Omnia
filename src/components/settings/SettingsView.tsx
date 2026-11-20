@@ -19,6 +19,9 @@ import { useDevMode } from "../../services/devMode";
 import { isRemote, platformMode, setTvNavigation, tvNavigation } from "../../services/platform";
 import { LinkedDevicesSection } from "./LinkedDevices";
 import { CloudSyncSection } from "./CloudSyncSection";
+import { HomeLayoutEditor } from "../common/HomeLayoutEditor";
+import { mergeForSave, parseHomeOrder, resolveHomeOrder } from "../../config/homeLayout";
+import { homeOrderKey } from "../../store/useAppStore";
 import { cloud } from "../../services/tauriBridge";
 
 function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
@@ -322,6 +325,29 @@ function BackgroundSyncToggle() {
   );
 }
 
+/** Order of the Home rows below Browse by service, per profile (synced when signed in to cloud sync). */
+function HomeLayoutSection() {
+  const profile = useAppStore((s) => s.activeProfile)!;
+  const raw = useAppStore((s) => s.settings[homeOrderKey(profile.profileId)]);
+  const setHomeRowOrder = useAppStore((s) => s.setHomeRowOrder);
+  const toast = useAppStore((s) => s.toast);
+  const saved = useMemo(() => parseHomeOrder(raw), [raw]);
+  const order = useMemo(() => resolveHomeOrder(saved), [saved]);
+  const change = (next: string[] | null) => {
+    void setHomeRowOrder(next ? mergeForSave(next, saved) : null)
+      .then(() => {
+        if (platformMode === "desktop") void cloud.syncNow().catch(() => undefined);
+        if (!next) toast({ kind: "info", title: "Home layout reset", body: "Rows are back in their default order." });
+      })
+      .catch((e) => toast({ kind: "error", title: "Couldn't save the layout", body: e instanceof Error ? e.message : String(e) }));
+  };
+  return (
+    <Section title="Home Page Layout" description={`The order of the rows on Home for ${profile.profileName}. Syncs to Omnia Web when you're signed in.`}>
+      <HomeLayoutEditor order={order} onChange={change} />
+    </Section>
+  );
+}
+
 function PrivacySection() {
   const trailerAutoplay = useAppStore((s) => s.trailerAutoplay);
   const setTrailerAutoplay = useAppStore((s) => s.setTrailerAutoplay);
@@ -444,6 +470,7 @@ export function SettingsView() {
       {platformMode === "desktop" && <CloudSyncSection Section={Section} />}
       {platformMode === "desktop" && <LinkedDevicesSection Section={Section} Toggle={Toggle} />}
       <RecommendationsSection />
+      <HomeLayoutSection />
       <PrivacySection />
       {devUnlocked && <DeveloperSection />}
       <VersionFooter />

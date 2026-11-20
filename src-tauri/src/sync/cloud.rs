@@ -56,6 +56,20 @@ pub mod keys {
     pub const LAST_ERROR: &str = "cloud_last_error";
     pub const PROFILE_SIG: &str = "cloud_profile_sig";
     pub const PROFILE_SEEN: &str = "cloud_profile_seen_at";
+    /// Last Home row order synced (its own LWW signature, separate from name / picture).
+    pub const HOME_ORDER_SIG: &str = "cloud_home_order_sig";
+}
+
+/// The profile's Home row order setting (a JSON array of row ids). Must match
+/// src/store/useAppStore.ts → homeOrderKey.
+pub fn home_order_key(profile_id: i64) -> String {
+    format!("home_row_order_p{profile_id}")
+}
+
+/// A stored / synced Home row order as canonical JSON (strings only, at most 100 short ids).
+fn canonical_order(v: &Value) -> Option<String> {
+    let ids: Vec<&str> = v.as_array()?.iter().filter_map(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 64).take(100).collect();
+    serde_json::to_string(&ids).ok()
 }
 
 const CHUNK: usize = 500;
@@ -913,26 +927,40 @@ async fn download_avatar(state: &AppState, url: &str) -> AppResult<Option<String
 }
 
 async fn sync_profile(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppResult<bool> {
-    let (local, stored_sig, seen) = state
+    let order_key = home_order_key(profile_id);
+    let ok = order_key.clone();
+    let (local, stored_sig, seen, local_order, order_sig_stored) = state
         .db
         .run(move |c| {
             Ok((
                 queries::get_profile(c, profile_id)?,
                 queries::get_setting(c, keys::PROFILE_SIG)?,
                 queries::get_setting(c, keys::PROFILE_SEEN)?.and_then(|s| parse_ts(&s)),
+                queries::get_setting(c, &ok)?,
+                queries::get_setting(c, keys::HOME_ORDER_SIG)?,
             ))
         })
         .await?;
     let Some(local) = local else { return Ok(false) };
-    let resp = api
-        .req(reqwest::Method::GET, "/rest/v1/profiles")
-        .query(&[("select", "display_name,avatar_url,updated_at"), ("user_id", &format!("eq.{}", api.user_id))])
-        .send()
-        .await?;
+    let local_order = local_order.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|v| canonical_order(&v));
+
+    // Projects whose schema predates home_row_order: read (and later write) without it.
+    let get_profile_row = |select: &'static str| {
+        api.req(reqwest::Method::GET, "/rest/v1/profiles")
+            .query(&[("select", select), ("user_id", &format!("eq.{}", api.user_id))])
+            .send()
+    };
+    let mut has_order_column = true;
+    let mut resp = get_profile_row("display_name,avatar_url,home_row_order,updated_at").await?;
+    if !resp.status().is_success() {
+        has_order_column = false;
+        resp = get_profile_row("display_name,avatar_url,updated_at").await?;
+    }
     if !resp.status().is_success() {
         return Err(api_error(resp, "Reading your profile").await);
     }
     let remote: Option<Value> = resp.json::<Vec<Value>>().await?.into_iter().next();
+    let r_order = remote.as_ref().and_then(|r| r.get("home_row_order")).and_then(canonical_order);
     let r_name = remote.as_ref().and_then(|r| r.get("display_name")).and_then(Value::as_str).map(str::to_string);
     let r_avatar = remote.as_ref().and_then(|r| r.get("avatar_url")).and_then(Value::as_str).map(str::to_string);
     let r_updated = remote.as_ref().and_then(|r| r.get("updated_at")).and_then(Value::as_str).and_then(parse_ts);
@@ -981,8 +1009,23 @@ async fn sync_profile(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppRe
         }
     }
 
+    // Home row order: its own last-write-wins, so it never drags the picture along.
+    let order_sig = sha256_hex(local_order.as_deref().unwrap_or(""));
+    let mut new_order = local_order.clone();
+    let mut push_order = false;
+    if has_order_column {
+        match order_sig_stored.as_deref() {
+            // First sync of the order: this PC's custom order wins; otherwise take the cloud's.
+            None if local_order.is_some() => push_order = true,
+            None => new_order = r_order.clone(),
+            Some(prev) if prev != order_sig => push_order = true,
+            Some(_) if remote_changed => new_order = r_order.clone(),
+            Some(_) => {}
+        }
+    }
+
     let mut seen_at = r_updated.map(|d| d.to_rfc3339_opts(SecondsFormat::Micros, true));
-    if push_name || push_avatar {
+    if push_name || push_avatar || push_order {
         let mut row = serde_json::Map::new();
         row.insert("user_id".into(), json!(api.user_id));
         let now = now_iso();
@@ -998,17 +1041,35 @@ async fn sync_profile(state: &AppState, api: &Api<'_>, profile_id: i64) -> AppRe
             };
             row.insert("avatar_url".into(), json!(url));
         }
+        if push_order {
+            let ids: Value = local_order.as_deref().and_then(|o| serde_json::from_str(o).ok()).unwrap_or(Value::Null);
+            row.insert("home_row_order".into(), ids);
+        }
         api.upsert("profiles", "user_id", &[Value::Object(row)]).await?;
         seen_at = Some(now);
     }
 
-    let changed_locally = new_name != local.profile_name || new_avatar != local.avatar_asset;
+    let order_changed = new_order != local_order;
+    let changed_locally = new_name != local.profile_name || new_avatar != local.avatar_asset || order_changed;
     let final_sig = profile_sig(&new_name, new_avatar.as_deref());
+    let final_order_sig = sha256_hex(new_order.as_deref().unwrap_or(""));
+    let name_or_avatar = new_name != local.profile_name || new_avatar != local.avatar_asset;
     state
         .db
         .run(move |c| {
-            if changed_locally {
+            if name_or_avatar {
                 queries::update_profile(c, profile_id, &new_name, new_avatar.as_deref(), local.is_kids_profile)?;
+            }
+            if order_changed {
+                match &new_order {
+                    Some(o) => queries::set_setting(c, &order_key, o)?,
+                    None => {
+                        queries::delete_setting(c, &order_key)?;
+                    }
+                }
+            }
+            if has_order_column {
+                queries::set_setting(c, keys::HOME_ORDER_SIG, &final_order_sig)?;
             }
             queries::set_setting(c, keys::PROFILE_SIG, &final_sig)?;
             if let Some(s) = seen_at {
@@ -1435,6 +1496,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn home_orders_are_canonicalised() {
+        assert_eq!(canonical_order(&json!(["love", 3, "in-theatres", ""])).as_deref(), Some(r#"["love","in-theatres"]"#));
+        assert_eq!(canonical_order(&json!(null)), None);
+        assert_eq!(canonical_order(&json!("love")), None);
+        assert_eq!(home_order_key(4), "home_row_order_p4");
     }
 
     #[tokio::test]

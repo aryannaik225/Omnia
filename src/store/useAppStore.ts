@@ -29,6 +29,12 @@ import {
 import { DEFAULT_PALETTE, type Rgb } from "../lib/color";
 import { providerFamily } from "../lib/providers";
 
+/**
+ * Settings key of a profile's Home row order (JSON array of config/homeLayout ids). Must match
+ * src-tauri/src/sync/cloud.rs → home_order_key: the order syncs as profiles.home_row_order.
+ */
+export const homeOrderKey = (profileId: number) => `home_row_order_p${profileId}`;
+
 export type View = "home" | "search" | "continue" | "library" | "myotts" | "hubs" | "watchlist" | "collections" | "settings" | "remote" | "browse";
 
 /** A Home row registry entry (see config/homeRows): `arg` / `label` parameterise it (provider ids, seed titles). */
@@ -128,6 +134,10 @@ interface AppState {
   setSubscriptionsOnly: (on: boolean) => Promise<void>;
   setKidsSafeMode: (on: boolean) => Promise<void>;
   setTrailerAutoplay: (on: boolean) => Promise<void>;
+  /** Settings → Home Page Layout: the active profile's row order; null restores the default. */
+  setHomeRowOrder: (order: string[] | null) => Promise<void>;
+  /** Re-reads local settings (e.g. after cloud sync brought a new Home layout). */
+  reloadSettings: () => Promise<void>;
   setTmdbKey: (key: string) => Promise<void>;
 
   navigate: (view: View, opts?: { hub?: string | null; browse?: BrowseTarget; librarySection?: string | null }) => void;
@@ -351,6 +361,29 @@ export const useAppStore = create<AppState>((set, get) => ({
     await settingsApi.set(SettingKeys.kidsSafeMode, String(on));
     set({ kidsSafeMode: on, recsStale: true });
     void get().loadRecommendations(true);
+  },
+
+  setHomeRowOrder: async (order) => {
+    const p = get().activeProfile;
+    if (!p) return;
+    const key = homeOrderKey(p.profileId);
+    if (order) {
+      const value = JSON.stringify(order);
+      await settingsApi.set(key, value);
+      set((s) => ({ settings: { ...s.settings, [key]: value } }));
+    } else {
+      await settingsApi.remove(key);
+      set((s) => {
+        const settings = { ...s.settings };
+        delete settings[key];
+        return { settings };
+      });
+    }
+  },
+
+  reloadSettings: async () => {
+    const all = await settingsApi.getAll();
+    set({ settings: all });
   },
 
   setTrailerAutoplay: async (on) => {

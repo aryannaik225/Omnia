@@ -225,9 +225,36 @@ export async function discover(mt: MediaType, ctx: CatalogContext, params: Param
   return toPaged(raw, mt);
 }
 
-/** Movies in cinemas now in a region (`/movie/now_playing`). */
+const localToday = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+/**
+ * Still a cinema-only release in the region? TMDB keeps titles in `now_playing` for about six
+ * weeks after release whatever happens on streaming, so a movie that already streams in the
+ * region on a subscription (flatrate), or whose regional digital release date has passed, is out.
+ * Unknown (request failed) counts as still in cinemas.
+ */
+async function stillOnlyInCinemas(id: number, region: string, today: string): Promise<boolean> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = await request<any>(`/movie/${id}`, { append_to_response: "watch/providers,release_dates" }, 6 * 3600_000);
+  if (raw?.["watch/providers"]?.results?.[region]?.flatrate?.length) return false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const local = (raw?.release_dates?.results ?? []).find((r: any) => r.iso_3166_1 === region);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return !(local?.release_dates ?? []).some((x: any) => x.type === 4 && typeof x.release_date === "string" && x.release_date.slice(0, 10) <= today);
+}
+
+/**
+ * Movies in cinemas now in a region: `/movie/now_playing`, minus titles not out yet and titles
+ * already streaming there (see stillOnlyInCinemas). Shared with web-export/omnia/services/tmdbClient.ts.
+ */
 export async function nowPlaying(region: string, page = 1) {
-  return toPaged(await request<RawPaged>("/movie/now_playing", { region, page }), "movie");
+  const paged = toPaged(await request<RawPaged>("/movie/now_playing", { region, page }), "movie");
+  const today = localToday();
+  const keep = await Promise.all(paged.results.map((m) => stillOnlyInCinemas(m.id, region, today).catch(() => true)));
+  return { ...paged, results: paged.results.filter((m, i) => keep[i] && (!m.releaseDate || m.releaseDate <= today)) };
 }
 
 /** TMDB's "more like this" for one title; falls back to `/similar` when it has no recommendations. */

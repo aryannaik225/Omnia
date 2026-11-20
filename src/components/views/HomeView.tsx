@@ -11,7 +11,8 @@ import { useAsync } from "../../lib/hooks";
 import { usePersonalSignals, type PersonalSignals } from "../../lib/personal";
 import { discover, isKidsSafe, trending, type MediaSummary } from "../../services/tmdbClient";
 import { history, type RecommendationRow, type RecommendedItem } from "../../services/tauriBridge";
-import { availabilityKey, useAppStore, useCatalogKey } from "../../store/useAppStore";
+import { availabilityKey, homeOrderKey, useAppStore, useCatalogKey } from "../../store/useAppStore";
+import { parseHomeOrder, resolveHomeOrder } from "../../config/homeLayout";
 import { MatchBadge, SkeletonCard } from "../common/Cards";
 import { BrandHubsRow } from "../home/BrandHubsRow";
 import { ContinueWatchingRow } from "../home/ContinueWatchingRow";
@@ -233,6 +234,10 @@ export function HomeView() {
   const heroFiltered = useSubscriptionFilter(heroCandidates, ({ m, trusted }) => ({ id: m.id, mediaType: m.mediaType, trusted }));
   const heroItems = useMemo(() => heroFiltered.items.map(({ m }) => m), [heroFiltered.items]);
 
+  // Settings → Home Page Layout (before any early return: hooks keep their order).
+  const profileId = useAppStore((s) => s.activeProfile?.profileId);
+  const savedOrder = useAppStore((s) => (profileId ? s.settings[homeOrderKey(profileId)] : undefined));
+  const homeOrder = useMemo(() => resolveHomeOrder(parseHomeOrder(savedOrder)), [savedOrder]);
   if (!tmdbReady) {
     return (
       <div className="px-10 pt-10" style={{ paddingLeft: "var(--content-left)" }}>
@@ -255,34 +260,21 @@ export function HomeView() {
         <BrandHubsRow />
         <MyListRow />
         <BrowseByServiceRow />
-        {row("in-theatres")}
-        {row("acclaimed-films")}
-        {row("airing")}
-        {row("acclaimed-series")}
-        {signals.loaded && (
-          <>
-            <NextWatchRow signals={signals} env={env} />
-            <BecauseRows signals={signals} env={env} />
-          </>
-        )}
-        {row("region-movies")}
-        {row("region-series")}
-        {row("imdb-popular")}
-        {row("rt-fresh")}
-        {row("moviemeter")}
-        {row("hidden-gems")}
-        <PopularOnStreamingRow env={env} />
-        {row("anime")}
-        {signals.loaded && <LoveRow signals={signals} env={env} />}
-        {row("oscars")}
-        {row("laugh")}
-        {row("millennial")}
-        {row("scifi-tv")}
-        {row("horror")}
-        {row("rt-hot")}
-        {row("best-year")}
-        {row("worst")}
-        {row("popular-tv")}
+        {/* Everything below follows Settings → Home Page Layout (config/homeLayout.ts). */}
+        {homeOrder.map((id) => {
+          switch (id) {
+            case "next-watch":
+              return signals.loaded ? <NextWatchRow key={id} signals={signals} env={env} /> : null;
+            case "because":
+              return signals.loaded ? <BecauseRows key={id} signals={signals} env={env} /> : null;
+            case "streaming":
+              return <PopularOnStreamingRow key={id} env={env} />;
+            case "love":
+              return signals.loaded ? <LoveRow key={id} signals={signals} env={env} /> : null;
+            default:
+              return row(id);
+          }
+        })}
       </div>
     </div>
   );

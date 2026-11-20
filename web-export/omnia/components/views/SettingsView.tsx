@@ -19,6 +19,8 @@ import { DesktopBadge } from "../common/DesktopOnly";
 import { CheckIcon, DownloadIcon, GlobeIcon, RefreshIcon, TrashIcon, UploadIcon } from "../common/Icons";
 import { RegionSwitcher } from "../layout/TopFilterBar";
 import { UserAvatar, accountName } from "../common/UserAvatar";
+import { HomeLayoutEditor } from "../common/HomeLayoutEditor";
+import { resolveHomeOrder } from "../../config/homeLayout";
 import { PageHeader } from "./BrowseViews";
 
 function Section({ id, title, subtitle, children }: { id?: string; title: string; subtitle?: string; children: ReactNode }) {
@@ -154,6 +156,26 @@ function AccountCard() {
       </div>
     </div>
   );
+}
+
+/** Order of the Home rows below Browse by service: this browser, plus the account when signed in. */
+function HomeLayout() {
+  const t = useTracker();
+  const toast = useAppStore((s) => s.toast);
+  const [busy, setBusy] = useState(false);
+  const order = useMemo(() => resolveHomeOrder(t.homeRowOrder), [t.homeRowOrder]);
+  const change = async (next: string[] | null) => {
+    setBusy(true);
+    try {
+      await t.setHomeRowOrder(next);
+      if (!next) toast({ kind: "info", title: "Home layout reset", body: "Rows are back in their default order." });
+    } catch (e) {
+      toast({ kind: "error", title: "Couldn't save the layout", body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <HomeLayoutEditor order={order} onChange={(o) => void change(o)} busy={busy} />;
 }
 
 function Subscriptions() {
@@ -331,6 +353,13 @@ export function SettingsView() {
           <div className="mt-5">
             <Subscriptions />
           </div>
+        </Section>
+
+        <Section
+          title="Home Page Layout"
+          subtitle={t.user ? "The order of the rows on Home. Syncs with Omnia Desktop and your other browsers." : "The order of the rows on Home, saved in this browser. Sign in to sync it."}
+        >
+          <HomeLayout />
         </Section>
 
         <Section title="Preferences">

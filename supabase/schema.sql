@@ -98,6 +98,12 @@ create table if not exists public.tracked_episodes (
 );
 
 -- Upgrades for projects created from an earlier version of this file (no-ops otherwise).
+-- Home page layout (Settings → Home Page Layout): row ids after "Browse by service", in order.
+-- Apps ignore ids they don't know and append rows added later, so any app version can read it.
+alter table public.profiles add column if not exists home_row_order jsonb;
+alter table public.profiles drop constraint if exists profiles_home_row_order_check;
+alter table public.profiles add constraint profiles_home_row_order_check
+  check (home_row_order is null or (jsonb_typeof(home_row_order) = 'array' and jsonb_array_length(home_row_order) <= 100));
 alter table public.tracked_episodes add column if not exists episode_title text;
 alter table public.tracked_episodes drop constraint if exists tracked_episodes_episode_title_check;
 alter table public.tracked_episodes add constraint tracked_episodes_episode_title_check

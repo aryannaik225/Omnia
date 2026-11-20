@@ -17,9 +17,28 @@ import { supabaseConfigured } from "@/lib/supabase/env";
 import { countItems, emptyData, epKey, episodeRuntimeKey, isEmpty, itemKey, merge, movieRuntimeKey, validRuntime, type TrackerData } from "@/lib/tracker";
 import { compressAvatar } from "@/lib/avatar-image";
 import * as cloud from "@/lib/tracker-cloud";
+import { mergeForSave, parseHomeOrder } from "@/omnia/config/homeLayout";
 import { useAppStore } from "@/omnia/store/useAppStore";
 
 const GUEST_KEY = "omnia.tracker.v1";
+/** Home Page Layout in this browser (guests, and the offline copy when signed in). */
+const HOME_ORDER_KEY = "omnia.homeRowOrder.v1";
+
+function readLocalOrder(): string[] | null {
+  try {
+    return parseHomeOrder(localStorage.getItem(HOME_ORDER_KEY));
+  } catch {
+    return null;
+  }
+}
+function writeLocalOrder(order: string[] | null) {
+  try {
+    if (order) localStorage.setItem(HOME_ORDER_KEY, JSON.stringify(order));
+    else localStorage.removeItem(HOME_ORDER_KEY);
+  } catch {
+    // Storage unavailable: the layout lasts for this visit.
+  }
+}
 const HINT_KEY = "omnia.guest-hint-shown";
 
 export interface SessionUser {
@@ -40,6 +59,10 @@ interface TrackerApi {
   setAvatar: (file: File | null) => Promise<void>;
   /** Same, from a pasted image link (downloaded by /app/api/avatar-image, then compressed here). */
   setAvatarFromUrl: (url: string) => Promise<void>;
+  /** Saved Home row order (signed in: the account's, else this browser's); null = default. */
+  homeRowOrder: string[] | null;
+  /** Settings → Home Page Layout. Saved in this browser, and to the account when signed in. */
+  setHomeRowOrder: (order: string[] | null) => Promise<void>;
   /** Permanently deletes the account and everything synced to it. */
   deleteAccount: () => Promise<void>;
   canSignIn: boolean;
@@ -91,6 +114,10 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
   const [data, setData] = useState<TrackerData>(emptyData);
   const [status, setStatus] = useState<Status>("loading");
   const [profile, setProfile] = useState<cloud.CloudProfile | null>(null);
+  const [localOrder, setLocalOrder] = useState<string[] | null>(null);
+  useEffect(() => setLocalOrder(readLocalOrder()), []);
+  // Signed in, the account's order wins (it syncs with Omnia Desktop); keep a local copy for guests.
+  const homeRowOrder = mode === "cloud" && profile ? (profile.homeRowOrder ?? null) : localOrder;
   const ctxRef = useRef<cloud.CloudCtx | null>(null);
   /** Writes still in flight: a live refresh waits for them so it can't undo an optimistic change. */
   const pendingRef = useRef(0);
@@ -153,6 +180,12 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
           if (!cancelled) notify(`Synced ${countItems(guest)} item${countItems(guest) === 1 ? "" : "s"} from this browser to your account`);
         }
         const [d, p] = await Promise.all([cloud.loadCloud(c), cloud.loadProfile(c)]);
+        // A layout customised as a guest moves into an account that has none yet.
+        const guestOrder = readLocalOrder();
+        if (!p.homeRowOrder && guestOrder) {
+          await cloud.saveHomeOrder(c, guestOrder).catch(() => undefined);
+          p.homeRowOrder = guestOrder;
+        }
         if (cancelled) return;
         ctxRef.current = c;
         dataRef.current = d;
@@ -240,11 +273,11 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
         if (mode !== "cloud" || !c) throw new Error("Sign in to set a profile picture.");
         if (!file) {
           await cloud.removeAvatar(c);
-          setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: null }));
+          setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: null, homeRowOrder: p?.homeRowOrder ?? null }));
           return;
         }
         const url = await cloud.uploadAvatar(c, await compressAvatar(file));
-        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url }));
+        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url, homeRowOrder: p?.homeRowOrder ?? null }));
       },
       setAvatarFromUrl: async (link) => {
         const c = ctxRef.current;
@@ -257,7 +290,24 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
           throw new Error(body?.error ?? "That image couldn't be loaded.");
         }
         const url = await cloud.uploadAvatar(c, await compressAvatar(await res.blob()));
-        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url }));
+        setProfile((p) => ({ displayName: p?.displayName ?? null, avatarUrl: url, homeRowOrder: p?.homeRowOrder ?? null }));
+      },
+      homeRowOrder,
+      setHomeRowOrder: async (order) => {
+        const stored = order ? mergeForSave(order, homeRowOrder) : null;
+        writeLocalOrder(stored);
+        setLocalOrder(stored);
+        const c = ctxRef.current;
+        if (mode === "cloud" && c) {
+          const prev = profile;
+          setProfile((p) => (p ? { ...p, homeRowOrder: stored } : p));
+          try {
+            await cloud.saveHomeOrder(c, stored);
+          } catch (e) {
+            setProfile(prev);
+            throw e;
+          }
+        }
       },
       deleteAccount: async () => {
         const c = ctxRef.current;
@@ -354,7 +404,7 @@ export function TrackerProvider({ user, children }: { user: SessionUser | null; 
         setData(emptyData());
       },
     };
-  }, [data, status, mode, user, profile, canSignIn, mutate, notify]);
+  }, [data, status, mode, user, profile, homeRowOrder, canSignIn, mutate, notify]);
 
   return (
     <Ctx.Provider value={api}>

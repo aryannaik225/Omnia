@@ -26,6 +26,8 @@ export interface CloudCtx {
 export interface CloudProfile {
   displayName: string | null;
   avatarUrl: string | null;
+  /** Settings → Home Page Layout (omnia/config/homeLayout ids), synced with Omnia Desktop. */
+  homeRowOrder: string[] | null;
 }
 
 async function all<T>(query: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: unknown }>): Promise<T[]> {
@@ -189,9 +191,22 @@ export async function clearCloud(c: CloudCtx) {
 // ---------------------------------------------------------------------------------------------
 
 export async function loadProfile({ sb, userId }: CloudCtx): Promise<CloudProfile> {
-  const { data, error } = await sb.from("profiles").select("display_name, avatar_url").eq("user_id", userId).maybeSingle();
-  if (error) throw error;
-  return { displayName: data?.display_name ?? null, avatarUrl: data?.avatar_url ?? null };
+  type Row = { display_name: string | null; avatar_url: string | null; home_row_order?: unknown };
+  let res = await sb.from("profiles").select("display_name, avatar_url, home_row_order").eq("user_id", userId).maybeSingle<Row>();
+  // A project whose schema predates home_row_order: read without it.
+  if (res.error) res = await sb.from("profiles").select("display_name, avatar_url").eq("user_id", userId).maybeSingle<Row>();
+  if (res.error) throw res.error;
+  const order = res.data?.home_row_order;
+  return {
+    displayName: res.data?.display_name ?? null,
+    avatarUrl: res.data?.avatar_url ?? null,
+    homeRowOrder: Array.isArray(order) ? order.filter((x): x is string => typeof x === "string") : null,
+  };
+}
+
+/** Saves the Home row order (null = default) to the account. */
+export async function saveHomeOrder(c: CloudCtx, order: string[] | null) {
+  check(await c.sb.from("profiles").upsert({ user_id: c.userId, home_row_order: order, updated_at: new Date().toISOString() }, { onConflict: "user_id" }));
 }
 
 /**

@@ -216,7 +216,10 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         app().toast({ kind: "info", title: `Synced from ${e.providerName}`, body: `${e.updated} new ${e.updated === 1 ? "entry" : "entries"} from your other devices.` });
       }),
       events.onCloudSync((e) => {
-        if (e.profileUpdated) void app().reloadProfiles();
+        if (e.profileUpdated) {
+          void app().reloadProfiles();
+          void app().reloadSettings(); // Home Page Layout may have changed on another device
+        }
         if (e.appProfileId !== app().activeProfile?.profileId || !e.applied) return;
         void app().refreshContinueWatching();
         void app().refreshWatchlist();

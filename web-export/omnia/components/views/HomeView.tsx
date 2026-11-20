@@ -11,6 +11,7 @@ import { useMemo } from "react";
 import { useTracker } from "@/components/tracker/TrackerProvider";
 import { useSummaries } from "@/components/tracker/useSummaries";
 import { encodeSeeds, type RowEnv } from "../../config/homeRows";
+import { resolveHomeOrder } from "../../config/homeLayout";
 import { useSubscriptionFilter } from "../../lib/availability";
 import { useAsync } from "../../lib/hooks";
 import { usePersonalSignals, type PersonalSignals } from "../../lib/personal";
@@ -90,6 +91,9 @@ function LoveRowPlaceholder() {
 }
 
 export function HomeView() {
+  // Settings → Home Page Layout (this browser's, or the account's when signed in).
+  const savedOrder = useTracker().homeRowOrder;
+  const homeOrder = useMemo(() => resolveHomeOrder(savedOrder), [savedOrder]);
   const catalogKey = useCatalogKey();
   const ctx = useAppStore((s) => s.catalogContext)();
   const kids = useAppStore((s) => s.isKids());
@@ -153,34 +157,21 @@ export function HomeView() {
         <BrandHubsRow />
         <MyListRow />
         <BrowseByServiceRow />
-        {row("in-theatres")}
-        {row("acclaimed-films")}
-        {row("airing")}
-        {row("acclaimed-series")}
-        {signals.loaded && (
-          <>
-            <NextWatchRow signals={signals} env={env} />
-            <BecauseRows signals={signals} env={env} />
-          </>
-        )}
-        {row("region-movies")}
-        {row("region-series")}
-        {row("imdb-popular")}
-        {row("rt-fresh")}
-        {row("moviemeter")}
-        {row("hidden-gems")}
-        <PopularOnStreamingRow env={env} />
-        {row("anime")}
-        <LoveRowPlaceholder />
-        {row("oscars")}
-        {row("laugh")}
-        {row("millennial")}
-        {row("scifi-tv")}
-        {row("horror")}
-        {row("rt-hot")}
-        {row("best-year")}
-        {row("worst")}
-        {row("popular-tv")}
+        {/* Everything below follows Settings → Home Page Layout (omnia/config/homeLayout.ts). */}
+        {homeOrder.map((id) => {
+          switch (id) {
+            case "next-watch":
+              return signals.loaded ? <NextWatchRow key={id} signals={signals} env={env} /> : null;
+            case "because":
+              return signals.loaded ? <BecauseRows key={id} signals={signals} env={env} /> : null;
+            case "streaming":
+              return <PopularOnStreamingRow key={id} env={env} />;
+            case "love":
+              return <LoveRowPlaceholder key={id} />;
+            default:
+              return row(id);
+          }
+        })}
       </div>
     </div>
   );
