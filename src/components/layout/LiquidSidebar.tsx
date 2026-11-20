@@ -105,7 +105,7 @@ export function LiquidSidebar() {
                 onClick={() => (active ? requestScrollTop() : navigate(v))}
                 aria-current={active ? "page" : undefined}
                 title={collapsed ? label : undefined}
-                className={`relative flex w-full items-center gap-3.5 rounded-pill px-3 py-2.5 text-[15px] font-medium transition-colors duration-200 ${
+                className={`relative flex w-full items-center gap-3.5 rounded-pill px-[15.5px] py-2.5 text-[15px] font-medium transition-colors duration-200 ${
                   active ? "text-label-primary" : "text-label-secondary hover:bg-white/[0.07] hover:text-label-primary"
                 }`}
               >
